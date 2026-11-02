@@ -60,12 +60,16 @@ fn run(args: args::Args) -> Result<(), String> {
                 Some(_) => {}
                 None => cfg.model = Some(used.to_owned()).filter(|m| !m.is_empty()),
             }
+            if cfg.model.is_none() {
+                cfg.model = cfg.fallback.take();
+            }
             (l.session, l.messages)
         }
-        None => (
-            agent::session::Session::new(&dir, &new_id(), &cwd, cfg.model.as_deref().unwrap_or("")),
-            Vec::new(),
-        ),
+        None => {
+            cfg.model = cfg.model.or(cfg.fallback.take());
+            let model = cfg.model.as_deref().unwrap_or("");
+            (agent::session::Session::new(&dir, &new_id(), &cwd, model), Vec::new())
+        }
     };
     // One id per conversation routes every request, resumed or not, to the cache that saw it.
     let id = session.id().to_owned();
@@ -92,6 +96,7 @@ fn run(args: args::Args) -> Result<(), String> {
             policy: agent::Policy::new(cfg.allow),
             mode,
             session,
+            remember: cfg.remember,
         };
         tokio::spawn(agent::run(agent, cx, cmd_rx, ev_tx));
         tui::run(cmd_tx, ev_rx, &model, &cfg.models, mode, &cfg.notices).await

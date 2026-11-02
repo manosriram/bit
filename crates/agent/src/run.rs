@@ -3,6 +3,7 @@ use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::session::Session;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -14,6 +15,8 @@ pub struct Agent {
     pub policy: Policy,
     pub mode: Mode,
     pub session: Session,
+    /// Where a picked model is written, so the next session starts with it.
+    pub remember: Option<PathBuf>,
 }
 
 /// Runs until the command channel closes.
@@ -42,6 +45,19 @@ pub async fn run(
             Command::SetModel(m) => {
                 cx.set_model(&m);
                 if let Err(e) = agent.session.set_model(&m) {
+                    let _ = events.send(save_failed(&e));
+                }
+                if let Err(e) = remember(&agent.remember, &m) {
+                    let n = format!(
+                        "error: could not remember {m} for next time: {e}. hint: check that the state directory is writable"
+                    );
+                    let _ = events.send(Event::Notice(n.into()));
+                }
+                continue;
+            }
+            Command::Clear => {
+                cx.messages.clear();
+                if let Err(e) = agent.session.clear() {
                     let _ = events.send(save_failed(&e));
                 }
                 continue;
@@ -170,6 +186,12 @@ impl Turn<'_> {
     }
 }
 
+fn remember(path: &Option<PathBuf>, model: &str) -> std::io::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    std::fs::create_dir_all(path.parent().unwrap_or(path))?;
+    std::fs::write(path, model)
+}
+
 fn save_failed(e: &std::io::Error) -> Event {
     Event::Notice(format!("error: could not save the session: {e}. hint: check disk space").into())
 }
@@ -251,7 +273,7 @@ async fn listen(
                 let _ = approve.send((id, decision));
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
-            Command::Submit(_) | Command::SetModel(_) => {}
+            Command::Submit(_) | Command::SetModel(_) | Command::Clear => {}
         }
     }
 }
@@ -295,6 +317,7 @@ mod tests {
             policy: Policy::new(Vec::new()),
             mode: Mode::Ask,
             session,
+            remember: None,
         }
     }
 
@@ -551,12 +574,15 @@ mod tests {
     #[tokio::test]
     async fn set_model_switches_the_request_model() {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let agent = agent(l.local_addr().unwrap(), "model");
+        let mut agent = agent(l.local_addr().unwrap(), "model");
+        let state = agent.tools.cwd.join("state/opencode-go.model");
+        agent.remember = Some(state.clone());
         let cx = Context::new("", None, Vec::new());
         let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
         cmds.send(Command::SetModel("m2".into())).unwrap();
         cmds.send(Command::Submit("hi".into())).unwrap();
         assert_eq!(next(&mut ev).await, Event::Text("a".into()));
         assert!(bodies.recv().await.unwrap().starts_with(r#"{"model":"m2","#));
+        assert_eq!(std::fs::read_to_string(state).unwrap(), "m2");
     }
 }

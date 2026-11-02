@@ -62,6 +62,11 @@ impl Input {
         text
     }
 
+    /// Whether the text is an earlier prompt brought back by `recall`.
+    pub fn recalling(&self) -> bool {
+        self.back > 0
+    }
+
     /// Replaces the text, with the cursor at the end.
     pub fn set(&mut self, text: &str) {
         self.text = text.into();

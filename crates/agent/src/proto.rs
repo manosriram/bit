@@ -11,6 +11,8 @@ pub enum Command {
     SetMode(Mode),
     /// Sent only while idle.
     SetModel(Box<str>),
+    /// Drops the history. Sent only while idle.
+    Clear,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

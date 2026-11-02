@@ -156,6 +156,14 @@ impl Term {
         write(&format!("\x1b[{height};1H{}\x1b[H", "\n".repeat(used.into())))
     }
 
+    /// Clears the screen and the scrollback, and takes the whole screen as the region, as
+    /// `pin` does at startup.
+    pub fn wipe(&mut self, height: u16) -> io::Result<()> {
+        self.prev = vec![String::new(); height.into()];
+        self.row = 0;
+        write("\x1b[H\x1b[2J\x1b[3J")
+    }
+
     /// Removes the live region, leaving only scrollback.
     pub fn clear(&mut self) -> io::Result<()> {
         let mut out = String::new();

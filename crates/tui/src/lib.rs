@@ -1,10 +1,12 @@
 mod input;
+mod markdown;
 mod render;
 
 use agent::proto::{Command, Decision, Event, Mode, StopReason, Usage};
 use crossterm::event::{self as ct, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
 use input::Input;
+use markdown::Markdown;
 use render::{Line, Term, clip, str_width, wrap};
 use std::io;
 use std::time::Duration;
@@ -20,7 +22,10 @@ const DETAIL_ROWS: usize = 12;
 /// Rows of the model picker shown at once.
 const PICK_ROWS: usize = 10;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 1] = [("/model", "[id]", "pick the model, or set it to id")];
+const COMMANDS: [(&str, &str, &str); 2] = [
+    ("/clear", "", "start over; the model forgets this conversation"),
+    ("/model", "[id]", "pick the model, or set it to id"),
+];
 const CHOICES: [(&str, Decision); 3] = [
     ("[y]es", Decision::Yes),
     ("[n]o", Decision::No),
@@ -79,10 +84,13 @@ async fn event_loop(
         models: models.into(),
         picker: None,
         menu: 0,
+        wipe: false,
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
         input: Input::default(),
         partial: String::new(),
+        shown: 0,
+        md: Markdown::default(),
         done: Vec::new(),
         busy: None,
         usage: None,
@@ -102,6 +110,10 @@ async fn event_loop(
     let mut dirty = true;
     loop {
         if dirty && last.elapsed() >= FRAME {
+            if ui.wipe {
+                term.wipe(terminal::size()?.1)?;
+                ui.wipe = false;
+            }
             let (frame, split, cursor) = ui.frame();
             term.draw(&ui.done, &frame, split, cursor)?;
             ui.done.clear();
@@ -137,12 +149,17 @@ struct Ui {
     picker: Option<Picker>,
     /// The marked row of the slash-command list.
     menu: usize,
+    /// Set by `/clear`: wipe the screen and scrollback before the next frame.
+    wipe: bool,
     color: bool,
     cols: usize,
     input: Input,
-    /// The last, unfinished row of model text. Finished rows move to `done` at once, so the
-    /// live region stays small however long the reply is.
+    /// The unfinished line of model text, as markdown. Its finished rows move to `done` at
+    /// once, so the live region stays small however long the reply is.
     partial: String,
+    /// How many rows of `partial` are already in `done`.
+    shown: usize,
+    md: Markdown,
     /// Rows waiting to be written to scrollback.
     done: Vec<String>,
     busy: Option<Instant>,
@@ -180,7 +197,7 @@ fn commands(text: &str) -> Vec<String> {
         return Vec::new();
     };
     let found = COMMANDS.iter().filter(|c| c.0[1..].contains(&word.to_lowercase()));
-    found.map(|c| format!("{} {}  {}", c.0, c.1, c.2)).collect()
+    found.map(|c| format!("{:<13}{}", format!("{} {}", c.0, c.1).trim_end(), c.2)).collect()
 }
 
 /// The models whose id contains `query`, ignoring case.
@@ -322,6 +339,14 @@ impl Ui {
         if self.busy.is_some() || self.input.text.trim().is_empty() {
             return;
         }
+        if self.input.text.trim() == "/clear" {
+            self.input.take();
+            self.usage = None;
+            let _ = cmds.send(Command::Clear);
+            self.done.clear();
+            (self.section, self.wipe) = (None, true);
+            return;
+        }
         if let Some(id) = self.input.text.trim().strip_prefix("/model")
             && (id.is_empty() || id.starts_with(' '))
         {
@@ -352,7 +377,8 @@ impl Ui {
             KeyCode::Esc => self.busy.is_none(),
             _ => false,
         };
-        keys && !commands(&self.input.text).is_empty()
+        let arrow = matches!(code, KeyCode::Up | KeyCode::Down);
+        keys && !(arrow && self.input.recalling()) && !commands(&self.input.text).is_empty()
     }
 
     fn menu_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
@@ -493,19 +519,32 @@ impl Ui {
     }
 
     fn spinner(&self) -> &'static str {
-        let ms = self.busy.map_or(0, |t| t.elapsed().as_millis());
-        ["|", "/", "-", "\\"][(ms / 100 % 4) as usize]
+        ["|", "/", "-", "\\"][self.tick() % 4]
     }
 
-    /// Moves finished rows of model text to scrollback; with `all`, the last row too.
+    /// An 8-bit window scrolling through "bit" in binary, one bit per tick.
+    fn bits(&self) -> String {
+        const BITS: &str = "011000100110100101110100";
+        BITS.chars().cycle().skip(self.tick() % BITS.len()).take(8).collect()
+    }
+
+    /// 100 ms steps since the turn started.
+    fn tick(&self) -> usize {
+        self.busy.map_or(0, |t| t.elapsed().as_millis() as usize / 100)
+    }
+
+    /// Moves finished rows of model text to scrollback; with `all`, the last row too, and
+    /// the line is done.
     fn flush(&mut self, all: bool) {
-        let rows = wrap(&self.partial, self.width() - 2);
-        let keep = if all { rows.len() } else { rows.len() - 1 };
-        for r in &rows[..keep] {
-            self.done.push(format!("  {}", self.partial[r.clone()].trim_end()));
+        let rows = self.md.rows(&self.partial, self.width(), self.color);
+        let keep = if all { rows.len() } else { rows.len().saturating_sub(1) };
+        self.done.extend(rows.into_iter().take(keep).skip(self.shown));
+        self.shown = self.shown.max(keep);
+        if all {
+            self.md.end(&self.partial);
+            self.partial.clear();
+            self.shown = 0;
         }
-        let cut = rows.get(keep).map_or(self.partial.len(), |r| r.start);
-        self.partial.drain(..cut);
     }
 
     /// The live region: unfinished text, then the input box. Returns the rows and the
@@ -515,7 +554,7 @@ impl Ui {
         let w = self.width();
         let mut f = Vec::new();
         if !self.partial.is_empty() {
-            f.push(format!("  {}", self.partial));
+            f.extend(self.md.rows(&self.partial, w, self.color).into_iter().skip(self.shown));
         }
         let mut l = Line::new(self.color);
         if let Some((name, summary)) = &self.tool {
@@ -558,7 +597,7 @@ impl Ui {
         if let Some(t) = self.busy {
             let e = t.elapsed();
             l.add(DIM, "-- ")
-                .add(YELLOW, self.spinner())
+                .add(YELLOW, &self.bits())
                 .add("", &format!(" working {:.1}s", e.as_secs_f32()))
                 .add(DIM, " ");
             let right = " esc cancels --+";

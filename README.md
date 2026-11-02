@@ -34,7 +34,7 @@ cargo build --release      # target/release/bit
 bit                start a session
 bit -c             continue the last session in this directory
 bit -r <id>        resume a session by id or id prefix
---model <id>       model to use (otherwise pick one with /model)
+--model <id>       model to use (default: the last one picked with /model)
 --mode ask|auto    ask before write, edit and bash (default ask), or don't
 ```
 

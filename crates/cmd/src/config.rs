@@ -4,8 +4,12 @@ use std::path::PathBuf;
 
 pub struct Config {
     pub provider: String,
-    /// `None` until the user picks one.
+    /// From `--model`.
     pub model: Option<String>,
+    /// For a new session without `--model`: the last model picked, else the config's.
+    pub fallback: Option<String>,
+    /// Where the last picked model is kept, per provider.
+    pub remember: Option<PathBuf>,
     pub base_url: String,
     pub api_key: String,
     pub headers: Vec<(Box<str>, Box<str>)>,
@@ -107,10 +111,19 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
             models.push(m.into());
         }
     }
+    let remember =
+        dir("XDG_STATE_HOME", ".local/state").map(|d| d.join(format!("bit/{name}.model")));
     let headers = vec![("user-agent".into(), concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
     Ok(Config {
         provider: name.into(),
-        model: model.or(file.model),
+        fallback: remember
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|m| !m.is_empty())
+            .or(file.model),
+        remember,
+        model,
         base_url,
         api_key,
         headers,
@@ -121,9 +134,13 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
 }
 
 pub fn sessions_dir() -> Result<PathBuf, String> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    let base = dir("XDG_DATA_HOME", ".local/share")
         .ok_or("error: cannot find the data directory. hint: set HOME")?;
     Ok(base.join("bit/sessions"))
+}
+
+/// `$var`, else `$HOME/<default>`.
+fn dir(var: &str, default: &str) -> Option<PathBuf> {
+    let home = || std::env::var_os("HOME").map(|h| PathBuf::from(h).join(default));
+    std::env::var_os(var).map(PathBuf::from).or_else(home)
 }

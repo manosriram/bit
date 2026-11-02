@@ -46,6 +46,7 @@ impl Session {
             };
             match (r.t, r.msg) {
                 ("header" | "model", _) => model = r.model.unwrap_or_default(),
+                ("clear", _) => messages.clear(),
                 ("msg", Some(m)) => messages.push(m.to_owned()),
                 _ => {}
             }
@@ -89,6 +90,15 @@ impl Session {
             return Ok(());
         }
         self.write(&format!("{}\n", serde_json::json!({"t": "model", "model": model})))
+    }
+
+    /// Starts the history over; a resume then sees only what comes after.
+    pub(crate) fn clear(&mut self) -> io::Result<()> {
+        self.logged = 0;
+        match self.header {
+            Some(_) => Ok(()),
+            None => self.write("{\"t\":\"clear\"}\n"),
+        }
     }
 
     fn write(&mut self, lines: &str) -> io::Result<()> {
@@ -197,5 +207,20 @@ mod tests {
         assert_eq!(latest(&dir, Path::new("/w")).unwrap(), Some(dir.join("abc123.jsonl")));
         assert_eq!(latest(&dir, Path::new("/other")).unwrap(), None);
         assert!(find(&dir, "zz").is_err());
+    }
+
+    #[test]
+    fn clear_drops_earlier_messages_on_load() {
+        let dir = std::env::temp_dir().join(format!("bit-session-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = |s: &str| RawValue::from_string(s.into()).unwrap();
+        let mut s = Session::new(&dir, "c1", Path::new("/w"), "m");
+        s.clear().unwrap();
+        s.append(&[m("1")]).unwrap();
+        s.clear().unwrap();
+        assert_eq!(s.logged, 0);
+        s.append(&[m("2")]).unwrap();
+        let l = Session::open(&dir.join("c1.jsonl")).unwrap();
+        assert_eq!(l.messages.iter().map(|m| m.get()).collect::<Vec<_>>(), ["2"]);
     }
 }
