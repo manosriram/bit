@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub struct Config {
+    pub provider: String,
     pub model: String,
     pub base_url: String,
     pub api_key: String,
@@ -127,14 +128,12 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
                 path.display()
             )
         })?;
-    let mut headers = vec![(
+    let headers = vec![(
         "user-agent".into(),
         concat!("bit/", env!("CARGO_PKG_VERSION")).into(),
     )];
-    if name == "opencode-go" {
-        headers.push(("x-opencode-session".into(), session_id()));
-    }
     Ok(Config {
+        provider: name.into(),
         model,
         base_url,
         api_key,
@@ -144,10 +143,10 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
     })
 }
 
-/// Unique per run, which is per conversation until sessions land in Phase 6.
-fn session_id() -> Box<str> {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("bit-{:x}-{:x}", t.as_nanos(), std::process::id()).into()
+pub fn sessions_dir() -> Result<PathBuf, String> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .ok_or("error: cannot find the data directory. hint: set HOME")?;
+    Ok(base.join("bit/sessions"))
 }

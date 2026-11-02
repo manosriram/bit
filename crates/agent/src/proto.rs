@@ -23,6 +23,8 @@ pub enum Mode {
 
 #[derive(Debug, PartialEq)]
 pub enum Event {
+    /// A user message; sent only when replaying a resumed session.
+    User(Box<str>),
     Text(Box<str>),
     ToolStart {
         id: Box<str>,
@@ -41,6 +43,7 @@ pub enum Event {
         preview: Box<str>,
     },
     Usage(Usage),
+    Notice(Box<str>),
     TurnEnd(StopReason),
 }
 

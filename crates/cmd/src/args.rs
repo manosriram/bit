@@ -1,9 +1,16 @@
-use lexopt::{Arg::Long, ValueExt};
+use lexopt::{
+    Arg::{Long, Short},
+    ValueExt,
+};
 
 #[derive(Default)]
 pub struct Args {
     pub model: Option<String>,
     pub auto: bool,
+    /// `-c`: continue the last session in this directory.
+    pub cont: bool,
+    /// `-r <id>`: resume a session by id or id prefix.
+    pub resume: Option<String>,
     pub print_prompt: bool,
     pub version: bool,
 }
@@ -21,6 +28,8 @@ pub fn parse() -> Result<Args, lexopt::Error> {
                     m => return Err(format!("invalid --mode `{m}`: use ask or auto").into()),
                 }
             }
+            Short('c') | Long("continue") => a.cont = true,
+            Short('r') | Long("resume") => a.resume = Some(p.value()?.string()?),
             Long("print-prompt") => a.print_prompt = true,
             Long("version") => a.version = true,
             _ => return Err(arg.unexpected()),

@@ -2,6 +2,7 @@ mod context;
 mod policy;
 pub mod proto;
 mod run;
+pub mod session;
 
 pub use context::Context;
 pub use llm::Client;

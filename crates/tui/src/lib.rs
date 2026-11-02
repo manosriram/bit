@@ -231,10 +231,19 @@ impl Ui {
             return;
         }
         let text = self.input.take();
+        self.user(&text);
+        let _ = cmds.send(Command::Submit(text));
+        self.busy = Some(Instant::now());
+    }
+
+    /// A user message in scrollback, typed now or replayed from a resumed session.
+    fn user(&mut self, text: &str) {
+        self.end_text();
         let mut l = Line::new(self.color);
         self.done.push(String::new());
         for (i, line) in text.lines().enumerate() {
-            for (j, r) in wrap(line, self.width() - 2).into_iter().enumerate() {
+            let line = clean(line);
+            for (j, r) in wrap(&line, self.width() - 2).into_iter().enumerate() {
                 let mark = if i + j == 0 { ">" } else { " " };
                 l.add("34;1", mark).add("1", &format!(" {}", &line[r]));
                 self.done.push(l.take());
@@ -242,8 +251,6 @@ impl Ui {
         }
         self.done.push(String::new());
         self.section = None;
-        let _ = cmds.send(Command::Submit(text));
-        self.busy = Some(Instant::now());
     }
 
     fn event(&mut self, e: Event) {
@@ -263,6 +270,17 @@ impl Ui {
                 self.flush(false);
             }
             Event::Usage(u) => self.usage = Some(u),
+            Event::User(t) => self.user(&t),
+            Event::Notice(n) => {
+                self.end_text();
+                let mut l = Line::new(self.color);
+                if n.starts_with("error:") {
+                    l.add(YELLOW, "!").add("", &format!(" {}", clean(&n)));
+                } else {
+                    l.add(DIM, &format!("  {}", clean(&n)));
+                }
+                self.done.push(l.take());
+            }
             Event::Approval {
                 id,
                 name,
