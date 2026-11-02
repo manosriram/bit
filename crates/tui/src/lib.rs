@@ -80,9 +80,7 @@ async fn event_loop(
     };
     ui.logo();
     for n in notices {
-        let mut l = Line::new(ui.color);
-        ui.done
-            .push(l.add(YELLOW, "!").add("", &format!(" {n}")).take());
+        ui.event(Event::Notice(n.as_str().into()));
     }
     let mut term = Term::default();
     term.pin(height, used)?;
@@ -96,11 +94,7 @@ async fn event_loop(
             last = Instant::now();
             dirty = false;
         }
-        let wake = if dirty {
-            Some(last + FRAME)
-        } else {
-            ui.busy.map(|_| last + SPIN)
-        };
+        let wake = if dirty { Some(last + FRAME) } else { ui.busy.map(|_| last + SPIN) };
         tokio::select! {
             k = keys.recv() => match k {
                 Some(ct::Event::Resize(c, _)) => {
@@ -152,9 +146,7 @@ struct Approval {
 
 /// Control characters could move the cursor and break the layout.
 fn clean(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 impl Ui {
@@ -176,13 +168,8 @@ impl Ui {
             Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
             _ => dir.display().to_string(),
         };
-        let info = format!(
-            "  bit {} | {} | {dir}",
-            env!("CARGO_PKG_VERSION"),
-            self.model
-        );
-        self.done
-            .extend([String::new(), l.add(DIM, clip(&info, self.width())).take()]);
+        let info = format!("  bit {} | {} | {dir}", env!("CARGO_PKG_VERSION"), self.model);
+        self.done.extend([String::new(), l.add(DIM, clip(&info, self.width())).take()]);
     }
 
     /// Returns false when the user quits.
@@ -281,19 +268,9 @@ impl Ui {
                 }
                 self.done.push(l.take());
             }
-            Event::Approval {
-                id,
-                name,
-                summary,
-                detail,
-            } => {
+            Event::Approval { id, name, summary, detail } => {
                 self.end_text();
-                self.approval = Some(Approval {
-                    id,
-                    name,
-                    summary,
-                    detail,
-                });
+                self.approval = Some(Approval { id, name, summary, detail });
             }
             Event::ToolStart { name, summary, .. } => {
                 self.end_text();
@@ -344,12 +321,9 @@ impl Ui {
         let room = w.saturating_sub(str_width(name) + str_width(preview) + 7);
         let summary = clean(summary);
         let mut l = Line::new(self.color);
-        if ok {
-            l.add("32", "*");
-        } else {
-            l.add("31", "!");
-        }
-        l.add("", " ")
+        let (sgr, mark) = if ok { ("32", "*") } else { ("31", "!") };
+        l.add(sgr, mark)
+            .add("", " ")
             .add("1", name)
             .add("", &format!(" {}", clip(&summary, room)))
             .add(DIM, &format!("  [{preview}]"));
@@ -366,8 +340,7 @@ impl Ui {
         let rows = wrap(&self.partial, self.width() - 2);
         let keep = if all { rows.len() } else { rows.len() - 1 };
         for r in &rows[..keep] {
-            self.done
-                .push(format!("  {}", self.partial[r.clone()].trim_end()));
+            self.done.push(format!("  {}", self.partial[r.clone()].trim_end()));
         }
         let cut = rows.get(keep).map_or(self.partial.len(), |r| r.start);
         self.partial.drain(..cut);
@@ -407,9 +380,7 @@ impl Ui {
             l.fill(DIM, '-', w - right.len()).add(DIM, right);
         } else {
             if self.quit_armed {
-                l.add(DIM, "-- ")
-                    .add(YELLOW, "ctrl-c again to quit")
-                    .add(DIM, " ");
+                l.add(DIM, "-- ").add(YELLOW, "ctrl-c again to quit").add(DIM, " ");
             }
             l.fill(DIM, '-', w - 1).add(DIM, "+");
         }
@@ -446,10 +417,7 @@ impl Ui {
             .add(YELLOW, "+");
         f.push(l.take());
         let row = |l: &mut Line, f: &mut Vec<String>, sgr: &str, s: &str| {
-            l.add(YELLOW, "| ")
-                .add(sgr, clip(s, w - 4))
-                .fill("", ' ', w - 2)
-                .add(YELLOW, " |");
+            l.add(YELLOW, "| ").add(sgr, clip(s, w - 4)).fill("", ' ', w - 2).add(YELLOW, " |");
             f.push(l.take());
         };
         let lines: Vec<String> = a.detail.lines().map(clean).collect();
@@ -467,19 +435,21 @@ impl Ui {
         }
         row(&mut l, &mut f, "", "");
         let at = f.len();
-        row(
-            &mut l,
-            &mut f,
-            "1",
-            "[y]es  [n]o  [a]lways for this session",
-        );
+        row(&mut l, &mut f, "1", "[y]es  [n]o  [a]lways for this session");
         f.push(self.status_border(YELLOW));
         (f, (at, w - 2))
     }
 
     fn status_border(&self, sgr: &str) -> String {
         let w = self.width();
-        let status = self.status();
+        let mode = if self.auto { "auto" } else { "ask" };
+        let status = match self.usage.map(|u| u.input) {
+            Some(n) if n >= 1000 => {
+                format!("{mode} | {} | {:.1}k ctx", self.model, f64::from(n) / 1e3)
+            }
+            Some(n) => format!("{mode} | {} | {n} ctx", self.model),
+            None => format!("{mode} | {}", self.model),
+        };
         let mut l = Line::new(self.color);
         l.add(sgr, "+-- ")
             .add("", clip(&status, w - 6))
@@ -487,18 +457,5 @@ impl Ui {
             .fill(sgr, '-', w - 1)
             .add(sgr, "+");
         l.take()
-    }
-
-    fn status(&self) -> String {
-        let mode = if self.auto { "auto" } else { "ask" };
-        let Some(u) = self.usage else {
-            return format!("{mode} | {}", self.model);
-        };
-        let ctx = if u.input >= 1000 {
-            format!("{:.1}k", f64::from(u.input) / 1000.0)
-        } else {
-            u.input.to_string()
-        };
-        format!("{mode} | {} | {ctx} ctx", self.model)
     }
 }

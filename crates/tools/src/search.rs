@@ -34,12 +34,7 @@ pub async fn grep(a: Grep, cx: &Ctx) -> Result<String, String> {
 }
 
 pub async fn glob(a: Glob, cx: &Ctx) -> Result<String, String> {
-    rg(
-        vec!["--files", "--sort=path", "-g", &a.pattern],
-        a.path.as_deref(),
-        cx,
-    )
-    .await
+    rg(vec!["--files", "--sort=path", "-g", &a.pattern], a.path.as_deref(), cx).await
 }
 
 async fn rg(mut args: Vec<&str>, path: Option<&str>, cx: &Ctx) -> Result<String, String> {
@@ -55,19 +50,16 @@ async fn rg(mut args: Vec<&str>, path: Option<&str>, cx: &Ctx) -> Result<String,
         .output()
         .await
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => err(
-                "rg is not installed",
-                "install ripgrep, e.g. `brew install ripgrep`",
-            ),
+            std::io::ErrorKind::NotFound => {
+                err("rg is not installed", "install ripgrep, e.g. `brew install ripgrep`")
+            }
             _ => err(format_args!("cannot start rg: {e}"), "try again"),
         })?;
     match out.status.code() {
         Some(0) => Ok(cap(String::from_utf8_lossy(&out.stdout).into_owned(), cx)),
         Some(1) => Ok("no matches".into()),
         _ => Err(err(
-            String::from_utf8_lossy(&out.stderr)
-                .trim()
-                .trim_start_matches("rg: "),
+            String::from_utf8_lossy(&out.stderr).trim().trim_start_matches("rg: "),
             "check the pattern and the path",
         )),
     }

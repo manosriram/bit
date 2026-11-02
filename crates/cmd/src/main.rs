@@ -33,11 +33,7 @@ fn run(args: args::Args) -> Result<(), String> {
     }
     let mut cfg = config::load(args.model)?;
     // Checked once here so a missing rg is a notice now, not a confusing tool error later.
-    if std::process::Command::new("rg")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if std::process::Command::new("rg").arg("--version").output().is_err() {
         cfg.notices.push("error: rg (ripgrep) is not installed, so grep and glob will fail. hint: install it, e.g. `brew install ripgrep`".into());
     }
     let cwd = std::env::current_dir().map_err(|e| format!("error: current directory: {e}"))?;
@@ -62,33 +58,21 @@ fn run(args: args::Args) -> Result<(), String> {
             let l = agent::session::Session::open(&path)
                 .map_err(|e| format!("error: {}: {e}", path.display()))?;
             if !l.model.is_empty() && l.model != cfg.model {
-                let note = format!(
-                    "this session used {}; continuing with {}",
-                    l.model, cfg.model
-                );
+                let note = format!("this session used {}; continuing with {}", l.model, cfg.model);
                 cfg.notices.push(note);
             }
             (l.session, l.messages, l.cost)
         }
-        None => (
-            agent::session::Session::new(&dir, &new_id(), &cwd, &cfg.model),
-            Vec::new(),
-            0.0,
-        ),
+        None => (agent::session::Session::new(&dir, &new_id(), &cwd, &cfg.model), Vec::new(), 0.0),
     };
     // One id per conversation routes every request, resumed or not, to the cache that saw it.
     let id = session.id().to_owned();
     if cfg.provider == "opencode-go" {
-        cfg.headers
-            .push(("x-opencode-session".into(), id.as_str().into()));
+        cfg.headers.push(("x-opencode-session".into(), id.as_str().into()));
     }
     let cache_key = (cfg.provider == "openai").then_some(id.as_str());
     let cx = agent::Context::new(&cfg.model, cache_key, messages);
-    let mode = if args.auto {
-        agent::proto::Mode::Auto
-    } else {
-        agent::proto::Mode::Ask
-    };
+    let mode = if args.auto { agent::proto::Mode::Auto } else { agent::proto::Mode::Ask };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

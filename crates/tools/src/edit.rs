@@ -58,12 +58,7 @@ fn near_misses(text: &str, old: &str, path: &str) -> String {
         }
         if picked.iter().all(|&p| p.abs_diff(s) >= k) {
             picked.push(s);
-            msg += &format!(
-                "\nlines {}-{} ({:.0}% similar):\n",
-                s + 1,
-                s + k,
-                score * 100.0
-            );
+            msg += &format!("\nlines {}-{} ({:.0}% similar):\n", s + 1, s + k, score * 100.0);
             for (j, line) in lines[s..s + k].iter().enumerate() {
                 numbered(&mut msg, s + j + 1, line);
             }
@@ -75,10 +70,8 @@ fn near_misses(text: &str, old: &str, path: &str) -> String {
 /// Sorted char bigrams of the trimmed line, so indentation differences don't count.
 fn bigrams(line: &str) -> Vec<u64> {
     let cs: Vec<char> = line.trim().chars().collect();
-    let mut g: Vec<u64> = cs
-        .windows(2)
-        .map(|w| (u64::from(w[0]) << 32) | u64::from(w[1]))
-        .collect();
+    let mut g: Vec<u64> =
+        cs.windows(2).map(|w| (u64::from(w[0]) << 32) | u64::from(w[1])).collect();
     g.sort_unstable();
     g
 }
@@ -109,21 +102,11 @@ mod tests {
     async fn replaces_a_unique_match() {
         let cx = test_ctx("edit");
         std::fs::write(cx.cwd.join("m.rs"), SRC).unwrap();
-        let o = exec(
-            "edit",
-            r#"{"path":"m.rs","old":"a + b","new":"a - b"}"#,
-            &cx,
-        )
-        .await;
+        let o = exec("edit", r#"{"path":"m.rs","old":"a + b","new":"a - b"}"#, &cx).await;
         assert!(o.ok, "{}", o.content);
         let now = std::fs::read_to_string(cx.cwd.join("m.rs")).unwrap();
         assert_eq!(now, SRC.replace("a + b", "a - b"));
-        let o = exec(
-            "edit",
-            r#"{"path":"m.rs","old":"fn ","new":"pub fn "}"#,
-            &cx,
-        )
-        .await;
+        let o = exec("edit", r#"{"path":"m.rs","old":"fn ","new":"pub fn "}"#, &cx).await;
         assert!(!o.ok && o.content.contains("matches 2 times"));
         let o = exec("edit", r#"{"path":"m.rs","old":"","new":"x"}"#, &cx).await;
         assert!(!o.ok && o.content.contains("use write"));

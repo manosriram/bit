@@ -69,11 +69,7 @@ pub struct Line {
 
 impl Line {
     pub fn new(color: bool) -> Self {
-        Self {
-            text: String::new(),
-            width: 0,
-            color,
-        }
+        Self { text: String::new(), width: 0, color }
     }
 
     /// `sgr` is an SGR parameter list such as "33" or "1"; empty means plain.
@@ -146,21 +142,16 @@ impl Term {
         let _ = write!(out, "\x1b[{}G\x1b[?25h", cursor.1 + 1);
         self.row = row;
         self.prev = rows;
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(out.as_bytes())?;
-        stdout.flush()
+        write(&out)
     }
 
     /// Scrolls the first `used` rows of the screen into scrollback and takes the whole
     /// screen as the region. The next frame is then padded to full height, so what is
     /// written first (the logo) lands on the top row and the box on the bottom row.
     pub fn pin(&mut self, height: u16, used: u16) -> io::Result<()> {
-        let out = format!("\x1b[{height};1H{}\x1b[H", "\n".repeat(used.into()));
         self.prev = vec![String::new(); height.into()];
         self.row = 0;
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(out.as_bytes())?;
-        stdout.flush()
+        write(&format!("\x1b[{height};1H{}\x1b[H", "\n".repeat(used.into())))
     }
 
     /// Removes the live region, leaving only scrollback.
@@ -170,9 +161,7 @@ impl Term {
         out.push_str("\x1b[J\x1b[?25h");
         self.prev.clear();
         self.row = 0;
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(out.as_bytes())?;
-        stdout.flush()
+        write(&out)
     }
 
     fn top(&self, out: &mut String) {
@@ -181,6 +170,12 @@ impl Term {
         }
         out.push('\r');
     }
+}
+
+fn write(out: &str) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()
 }
 
 #[cfg(test)]

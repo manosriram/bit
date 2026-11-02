@@ -10,10 +10,7 @@ pub struct Policy {
 
 impl Policy {
     pub fn new(allow: Vec<String>) -> Self {
-        Self {
-            allow,
-            tools: Vec::new(),
-        }
+        Self { allow, tools: Vec::new() }
     }
 
     pub fn check(&self, auto: bool, tool: &str, args: &str) -> bool {

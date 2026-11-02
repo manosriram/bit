@@ -78,10 +78,7 @@ impl Client {
         let mut res = req.body(body).send().await?;
         if !res.status().is_success() {
             let status = res.status().as_u16();
-            return Err(Error::Status(
-                status,
-                res.text().await.unwrap_or_default().into(),
-            ));
+            return Err(Error::Status(status, res.text().await.unwrap_or_default().into()));
         }
         let mut acc = Acc::new(on_text);
         while let Some(chunk) = res.chunk().await? {
@@ -116,54 +113,46 @@ impl<F: FnMut(&str)> Acc<F> {
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<(), Error> {
-        let Self {
-            sse,
-            on_text,
-            text,
-            reasoning,
-            calls,
-            usage,
-            done,
-        } = self;
-        sse.feed(chunk, |data| {
-            if *done {
-                return Ok(());
+        // Taken out for the call, so `data` can borrow the rest of `self`.
+        let mut sse = std::mem::take(&mut self.sse);
+        let r = sse.feed(chunk, |d| self.data(d));
+        self.sse = sse;
+        r
+    }
+
+    fn data(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.done || data == b"[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        let c: Chunk = serde_json::from_slice(data)?;
+        if let Some(e) = c.error {
+            return Err(Error::Api(e.get().into()));
+        }
+        for d in c.choices.into_iter().map(|c| c.delta) {
+            if let Some(s) = d.content.as_deref() {
+                (self.on_text)(s);
+                self.text.push_str(s);
             }
-            if data == b"[DONE]" {
-                *done = true;
-                return Ok(());
-            }
-            let c: Chunk = serde_json::from_slice(data)?;
-            if let Some(e) = c.error {
-                return Err(Error::Api(e.get().into()));
-            }
-            for d in c.choices.into_iter().map(|c| c.delta) {
-                if let Some(s) = d.content.as_deref() {
-                    on_text(s);
-                    text.push_str(s);
+            self.reasoning.push_str(d.reasoning_content.as_deref().unwrap_or(""));
+            for t in d.tool_calls {
+                if self.calls.len() <= t.index {
+                    self.calls.resize(t.index + 1, ToolCall::default());
                 }
-                reasoning.push_str(d.reasoning_content.as_deref().unwrap_or(""));
-                for t in d.tool_calls {
-                    if calls.len() <= t.index {
-                        calls.resize(t.index + 1, ToolCall::default());
-                    }
-                    let call = &mut calls[t.index];
-                    if let Some(id) = t.id.filter(|id| !id.is_empty()) {
-                        call.id = id.into_owned();
-                    }
-                    let f = t.function;
-                    // Some providers repeat the name in every chunk; it is never split.
-                    if let Some(name) = f.name.filter(|_| call.name.is_empty()) {
-                        call.name = name.into_owned();
-                    }
-                    call.args.push_str(f.arguments.as_deref().unwrap_or(""));
+                let call = &mut self.calls[t.index];
+                if let Some(id) = t.id.filter(|id| !id.is_empty()) {
+                    call.id = id.into_owned();
                 }
+                let f = t.function;
+                // Some providers repeat the name in every chunk; it is never split.
+                if let Some(name) = f.name.filter(|_| call.name.is_empty()) {
+                    call.name = name.into_owned();
+                }
+                call.args.push_str(f.arguments.as_deref().unwrap_or(""));
             }
-            if let Some(u) = c.usage {
-                *usage = u;
-            }
-            Ok(())
-        })
+        }
+        self.usage = c.usage.unwrap_or(self.usage);
+        Ok(())
     }
 
     fn finish(mut self) -> Result<Completion, Error> {
@@ -187,18 +176,11 @@ impl<F: FnMut(&str)> Acc<F> {
                 .map(|c| WireCall {
                     id: &c.id,
                     kind: "function",
-                    function: WireFn {
-                        name: &c.name,
-                        arguments: &c.args,
-                    },
+                    function: WireFn { name: &c.name, arguments: &c.args },
                 })
                 .collect(),
         })?;
-        Ok(Completion {
-            message,
-            tool_calls: self.calls,
-            usage: self.usage,
-        })
+        Ok(Completion { message, tool_calls: self.calls, usage: self.usage })
     }
 }
 
@@ -287,14 +269,9 @@ struct Details {
 
 impl From<WireUsage> for Usage {
     fn from(w: WireUsage) -> Self {
-        let cached = w
-            .prompt_cache_hit_tokens
-            .or(w.prompt_tokens_details.and_then(|d| d.cached_tokens));
-        Usage {
-            input: w.prompt_tokens,
-            cached: cached.unwrap_or(0),
-            output: w.completion_tokens,
-        }
+        let cached =
+            w.prompt_cache_hit_tokens.or(w.prompt_tokens_details.and_then(|d| d.cached_tokens));
+        Usage { input: w.prompt_tokens, cached: cached.unwrap_or(0), output: w.completion_tokens }
     }
 }
 
@@ -315,10 +292,7 @@ impl std::error::Error for Error {}
 impl Error {
     /// Rate limits, server errors and dropped connections often pass; anything else won't.
     pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Error::Status(429 | 500..=599, _) | Error::Http(_) | Error::Disconnected
-        )
+        matches!(self, Error::Status(429 | 500..=599, _) | Error::Http(_) | Error::Disconnected)
     }
 }
 
@@ -364,37 +338,20 @@ mod tests {
     fn utf8_split() {
         let (text, message, _) = run(include_bytes!("../testdata/utf8.sse")).unwrap();
         assert_eq!(text, "héllo 世界 🦀\n\"ok\"");
-        assert_eq!(
-            &*message,
-            r#"{"role":"assistant","content":"héllo 世界 🦀\n\"ok\""}"#
-        );
+        assert_eq!(&*message, r#"{"role":"assistant","content":"héllo 世界 🦀\n\"ok\""}"#);
     }
 
     #[test]
     fn openai_usage_only_final_chunk() {
         let (text, _, usage) = run(include_bytes!("../testdata/openai.sse")).unwrap();
         assert_eq!(text, "Hi there");
-        assert_eq!(
-            usage,
-            Usage {
-                input: 1200,
-                cached: 1024,
-                output: 3
-            }
-        );
+        assert_eq!(usage, Usage { input: 1200, cached: 1024, output: 3 });
     }
 
     #[test]
     fn deepseek_usage() {
         let (_, _, usage) = run(include_bytes!("../testdata/deepseek.sse")).unwrap();
-        assert_eq!(
-            usage,
-            Usage {
-                input: 900,
-                cached: 832,
-                output: 2
-            }
-        );
+        assert_eq!(usage, Usage { input: 900, cached: 832, output: 2 });
     }
 
     #[test]
@@ -423,20 +380,12 @@ mod tests {
 
     #[test]
     fn api_error() {
-        assert!(
-            run(include_bytes!("../testdata/error.sse"))
-                .unwrap_err()
-                .starts_with("api: ")
-        );
+        assert!(run(include_bytes!("../testdata/error.sse")).unwrap_err().starts_with("api: "));
     }
 
     #[test]
     fn cost() {
-        let u = Usage {
-            input: 1_000_000,
-            cached: 500_000,
-            output: 1_000_000,
-        };
+        let u = Usage { input: 1_000_000, cached: 500_000, output: 1_000_000 };
         let c = models::find("deepseek-chat").unwrap().cost(&u);
         assert!((c - (0.14 + 0.014 + 0.42)).abs() < 1e-9);
         assert_eq!(models::find("kimi-k3").unwrap().output, 15.0);

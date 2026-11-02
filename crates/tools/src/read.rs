@@ -29,20 +29,13 @@ pub fn run(a: Args, cx: &Ctx) -> Result<String, String> {
     let first = a.offset.unwrap_or(1).max(1);
     if first > total {
         return Err(err(
-            format_args!(
-                "offset {first} is past the end of {} ({total} lines)",
-                a.path
-            ),
+            format_args!("offset {first} is past the end of {} ({total} lines)", a.path),
             "pass a smaller offset",
         ));
     }
     let mut out = String::new();
     let mut last = first - 1;
-    for line in text
-        .lines()
-        .skip(first - 1)
-        .take(a.limit.unwrap_or(LIMIT).max(1))
-    {
+    for line in text.lines().skip(first - 1).take(a.limit.unwrap_or(LIMIT).max(1)) {
         if out.len() > BYTES_MAX {
             break;
         }
@@ -72,10 +65,7 @@ mod tests {
         let o = exec("read", r#"{"path":"a.txt"}"#, &cx).await;
         assert_eq!(o.content, "     1\tone\n     2\ttwo\n     3\tthree\n");
         let o = exec("read", r#"{"path":"a.txt","offset":2,"limit":1}"#, &cx).await;
-        assert_eq!(
-            o.content,
-            "     2\ttwo\n[lines 2-2 of 3. hint: read again with offset 3]\n"
-        );
+        assert_eq!(o.content, "     2\ttwo\n[lines 2-2 of 3. hint: read again with offset 3]\n");
         let o = exec("read", r#"{"path":"a.txt","offset":9}"#, &cx).await;
         assert!(!o.ok && o.content.contains("past the end"));
 
@@ -85,10 +75,6 @@ mod tests {
         let o = exec("read", r#"{"path":"."}"#, &cx).await;
         assert!(!o.ok && o.content.contains("hint: list its files with glob"));
         let o = exec("read", r#"{"path":"missing"}"#, &cx).await;
-        assert!(
-            !o.ok
-                && o.content
-                    .contains("hint: check the path, or find it with glob")
-        );
+        assert!(!o.ok && o.content.contains("hint: check the path, or find it with glob"));
     }
 }

@@ -22,12 +22,7 @@ pub async fn run(a: Args, cx: &Ctx) -> Result<String, String> {
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .map_err(|e| {
-            err(
-                format_args!("cannot start sh: {e}"),
-                "check the working directory",
-            )
-        })?;
+        .map_err(|e| err(format_args!("cannot start sh: {e}"), "check the working directory"))?;
     let group = Group(child.id().map_or(0, |id| id as i32));
     let mut pipe = child.stdout.take().expect("stdout is piped");
     let mut buf = Vec::new();
@@ -43,15 +38,10 @@ pub async fn run(a: Args, cx: &Ctx) -> Result<String, String> {
     .await;
     let out = cap(String::from_utf8_lossy(&buf).into_owned(), cx);
     match done {
-        Ok(Ok(s)) if s.success() => Ok(if out.is_empty() {
-            "(no output)".into()
-        } else {
-            out
-        }),
-        Ok(Ok(s)) => Err(format!(
-            "{out}[exit {}]",
-            s.code().map_or("killed".into(), |c| c.to_string())
-        )),
+        Ok(Ok(s)) if s.success() => Ok(if out.is_empty() { "(no output)".into() } else { out }),
+        Ok(Ok(s)) => {
+            Err(format!("{out}[exit {}]", s.code().map_or("killed".into(), |c| c.to_string())))
+        }
         Ok(Err(e)) => Err(err(format_args!("waiting for sh: {e}"), "try again")),
         Err(_) => Err(format!(
             "{out}{}",
@@ -113,12 +103,7 @@ mod tests {
     async fn background_jobs_do_not_hang_and_are_killed() {
         let cx = test_ctx("bash-bg");
         let t = Instant::now();
-        let o = exec(
-            "bash",
-            r#"{"command":"sleep 30 & echo $! > pid; echo hi"}"#,
-            &cx,
-        )
-        .await;
+        let o = exec("bash", r#"{"command":"sleep 30 & echo $! > pid; echo hi"}"#, &cx).await;
         assert_eq!(o.content, "hi\n");
         assert!(t.elapsed().as_secs() < 5);
         let pid = std::fs::read_to_string(cx.cwd.join("pid")).unwrap();
@@ -134,11 +119,7 @@ mod tests {
         let o = exec("bash", args, &cx).await;
         assert!(t.elapsed().as_secs() < 5);
         assert!(!o.ok);
-        assert!(
-            o.content.starts_with("started\nerror: timed out after 1s"),
-            "{}",
-            o.content
-        );
+        assert!(o.content.starts_with("started\nerror: timed out after 1s"), "{}", o.content);
         let pid = std::fs::read_to_string(cx.cwd.join("pid")).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!alive(&pid));

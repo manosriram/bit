@@ -50,26 +50,11 @@ struct Provider {
 }
 
 /// (name, base_url, api key env var, default model).
-const BUILTIN: &[(&str, &str, &str, Option<&str>)] = &[
-    (
-        "deepseek",
-        "https://api.deepseek.com/v1",
-        "DEEPSEEK_API_KEY",
-        Some("deepseek-chat"),
-    ),
-    (
-        "openai",
-        "https://api.openai.com/v1",
-        "OPENAI_API_KEY",
-        Some("gpt-5-mini"),
-    ),
+const BUILTIN: &[(&str, &str, &str, &str)] = &[
+    ("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"),
+    ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-5-mini"),
     // https://opencode.ai/v2/docs/console/go/; only its Chat Completions models work.
-    (
-        "opencode-go",
-        "https://opencode.ai/inference/go/openai/v1",
-        "OPENCODE_API_KEY",
-        Some("kimi-k3"),
-    ),
+    ("opencode-go", "https://opencode.ai/inference/go/openai/v1", "OPENCODE_API_KEY", "kimi-k3"),
 ];
 
 fn path() -> Option<PathBuf> {
@@ -93,29 +78,21 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         .flat_map(|(n, p)| p.unknown.keys().map(move |k| format!("providers.{n}.{k}")))
         .chain(file.bash.unknown.keys().map(|k| format!("bash.{k}")));
     for key in unknown.map(str::to_owned).chain(nested) {
-        eprintln!(
-            "bit: warning: unknown config key `{key}` in {}",
-            path.display()
-        );
+        eprintln!("bit: warning: unknown config key `{key}` in {}", path.display());
     }
 
     let name = file.provider.as_deref().unwrap_or_else(|| {
-        BUILTIN
-            .iter()
-            .find(|b| std::env::var_os(b.2).is_some())
-            .map_or("deepseek", |b| b.0)
+        BUILTIN.iter().find(|b| std::env::var_os(b.2).is_some()).map_or("deepseek", |b| b.0)
     });
     let builtin = BUILTIN.iter().find(|b| b.0 == name);
     let (base_url, key_env) = match file.providers.get(name) {
         Some(p) => (p.base_url.clone(), p.api_key_env.clone()),
-        None => builtin
-            .map(|b| (b.1.to_owned(), b.2.to_owned()))
-            .ok_or_else(|| {
-                format!(
-                    "error: unknown provider `{name}`. hint: add [providers.{name}] to {}",
-                    path.display()
-                )
-            })?,
+        None => builtin.map(|b| (b.1.to_owned(), b.2.to_owned())).ok_or_else(|| {
+            format!(
+                "error: unknown provider `{name}`. hint: add [providers.{name}] to {}",
+                path.display()
+            )
+        })?,
     };
     let mut notices = Vec::new();
     let api_key = std::env::var(&key_env).unwrap_or_else(|_| {
@@ -125,24 +102,14 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         ));
         String::new()
     });
-    let model = model
-        .or(file.model)
-        .or_else(|| Some(builtin?.3?.to_owned()))
-        .ok_or_else(|| {
-            format!(
-                "error: no model set for provider `{name}`. hint: pass --model, or set model in {}",
-                path.display()
-            )
-        })?;
-    let price = file
-        .models
-        .get(&model)
-        .copied()
-        .or_else(|| agent::models::find(&model));
-    let headers = vec![(
-        "user-agent".into(),
-        concat!("bit/", env!("CARGO_PKG_VERSION")).into(),
-    )];
+    let model = model.or(file.model).or_else(|| Some(builtin?.3.to_owned())).ok_or_else(|| {
+        format!(
+            "error: no model set for provider `{name}`. hint: pass --model, or set model in {}",
+            path.display()
+        )
+    })?;
+    let price = file.models.get(&model).copied().or_else(|| agent::models::find(&model));
+    let headers = vec![("user-agent".into(), concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
     Ok(Config {
         provider: name.into(),
         model,

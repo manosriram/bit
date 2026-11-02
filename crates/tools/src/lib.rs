@@ -39,12 +39,7 @@ pub fn summary(name: &str, args: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
     let s = |k: &str| v.get(k).and_then(|x| x.as_str());
     match (name, s("path")) {
-        ("bash", _) => s("command")
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("")
-            .into(),
+        ("bash", _) => s("command").unwrap_or("").lines().next().unwrap_or("").into(),
         ("grep" | "glob", None) => format!("{:?}", s("pattern").unwrap_or("")),
         ("grep" | "glob", Some(p)) => format!("{:?} in {p}", s("pattern").unwrap_or("")),
         (_, p) => p.unwrap_or("").into(),
@@ -65,40 +60,28 @@ pub fn detail(name: &str, args: &str) -> String {
 }
 
 pub async fn exec(name: &str, args: &str, cx: &Ctx) -> Output {
-    let r = match name {
-        "read" => parse(args).and_then(|a| read::run(a, cx)),
-        "write" => parse(args).and_then(|a| write::run(a, cx)),
-        "edit" => parse(args).and_then(|a| edit::run(a, cx)),
-        "bash" => match parse(args) {
-            Ok(a) => bash::run(a, cx).await,
-            Err(e) => Err(e),
-        },
-        "grep" => match parse(args) {
-            Ok(a) => search::grep(a, cx).await,
-            Err(e) => Err(e),
-        },
-        "glob" => match parse(args) {
-            Ok(a) => search::glob(a, cx).await,
-            Err(e) => Err(e),
-        },
+    let r = call(name, args, cx).await;
+    Output { ok: r.is_ok(), content: r.unwrap_or_else(|e| e) }
+}
+
+async fn call(name: &str, args: &str, cx: &Ctx) -> Result<String, String> {
+    match name {
+        "read" => read::run(parse(args)?, cx),
+        "write" => write::run(parse(args)?, cx),
+        "edit" => edit::run(parse(args)?, cx),
+        "bash" => bash::run(parse(args)?, cx).await,
+        "grep" => search::grep(parse(args)?, cx).await,
+        "glob" => search::glob(parse(args)?, cx).await,
         _ => Err(err(
             format_args!("unknown tool `{name}`"),
             "use read, write, edit, bash, grep or glob",
         )),
-    };
-    let ok = r.is_ok();
-    Output {
-        ok,
-        content: r.unwrap_or_else(|e| e),
     }
 }
 
 fn parse<T: DeserializeOwned>(args: &str) -> Result<T, String> {
     serde_json::from_str(args).map_err(|e| {
-        err(
-            format_args!("bad arguments: {e}"),
-            "pass a JSON object that matches the tool's schema",
-        )
+        err(format_args!("bad arguments: {e}"), "pass a JSON object that matches the tool's schema")
     })
 }
 
@@ -131,10 +114,7 @@ fn cap(text: String, cx: &Ctx) -> String {
     if text.lines().count() <= 2 * KEEP && text.len() <= 2 * HALF {
         return text;
     }
-    let head_end = text
-        .match_indices('\n')
-        .nth(KEEP - 1)
-        .map_or(text.len(), |(i, _)| i + 1);
+    let head_end = text.match_indices('\n').nth(KEEP - 1).map_or(text.len(), |(i, _)| i + 1);
     let head = &text[..text.floor_char_boundary(head_end.min(HALF))];
     // A final newline ends the last line rather than starting a new one.
     let body = text.strip_suffix('\n').unwrap_or(&text);
@@ -156,9 +136,7 @@ fn cap(text: String, cx: &Ctx) -> String {
 fn spill(text: &str, cx: &Ctx) -> std::io::Result<PathBuf> {
     static N: AtomicU32 = AtomicU32::new(0);
     std::fs::create_dir_all(&cx.spill)?;
-    let path = cx
-        .spill
-        .join(format!("{}.txt", N.fetch_add(1, Ordering::Relaxed)));
+    let path = cx.spill.join(format!("{}.txt", N.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&path, text)?;
     Ok(path)
 }
@@ -168,10 +146,7 @@ pub(crate) fn test_ctx(name: &str) -> Ctx {
     let dir = std::env::temp_dir().join(format!("bit-test-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Ctx {
-        spill: dir.join(".spill"),
-        cwd: dir,
-    }
+    Ctx { spill: dir.join(".spill"), cwd: dir }
 }
 
 #[cfg(test)]
@@ -187,13 +162,7 @@ mod tests {
         assert!(out.contains("\nline 200\n[... 600 lines left out; full output in "));
         assert!(out.contains("hint: read it with offset]\nline 801\n"));
         assert!(out.ends_with("line 1000\n"));
-        let path = out
-            .split("full output in ")
-            .nth(1)
-            .unwrap()
-            .split(". hint")
-            .next()
-            .unwrap();
+        let path = out.split("full output in ").nth(1).unwrap().split(". hint").next().unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), text);
         assert_eq!(cap("short".into(), &cx), "short");
     }
@@ -202,23 +171,13 @@ mod tests {
     async fn exec_reports_bad_args_and_unknown_tools() {
         let cx = test_ctx("exec");
         let o = exec("read", "{}", &cx).await;
-        assert!(
-            !o.ok
-                && o.content
-                    .starts_with("error: bad arguments: missing field `path`")
-        );
+        assert!(!o.ok && o.content.starts_with("error: bad arguments: missing field `path`"));
         let o = exec("nope", "{}", &cx).await;
         assert!(!o.ok && o.content.contains("unknown tool `nope`"));
         serde_json::from_str::<serde_json::Value>(SCHEMAS).unwrap();
         assert_eq!(summary("read", r#"{"path":"a.rs"}"#), "a.rs");
-        assert_eq!(
-            summary("grep", r#"{"pattern":"feed(","path":"src"}"#),
-            r#""feed(" in src"#
-        );
+        assert_eq!(summary("grep", r#"{"pattern":"feed(","path":"src"}"#), r#""feed(" in src"#);
         assert_eq!(summary("bash", r#"{"command":"ls\npwd"}"#), "ls");
-        assert_eq!(
-            detail("edit", r#"{"old":"a\nb","new":"c"}"#),
-            "- a\n- b\n+ c\n"
-        );
+        assert_eq!(detail("edit", r#"{"old":"a\nb","new":"c"}"#), "- a\n- b\n+ c\n");
     }
 }

@@ -17,12 +17,7 @@ fn default_context() -> u32 {
 }
 
 const fn p(context: u32, input: f64, cached: f64, output: f64) -> Price {
-    Price {
-        context,
-        input,
-        cached,
-        output,
-    }
+    Price { context, input, cached, output }
 }
 
 /// OpenCode Go prices are from `opencode.ai/inference/go/v1/models` (Nov 2026).

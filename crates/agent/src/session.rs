@@ -58,18 +58,8 @@ impl Session {
                 _ => {}
             }
         }
-        let session = Self {
-            path: path.into(),
-            header: None,
-            file: None,
-            logged: messages.len(),
-        };
-        Ok(Loaded {
-            session,
-            messages,
-            model,
-            cost,
-        })
+        let session = Self { path: path.into(), header: None, file: None, logged: messages.len() };
+        Ok(Loaded { session, messages, model, cost })
     }
 
     pub fn id(&self) -> &str {
@@ -80,10 +70,8 @@ impl Session {
         if messages.is_empty() {
             return Ok(());
         }
-        let lines: String = messages
-            .iter()
-            .map(|m| format!("{{\"t\":\"msg\",\"msg\":{}}}\n", m.get()))
-            .collect();
+        let lines: String =
+            messages.iter().map(|m| format!("{{\"t\":\"msg\",\"msg\":{}}}\n", m.get())).collect();
         self.write(&lines)?;
         self.logged += messages.len();
         Ok(())
@@ -103,10 +91,7 @@ impl Session {
                 if let Some(dir) = self.path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
-                let f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)?;
+                let f = OpenOptions::new().create(true).append(true).open(&self.path)?;
                 self.file.insert(f)
             }
         };
@@ -143,14 +128,11 @@ pub fn latest(dir: &Path, cwd: &Path) -> io::Result<Option<PathBuf>> {
 /// The one session whose id starts with `prefix`.
 pub fn find(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut hits = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".jsonl"))
-        });
+    let mut hits = entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".jsonl"))
+    });
     match (hits.next(), hits.next()) {
         (Some(p), None) => Ok(p),
         (None, _) => Err(format!("no session starts with `{prefix}`")),
@@ -170,13 +152,11 @@ mod tests {
         s.append(&[]).unwrap();
         assert!(!dir.exists());
         // Odd spacing and key order must survive: the cache depends on the exact bytes.
-        let msgs: Vec<Box<RawValue>> = [
-            r#"{"role":"user", "content":"hi"}"#,
-            r#"{"content":"yo","role":"assistant"}"#,
-        ]
-        .iter()
-        .map(|m| RawValue::from_string((*m).into()).unwrap())
-        .collect();
+        let msgs: Vec<Box<RawValue>> =
+            [r#"{"role":"user", "content":"hi"}"#, r#"{"content":"yo","role":"assistant"}"#]
+                .iter()
+                .map(|m| RawValue::from_string((*m).into()).unwrap())
+                .collect();
         s.append(&msgs[..1]).unwrap();
         let u = llm::Usage::default();
         s.usage(&u, Some(0.25)).unwrap();
@@ -199,10 +179,7 @@ mod tests {
         let got: Vec<&str> = l.messages.iter().map(|m| m.get()).collect();
         assert_eq!(got, [msgs[0].get(), msgs[1].get()]);
 
-        assert_eq!(
-            latest(&dir, Path::new("/w")).unwrap(),
-            Some(dir.join("abc123.jsonl"))
-        );
+        assert_eq!(latest(&dir, Path::new("/w")).unwrap(), Some(dir.join("abc123.jsonl")));
         assert_eq!(latest(&dir, Path::new("/other")).unwrap(), None);
         assert!(find(&dir, "zz").is_err());
     }

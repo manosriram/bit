@@ -26,16 +26,11 @@ impl Input {
                 self.text.remove(self.cursor);
             }
             KeyCode::Left => {
-                self.cursor -= self.text[..self.cursor]
-                    .chars()
-                    .next_back()
-                    .map_or(0, char::len_utf8)
+                self.cursor -=
+                    self.text[..self.cursor].chars().next_back().map_or(0, char::len_utf8)
             }
             KeyCode::Right => {
-                self.cursor += self.text[self.cursor..]
-                    .chars()
-                    .next()
-                    .map_or(0, char::len_utf8)
+                self.cursor += self.text[self.cursor..].chars().next().map_or(0, char::len_utf8)
             }
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.text.len(),

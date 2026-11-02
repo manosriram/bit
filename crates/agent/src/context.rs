@@ -40,23 +40,14 @@ impl Context {
             serde_json::from_str::<serde_json::Value>(m.get())
                 .map_or_else(|_| Default::default(), |v| v[k].clone())
         };
-        let Some(i) = self
-            .messages
-            .iter()
-            .rposition(|m| field(m, "role") == "assistant")
-        else {
+        let Some(i) = self.messages.iter().rposition(|m| field(m, "role") == "assistant") else {
             return;
         };
-        let answered: Vec<serde_json::Value> = self.messages[i + 1..]
-            .iter()
-            .map(|m| field(m, "tool_call_id"))
-            .collect();
+        let answered: Vec<serde_json::Value> =
+            self.messages[i + 1..].iter().map(|m| field(m, "tool_call_id")).collect();
         let calls = field(&self.messages[i], "tool_calls");
         for c in calls.as_array().into_iter().flatten() {
-            if let Some(id) = c["id"]
-                .as_str()
-                .filter(|id| !answered.iter().any(|a| a == id))
-            {
+            if let Some(id) = c["id"].as_str().filter(|id| !answered.iter().any(|a| a == id)) {
                 self.messages.push(tool_msg(id, why));
             }
         }
@@ -68,30 +59,21 @@ impl Context {
 
     /// Concatenates the stored pieces; nothing is serialized again.
     pub(crate) fn body(&self) -> String {
-        let len = self
-            .messages
-            .iter()
-            .map(|m| m.get().len() + 1)
-            .sum::<usize>();
-        let mut body = String::with_capacity(self.prefix.len() + len + 2);
-        body.push_str(&self.prefix);
+        let mut body = self.prefix.clone();
         for m in &self.messages {
-            body.push(',');
-            body.push_str(m.get());
+            body += ",";
+            body += m.get();
         }
-        body.push_str("]}");
-        body
+        body + "]}"
     }
 }
 
 pub(crate) fn msg(role: &str, content: &str) -> Box<RawValue> {
-    serde_json::value::to_raw_value(&serde_json::json!({"role": role, "content": content}))
-        .expect("strings always serialize")
+    RawValue::from_string(serde_json::json!({"role": role, "content": content}).to_string())
+        .expect("json! is valid JSON")
 }
 
 pub(crate) fn tool_msg(id: &str, content: &str) -> Box<RawValue> {
-    serde_json::value::to_raw_value(
-        &serde_json::json!({"role": "tool", "tool_call_id": id, "content": content}),
-    )
-    .expect("strings always serialize")
+    let m = serde_json::json!({"role": "tool", "tool_call_id": id, "content": content});
+    RawValue::from_string(m.to_string()).expect("json! is valid JSON")
 }

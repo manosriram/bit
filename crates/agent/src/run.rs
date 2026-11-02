@@ -20,45 +20,21 @@ pub struct Agent {
     pub spent: f64,
 }
 
-/// What a session changes as it goes, apart from the history.
-struct State {
-    policy: Policy,
-    session: Session,
-    /// The session's cost in USD; `None` once a reply's price was unknown.
-    spent: Option<f64>,
-}
-
 /// Runs until the command channel closes.
 pub async fn run(
-    agent: Agent,
+    mut agent: Agent,
     mut cx: Context,
     mut cmds: UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
 ) {
-    let Agent {
-        client,
-        tools,
-        policy,
-        mode,
-        session,
-        price,
-        max_cost,
-        spent,
-    } = agent;
-    let mut state = State {
-        policy,
-        session,
-        spent: Some(spent),
-    };
     if !cx.messages.is_empty() {
         replay(&cx, &events);
-        let n = cx.messages.len();
-        let note = format!("resumed {} ({n} messages)", state.session.id());
+        let note = format!("resumed {} ({} messages)", agent.session.id(), cx.messages.len());
         let _ = events.send(Event::Notice(note.into()));
     }
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
     // only because `tokio::spawn` needs the future to be `Send`.
-    let auto = AtomicBool::new(mode == Mode::Auto);
+    let auto = AtomicBool::new(agent.mode == Mode::Auto);
     let (approve_tx, mut approvals) = unbounded_channel();
     while let Some(cmd) = cmds.recv().await {
         let text = match cmd {
@@ -72,16 +48,9 @@ pub async fn run(
         while approvals.try_recv().is_ok() {}
         let len = cx.messages.len();
         cx.messages.push(msg("user", &text));
-        let turn = Turn {
-            client: &client,
-            tools: &tools,
-            events: &events,
-            auto: &auto,
-            price,
-            max_cost,
-        };
+        let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
         let reason = tokio::select! {
-            r = turn.run(&mut cx, &mut state, &mut approvals) => r.err().unwrap_or(StopReason::Done),
+            r = turn.run(&mut cx, &mut approvals) => r.err().unwrap_or(StopReason::Done),
             () = listen(&mut cmds, &auto, &approve_tx) => StopReason::Cancelled,
         };
         let why = match reason {
@@ -93,8 +62,8 @@ pub async fn run(
         if let Some(why) = why {
             cx.repair(len, &format!("error: {why} before it finished"));
         }
-        turn.save(&cx, &mut state.session);
-        if let Err(e) = state.session.sync() {
+        turn.save(&cx);
+        if let Err(e) = turn.a.session.sync() {
             turn.save_failed(&e);
         }
         // A send fails only once the UI is gone, and then the command channel closes too.
@@ -103,60 +72,46 @@ pub async fn run(
 }
 
 struct Turn<'a> {
-    client: &'a llm::Client,
-    tools: &'a tools::Ctx,
+    a: &'a mut Agent,
     events: &'a UnboundedSender<Event>,
     auto: &'a AtomicBool,
-    price: Option<llm::Price>,
-    max_cost: Option<f64>,
 }
 
 impl Turn<'_> {
     async fn run(
-        &self,
+        &mut self,
         cx: &mut Context,
-        state: &mut State,
         approvals: &mut UnboundedReceiver<(Box<str>, Decision)>,
     ) -> Result<(), StopReason> {
-        let State {
-            policy,
-            session,
-            spent,
-        } = state;
         loop {
-            if let (Some(max), Some(s)) = (self.max_cost, *spent)
-                && s >= max
+            // An unknown price means `spent` is incomplete, so the cap can't be judged.
+            if let (Some(max), Some(_)) = (self.a.max_cost, self.a.price)
+                && self.a.spent >= max
             {
                 let n = format!(
-                    "error: the session has cost ${s:.4}, reaching max_cost ${max}. hint: raise --max-cost or max_cost, or start a new session"
+                    "error: the session has cost ${:.4}, reaching max_cost ${max}. hint: raise --max-cost or max_cost, or start a new session",
+                    self.a.spent
                 );
                 self.send(Event::Notice(n.into()));
                 return Err(StopReason::Budget);
             }
-            let c = self
-                .request(cx)
-                .await
-                .map_err(|e| StopReason::Error(e.to_string().into()))?;
-            let cost = self.price.map(|p| p.cost(&c.usage));
-            *spent = spent.zip(cost).map(|(a, b)| a + b);
-            if let Err(e) = session.usage(&c.usage, cost) {
+            let c = self.request(cx).await.map_err(|e| StopReason::Error(e.to_string().into()))?;
+            let cost = self.a.price.map(|p| p.cost(&c.usage));
+            self.a.spent += cost.unwrap_or(0.0);
+            if let Err(e) = self.a.session.usage(&c.usage, cost) {
                 self.save_failed(&e);
             }
             cx.messages.push(c.message);
             self.send(Event::Usage(c.usage));
-            if c.tool_calls.is_empty() {
-                self.save(cx, session);
-                return Ok(());
-            }
-            for call in c.tool_calls {
-                let (id, name) = (&*call.id, &*call.name);
-                let summary = tools::summary(name, &call.args);
-                let allowed = policy.check(self.auto.load(Relaxed), name, &call.args) || {
+            for call in &c.tool_calls {
+                let (id, name, args) = (&*call.id, &*call.name, &*call.args);
+                let summary = tools::summary(name, args);
+                let allowed = self.a.policy.check(self.auto.load(Relaxed), name, args) || {
                     self.send(Event::Approval {
                         id: id.into(),
                         name: name.into(),
-                        summary: summary.clone().into(),
-                        detail: tools::detail(name, &call.args).into(),
+                        summary: summary.as_str().into(),
+                        detail: tools::detail(name, args).into(),
                     });
                     let d = loop {
                         match approvals.recv().await {
@@ -166,7 +121,7 @@ impl Turn<'_> {
                         }
                     };
                     if d == Decision::Always {
-                        policy.always(name, &call.args);
+                        self.a.policy.always(name, args);
                     }
                     d != Decision::No
                 };
@@ -175,31 +130,25 @@ impl Turn<'_> {
                     name: name.into(),
                     summary: summary.into(),
                 });
-                let out = if allowed {
-                    tools::exec(name, &call.args, self.tools).await
-                } else {
-                    tools::Output {
-                        ok: false,
-                        content:
-                            "error: the user declined this call. hint: ask them what to do instead"
-                                .into(),
-                    }
+                let out = match allowed {
+                    true => tools::exec(name, args, &self.a.tools).await,
+                    false => tools::Output { ok: false, content: DECLINED.into() },
                 };
-                self.send(Event::ToolEnd {
-                    id: id.into(),
-                    ok: out.ok,
-                    preview: preview(name, out.ok, &out.content).into(),
-                });
+                let preview = preview(name, out.ok, &out.content).into();
+                self.send(Event::ToolEnd { id: id.into(), ok: out.ok, preview });
                 cx.messages.push(tool_msg(id, &out.content));
             }
-            self.save(cx, session);
+            self.save(cx);
+            if c.tool_calls.is_empty() {
+                return Ok(());
+            }
         }
     }
 
     /// Writes the messages the log doesn't have yet. Each call ends a whole step, so the log
     /// never holds a tool call without its result.
-    fn save(&self, cx: &Context, session: &mut Session) {
-        if let Err(e) = session.append(&cx.messages[session.logged..]) {
+    fn save(&mut self, cx: &Context) {
+        if let Err(e) = self.a.session.append(&cx.messages[self.a.session.logged..]) {
             self.save_failed(&e);
         }
     }
@@ -209,35 +158,31 @@ impl Turn<'_> {
         self.send(Event::Notice(n.into()));
     }
 
-    /// One model request, retried while nothing from it has reached the screen.
+    /// One model request, retried after 1s and 3s while nothing from it has reached the screen.
     async fn request(&self, cx: &Context) -> Result<llm::Completion, llm::Error> {
-        for wait in [1, 3] {
+        let mut waits = [1, 3].into_iter();
+        loop {
             let mut shown = false;
-            let r = self
-                .client
-                .stream(cx.body(), |t| {
-                    shown = true;
-                    self.send(Event::Text(t.into()));
-                })
-                .await;
-            match r {
-                Err(e) if !shown && e.retryable() => {
-                    let n = format!("{e}; retrying in {wait}s");
-                    self.send(Event::Notice(n.into()));
+            let on_text = |t: &str| {
+                shown = true;
+                self.send(Event::Text(t.into()));
+            };
+            match (self.a.client.stream(cx.body(), on_text).await, waits.next()) {
+                (Err(e), Some(wait)) if !shown && e.retryable() => {
+                    self.send(Event::Notice(format!("{e}; retrying in {wait}s").into()));
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
-                r => return r,
+                (r, _) => return r,
             }
         }
-        self.client
-            .stream(cx.body(), |t| self.send(Event::Text(t.into())))
-            .await
     }
 
     fn send(&self, e: Event) {
         let _ = self.events.send(e);
     }
 }
+
+const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
 
 /// The few words shown at the end of a tool's gutter line.
 fn preview(name: &str, ok: bool, content: &str) -> String {
@@ -354,10 +299,7 @@ mod tests {
         let session = Session::new(&dir.join("sessions"), "s1", &dir, "m");
         Agent {
             client: llm::Client::new(&format!("http://{addr}"), "k", Vec::new()),
-            tools: tools::Ctx {
-                spill: dir.join(".spill"),
-                cwd: dir,
-            },
+            tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir },
             policy: Policy::new(Vec::new()),
             mode: Mode::Ask,
             session,
@@ -368,12 +310,7 @@ mod tests {
     }
 
     /// $1, $0.50 and $2 per million: a reply from `sse` costs $0.00001.
-    const PRICE: llm::Price = llm::Price {
-        context: 0,
-        input: 1.0,
-        cached: 0.5,
-        output: 2.0,
-    };
+    const PRICE: llm::Price = llm::Price { context: 0, input: 1.0, cached: 0.5, output: 2.0 };
 
     /// Runs `agent` against the scripted `replies`; returns its command sender, its events and
     /// the request bodies the server saw.
@@ -382,11 +319,7 @@ mod tests {
         cx: Context,
         l: TcpListener,
         replies: Vec<String>,
-    ) -> (
-        UnboundedSender<Command>,
-        UnboundedReceiver<Event>,
-        UnboundedReceiver<String>,
-    ) {
+    ) -> (UnboundedSender<Command>, UnboundedReceiver<Event>, UnboundedReceiver<String>) {
         let (body_tx, bodies) = unbounded_channel();
         tokio::spawn(serve(l, replies, body_tx));
         let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -433,9 +366,7 @@ mod tests {
                     break i + 4;
                 }
             };
-            bodies
-                .send(String::from_utf8(req[body_at..].to_vec()).unwrap())
-                .unwrap();
+            bodies.send(String::from_utf8(req[body_at..].to_vec()).unwrap()).unwrap();
             // A reply that is a whole HTTP response, such as an error, is sent as is.
             let head = match reply.starts_with("HTTP/") {
                 true => "",
@@ -443,9 +374,7 @@ mod tests {
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
                 }
             };
-            s.write_all(format!("{head}{reply}").as_bytes())
-                .await
-                .unwrap();
+            s.write_all(format!("{head}{reply}").as_bytes()).await.unwrap();
             if head.is_empty() || reply.ends_with("[DONE]\n\n") {
                 s.shutdown().await.unwrap();
             } else {
@@ -458,18 +387,10 @@ mod tests {
     async fn turns_cancel_and_stable_prefix() {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let agent = agent(l.local_addr().unwrap(), "turns");
-        let replies = vec![
-            sse(&["Hel", "lo"], true),
-            sse(&["wai"], false),
-            sse(&["ok"], true),
-        ];
+        let replies = vec![sse(&["Hel", "lo"], true), sse(&["wai"], false), sse(&["ok"], true)];
         let cx = Context::new("m", None, Vec::new());
         let (cmd_tx, mut ev, mut bodies) = start(agent, cx, l, replies).await;
-        let usage = Event::Usage(Usage {
-            input: 10,
-            cached: 8,
-            output: 2,
-        });
+        let usage = Event::Usage(Usage { input: 10, cached: 8, output: 2 });
 
         cmd_tx.send(Command::Submit("one".into())).unwrap();
         for want in [
@@ -484,10 +405,7 @@ mod tests {
         cmd_tx.send(Command::Submit("two".into())).unwrap();
         assert_eq!(ev.recv().await.unwrap(), Event::Text("wai".into()));
         cmd_tx.send(Command::Cancel).unwrap();
-        assert_eq!(
-            ev.recv().await.unwrap(),
-            Event::TurnEnd(StopReason::Cancelled)
-        );
+        assert_eq!(ev.recv().await.unwrap(), Event::TurnEnd(StopReason::Cancelled));
 
         cmd_tx.send(Command::Submit("three".into())).unwrap();
         assert_eq!(ev.recv().await.unwrap(), Event::Text("ok".into()));
@@ -538,19 +456,9 @@ mod tests {
             }
         );
         let decision = Decision::No;
-        cmd_tx
-            .send(Command::Approve {
-                id: "w1".into(),
-                decision,
-            })
-            .unwrap();
+        cmd_tx.send(Command::Approve { id: "w1".into(), decision }).unwrap();
         assert_eq!(next(&mut ev).await, start("w1"));
-        let declined = "error: the user declined this call. hint: ask them what to do instead";
-        let end = Event::ToolEnd {
-            id: "w1".into(),
-            ok: false,
-            preview: declined.into(),
-        };
+        let end = Event::ToolEnd { id: "w1".into(), ok: false, preview: DECLINED.into() };
         assert_eq!(next(&mut ev).await, end);
         assert_eq!(next(&mut ev).await, Event::Text("fine".into()));
         assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Done));
@@ -559,11 +467,7 @@ mod tests {
         cmd_tx.send(Command::SetMode(Mode::Auto)).unwrap();
         cmd_tx.send(Command::Submit("again".into())).unwrap();
         assert_eq!(next(&mut ev).await, start("w2"));
-        let end = Event::ToolEnd {
-            id: "w2".into(),
-            ok: true,
-            preview: "ok".into(),
-        };
+        let end = Event::ToolEnd { id: "w2".into(), ok: true, preview: "ok".into() };
         assert_eq!(next(&mut ev).await, end);
         assert_eq!(next(&mut ev).await, Event::Text("done".into()));
         assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "hi");
@@ -571,7 +475,7 @@ mod tests {
         let _ = bodies.recv().await.unwrap();
         let b2 = bodies.recv().await.unwrap();
         let assistant = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"w1","type":"function","function":{"name":"write","arguments":"{\"path\":\"f.txt\",\"content\":\"hi\"}"}}]}"#;
-        let result = format!(r#"{{"content":"{declined}","role":"tool","tool_call_id":"w1"}}]}}"#);
+        let result = format!(r#"{{"content":"{DECLINED}","role":"tool","tool_call_id":"w1"}}]}}"#);
         assert!(b2.ends_with(&format!("{assistant},{result}")), "{b2}");
     }
 
@@ -581,11 +485,8 @@ mod tests {
         let agent = agent(l.local_addr().unwrap(), "cancel");
         let read = r#"{"path":"nope.txt"}"#;
         let write = r#"{"path":"f.txt","content":"hi"}"#;
-        let replies = vec![
-            call("r1", "read", read),
-            call("w1", "write", write),
-            sse(&["ok"], true),
-        ];
+        let replies =
+            vec![call("r1", "read", read), call("w1", "write", write), sse(&["ok"], true)];
         let cx = Context::new("m", None, Vec::new());
         let (cmds, mut ev, mut bodies) = start(agent, cx, l, replies).await;
         cmds.send(Command::Submit("go".into())).unwrap();
@@ -656,16 +557,11 @@ mod tests {
         cmds.send(Command::Submit("one".into())).unwrap();
         while next(&mut ev).await != Event::TurnEnd(StopReason::Done) {}
         cmds.send(Command::Submit("two".into())).unwrap();
-        let Event::Notice(n) = next(&mut ev).await else {
-            panic!("expected a notice")
-        };
+        let Event::Notice(n) = next(&mut ev).await else { panic!("expected a notice") };
         assert!(n.starts_with("error: the session has cost $0.0000, reaching max_cost $0.00001."));
         assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Budget));
         bodies.recv().await.unwrap();
-        assert!(
-            bodies.try_recv().is_err(),
-            "the stopped turn must not send a request"
-        );
+        assert!(bodies.try_recv().is_err(), "the stopped turn must not send a request");
     }
 
     #[tokio::test]
