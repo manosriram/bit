@@ -1,12 +1,9 @@
-```
-██        ██    ██
-██              ██
-██████    ██  ██████
-██    ██  ██    ██
-██    ██  ██    ██
-██████    ██      ████
-01100010 01101001 01110100
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="bit" src="assets/logo-light.svg" width="220">
+  </picture>
+</p>
 
 bit is a terminal coding agent written in Rust. It talks to any OpenAI-compatible
 Chat Completions API, and the model reads, edits and runs code in your working directory.
