@@ -4,4 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+agent = { path = "../agent" }
+tui = { path = "../tui" }
 lexopt = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+tokio = { version = "1", features = ["rt"] }

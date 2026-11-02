@@ -115,7 +115,11 @@ mod tests {
     #[tokio::test]
     async fn turns_cancel_and_stable_prefix() {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = llm::Client::new(&format!("http://{}", l.local_addr().unwrap()), "k");
+        let client = llm::Client::new(
+            &format!("http://{}", l.local_addr().unwrap()),
+            "k",
+            Vec::new(),
+        );
         let (body_tx, mut bodies) = unbounded_channel();
         let replies = vec![
             sse(&["Hel", "lo"], true),

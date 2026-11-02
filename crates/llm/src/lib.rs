@@ -10,6 +10,7 @@ pub struct Client {
     http: reqwest::Client,
     base_url: Box<str>,
     api_key: Box<str>,
+    headers: Box<[(Box<str>, Box<str>)]>,
 }
 
 #[derive(Debug)]
@@ -38,11 +39,13 @@ pub enum Error {
 }
 
 impl Client {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+    /// `headers` are sent with every request, after the auth and content-type headers.
+    pub fn new(base_url: &str, api_key: &str, headers: Vec<(Box<str>, Box<str>)>) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').into(),
             api_key: api_key.into(),
+            headers: headers.into(),
         }
     }
 
@@ -53,14 +56,15 @@ impl Client {
         body: String,
         on_text: impl FnMut(&str),
     ) -> Result<Completion, Error> {
-        let mut res = self
+        let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&*self.api_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await?;
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        for (k, v) in &self.headers {
+            req = req.header(&**k, &**v);
+        }
+        let mut res = req.body(body).send().await?;
         if !res.status().is_success() {
             let status = res.status().as_u16();
             return Err(Error::Status(

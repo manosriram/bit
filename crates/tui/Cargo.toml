@@ -2,3 +2,8 @@
 name = "tui"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+agent = { path = "../agent" }
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste", "windows"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
