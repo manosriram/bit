@@ -22,6 +22,18 @@ pub fn width(c: char) -> usize {
     }
 }
 
+/// The longest prefix of `s` that fits in `max` columns.
+pub fn clip(s: &str, max: usize) -> &str {
+    let mut w = 0;
+    for (i, c) in s.char_indices() {
+        w += width(c);
+        if w > max {
+            return &s[..i];
+        }
+    }
+    s
+}
+
 pub fn str_width(s: &str) -> usize {
     s.chars().map(width).sum()
 }

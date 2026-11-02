@@ -7,8 +7,10 @@ pub struct Config {
     pub base_url: String,
     pub api_key: String,
     pub headers: Vec<(Box<str>, Box<str>)>,
-    /// Shown in the TUI at startup; set when the API key is missing.
-    pub notice: Option<String>,
+    /// Bash commands that run without asking.
+    pub allow: Vec<String>,
+    /// Shown in the TUI at startup, e.g. a missing API key.
+    pub notices: Vec<String>,
 }
 
 /// Unknown keys land in `unknown` so they can be warned about instead of failing the load.
@@ -18,6 +20,16 @@ struct File {
     provider: Option<String>,
     #[serde(default)]
     providers: BTreeMap<String, Provider>,
+    #[serde(default)]
+    bash: Bash,
+    #[serde(flatten)]
+    unknown: toml::Table,
+}
+
+#[derive(Deserialize, Default)]
+struct Bash {
+    #[serde(default)]
+    allow: Vec<String>,
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -71,7 +83,8 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
     let nested = file
         .providers
         .iter()
-        .flat_map(|(n, p)| p.unknown.keys().map(move |k| format!("providers.{n}.{k}")));
+        .flat_map(|(n, p)| p.unknown.keys().map(move |k| format!("providers.{n}.{k}")))
+        .chain(file.bash.unknown.keys().map(|k| format!("bash.{k}")));
     for key in unknown.map(str::to_owned).chain(nested) {
         eprintln!(
             "bit: warning: unknown config key `{key}` in {}",
@@ -97,16 +110,14 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
                 )
             })?,
     };
-    let (api_key, notice) = match std::env::var(&key_env) {
-        Ok(k) => (k, None),
-        Err(_) => (
-            String::new(),
-            Some(format!(
-                "error: {key_env} is not set. hint: export it, or set api_key_env for {name} in {}",
-                path.display()
-            )),
-        ),
-    };
+    let mut notices = Vec::new();
+    let api_key = std::env::var(&key_env).unwrap_or_else(|_| {
+        notices.push(format!(
+            "error: {key_env} is not set. hint: export it, or set api_key_env for {name} in {}",
+            path.display()
+        ));
+        String::new()
+    });
     let model = model
         .or(file.model)
         .or_else(|| Some(builtin?.3?.to_owned()))
@@ -128,7 +139,8 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         base_url,
         api_key,
         headers,
-        notice,
+        allow: file.bash.allow,
+        notices,
     })
 }
 

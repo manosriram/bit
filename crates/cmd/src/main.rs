@@ -31,7 +31,21 @@ fn run(args: args::Args) -> Result<(), String> {
         println!("{}", agent::Context::new(model).prefix());
         return Ok(());
     }
-    let cfg = config::load(args.model)?;
+    let mut cfg = config::load(args.model)?;
+    // Checked once here so a missing rg is a notice now, not a confusing tool error later.
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        cfg.notices.push("error: rg (ripgrep) is not installed, so grep and glob will fail. hint: install it, e.g. `brew install ripgrep`".into());
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("error: current directory: {e}"))?;
+    let mode = if args.auto {
+        agent::proto::Mode::Auto
+    } else {
+        agent::proto::Mode::Ask
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -39,14 +53,22 @@ fn run(args: args::Args) -> Result<(), String> {
     rt.block_on(async {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, ev_rx) = unbounded_channel();
-        let client = agent::Client::new(&cfg.base_url, &cfg.api_key, cfg.headers);
+        let agent = agent::Agent {
+            client: agent::Client::new(&cfg.base_url, &cfg.api_key, cfg.headers),
+            tools: agent::ToolCtx {
+                cwd,
+                spill: std::env::temp_dir().join(format!("bit-{}", std::process::id())),
+            },
+            policy: agent::Policy::new(cfg.allow),
+            mode,
+        };
         tokio::spawn(agent::run(
-            client,
+            agent,
             agent::Context::new(&cfg.model),
             cmd_rx,
             ev_tx,
         ));
-        tui::run(cmd_tx, ev_rx, &cfg.model, cfg.notice.as_deref()).await
+        tui::run(cmd_tx, ev_rx, &cfg.model, mode, &cfg.notices).await
     })
     .map_err(|e| format!("error: terminal: {e}"))
 }

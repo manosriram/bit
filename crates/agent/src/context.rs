@@ -14,6 +14,8 @@ impl Context {
         let head = serde_json::json!({"model": model, "stream": true, "stream_options": {"include_usage": true}});
         let mut prefix = head.to_string();
         prefix.pop();
+        prefix.push_str(",\"tools\":");
+        prefix.push_str(tools::SCHEMAS);
         prefix.push_str(",\"messages\":[");
         prefix.push_str(msg("system", PROMPT).get());
         Self {
@@ -47,4 +49,11 @@ impl Context {
 pub(crate) fn msg(role: &str, content: &str) -> Box<RawValue> {
     serde_json::value::to_raw_value(&serde_json::json!({"role": role, "content": content}))
         .expect("strings always serialize")
+}
+
+pub(crate) fn tool_msg(id: &str, content: &str) -> Box<RawValue> {
+    serde_json::value::to_raw_value(
+        &serde_json::json!({"role": "tool", "tool_call_id": id, "content": content}),
+    )
+    .expect("strings always serialize")
 }

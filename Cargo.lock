@@ -9,6 +9,7 @@ dependencies = [
  "llm",
  "serde_json",
  "tokio",
+ "tools",
 ]
 
 [[package]]

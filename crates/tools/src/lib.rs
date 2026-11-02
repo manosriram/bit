@@ -34,6 +34,36 @@ pub fn mutates(name: &str) -> bool {
     matches!(name, "write" | "edit" | "bash")
 }
 
+/// One line naming what a call touches, for the gutter and the approval title.
+pub fn summary(name: &str, args: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str());
+    match (name, s("path")) {
+        ("bash", _) => s("command")
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .into(),
+        ("grep" | "glob", None) => format!("{:?}", s("pattern").unwrap_or("")),
+        ("grep" | "glob", Some(p)) => format!("{:?} in {p}", s("pattern").unwrap_or("")),
+        (_, p) => p.unwrap_or("").into(),
+    }
+}
+
+/// The body of an approval: what would change, as `-`/`+` lines, or the command to run.
+pub fn detail(name: &str, args: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let mark = |m: &str, t: &str| t.lines().map(|l| format!("{m} {l}\n")).collect::<String>();
+    match name {
+        "edit" => mark("-", s("old")) + &mark("+", s("new")),
+        "write" => mark("+", s("content")),
+        "bash" => s("command").into(),
+        _ => String::new(),
+    }
+}
+
 pub async fn exec(name: &str, args: &str, cx: &Ctx) -> Output {
     let r = match name {
         "read" => parse(args).and_then(|a| read::run(a, cx)),
@@ -180,5 +210,15 @@ mod tests {
         let o = exec("nope", "{}", &cx).await;
         assert!(!o.ok && o.content.contains("unknown tool `nope`"));
         serde_json::from_str::<serde_json::Value>(SCHEMAS).unwrap();
+        assert_eq!(summary("read", r#"{"path":"a.rs"}"#), "a.rs");
+        assert_eq!(
+            summary("grep", r#"{"pattern":"feed(","path":"src"}"#),
+            r#""feed(" in src"#
+        );
+        assert_eq!(summary("bash", r#"{"command":"ls\npwd"}"#), "ls");
+        assert_eq!(
+            detail("edit", r#"{"old":"a\nb","new":"c"}"#),
+            "- a\n- b\n+ c\n"
+        );
     }
 }

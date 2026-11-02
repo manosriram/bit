@@ -1,11 +1,11 @@
 mod input;
 mod render;
 
-use agent::proto::{Command, Event, StopReason, Usage};
+use agent::proto::{Command, Decision, Event, Mode, StopReason, Usage};
 use crossterm::event::{self as ct, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
 use input::Input;
-use render::{Line, Term, wrap};
+use render::{Line, Term, clip, str_width, wrap};
 use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -14,6 +14,9 @@ use tokio::time::{Instant, sleep_until};
 const FRAME: Duration = Duration::from_millis(33);
 const SPIN: Duration = Duration::from_millis(100);
 const DIM: &str = "2";
+const YELLOW: &str = "33";
+/// Approval bodies longer than this are cut; the model's call is still shown in full later.
+const DETAIL_ROWS: usize = 12;
 /// Each pixel is `██`, so strokes line up exactly.
 const LOGO: [(&str, &str); 7] = [
     ("1", "  ██        ██    ██"),
@@ -30,11 +33,12 @@ pub async fn run(
     cmds: UnboundedSender<Command>,
     events: UnboundedReceiver<Event>,
     model: &str,
-    notice: Option<&str>,
+    mode: Mode,
+    notices: &[String],
 ) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), ct::EnableBracketedPaste)?;
-    let r = event_loop(cmds, events, model, notice).await;
+    let r = event_loop(cmds, events, model, mode, notices).await;
     let _ = execute!(io::stdout(), ct::DisableBracketedPaste);
     let _ = terminal::disable_raw_mode();
     r
@@ -44,7 +48,8 @@ async fn event_loop(
     cmds: UnboundedSender<Command>,
     mut events: UnboundedReceiver<Event>,
     model: &str,
-    notice: Option<&str>,
+    mode: Mode,
+    notices: &[String],
 ) -> io::Result<()> {
     // Asked before the reader thread starts, which would otherwise swallow the reply.
     let (_, height) = terminal::size()?;
@@ -68,12 +73,16 @@ async fn event_loop(
         busy: None,
         usage: None,
         quit_armed: false,
+        auto: mode == Mode::Auto,
+        tool: None,
+        approval: None,
+        section: None,
     };
     ui.logo();
-    if let Some(n) = notice {
+    for n in notices {
         let mut l = Line::new(ui.color);
         ui.done
-            .push(l.add("33", "!").add("", &format!(" {n}")).take());
+            .push(l.add(YELLOW, "!").add("", &format!(" {n}")).take());
     }
     let mut term = Term::default();
     term.pin(height, used)?;
@@ -125,6 +134,27 @@ struct Ui {
     busy: Option<Instant>,
     usage: Option<Usage>,
     quit_armed: bool,
+    auto: bool,
+    /// The running tool's name and summary, shown just above the box.
+    tool: Option<(Box<str>, Box<str>)>,
+    approval: Option<Approval>,
+    /// Whether the last scrollback rows were tool lines (`true`) or model text (`false`),
+    /// so a blank row can separate the two.
+    section: Option<bool>,
+}
+
+struct Approval {
+    id: Box<str>,
+    name: Box<str>,
+    summary: Box<str>,
+    detail: Box<str>,
+}
+
+/// Control characters could move the cursor and break the layout.
+fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 impl Ui {
@@ -151,7 +181,8 @@ impl Ui {
             env!("CARGO_PKG_VERSION"),
             self.model
         );
-        self.done.extend([String::new(), l.add(DIM, &info).take()]);
+        self.done
+            .extend([String::new(), l.add(DIM, clip(&info, self.width())).take()]);
     }
 
     /// Returns false when the user quits.
@@ -169,7 +200,21 @@ impl Ui {
                     return true;
                 }
                 self.quit_armed = false;
-                if k.code == KeyCode::Enter {
+                if let Some(a) = &self.approval {
+                    let decision = match k.code {
+                        KeyCode::Char('y') => Decision::Yes,
+                        KeyCode::Char('n') | KeyCode::Esc => Decision::No,
+                        KeyCode::Char('a') => Decision::Always,
+                        _ => return true,
+                    };
+                    let id = a.id.clone();
+                    let _ = cmds.send(Command::Approve { id, decision });
+                    self.approval = None;
+                } else if k.code == KeyCode::BackTab {
+                    self.auto = !self.auto;
+                    let mode = if self.auto { Mode::Auto } else { Mode::Ask };
+                    let _ = cmds.send(Command::SetMode(mode));
+                } else if k.code == KeyCode::Enter {
                     self.submit(cmds);
                 } else {
                     self.input.key(k);
@@ -196,6 +241,7 @@ impl Ui {
             }
         }
         self.done.push(String::new());
+        self.section = None;
         let _ = cmds.send(Command::Submit(text));
         self.busy = Some(Instant::now());
     }
@@ -203,6 +249,9 @@ impl Ui {
     fn event(&mut self, e: Event) {
         match e {
             Event::Text(t) => {
+                if !t.is_empty() {
+                    self.section(false);
+                }
                 for c in t.chars() {
                     match c {
                         '\n' => self.flush(true),
@@ -214,26 +263,82 @@ impl Ui {
                 self.flush(false);
             }
             Event::Usage(u) => self.usage = Some(u),
-            Event::TurnEnd(r) => {
-                if !self.partial.is_empty() {
-                    self.flush(true);
+            Event::Approval {
+                id,
+                name,
+                summary,
+                detail,
+            } => {
+                self.end_text();
+                self.approval = Some(Approval {
+                    id,
+                    name,
+                    summary,
+                    detail,
+                });
+            }
+            Event::ToolStart { name, summary, .. } => {
+                self.end_text();
+                self.section(true);
+                self.tool = Some((name, summary));
+            }
+            Event::ToolEnd { ok, preview, .. } => {
+                if let Some((name, summary)) = self.tool.take() {
+                    self.tool_line(&name, &summary, ok, &preview);
                 }
+            }
+            Event::TurnEnd(r) => {
+                self.end_text();
+                self.tool = None;
+                self.approval = None;
                 let secs = self.busy.take().map_or(0.0, |t| t.elapsed().as_secs_f32());
                 let mut l = Line::new(self.color);
                 match r {
                     StopReason::Done => l.add(DIM, &format!("  ({secs:.1}s)")),
-                    StopReason::Cancelled => l.add("33", "!").add("", " cancelled"),
-                    StopReason::Error(e) => {
-                        let e: String = e
-                            .chars()
-                            .map(|c| if c.is_control() { ' ' } else { c })
-                            .collect();
-                        l.add("31", "!").add("", &format!(" {e}"))
-                    }
+                    StopReason::Cancelled => l.add(YELLOW, "!").add("", " cancelled"),
+                    StopReason::Error(e) => l.add("31", "!").add("", &format!(" {}", clean(&e))),
                 };
                 self.done.push(l.take());
             }
         }
+    }
+
+    fn end_text(&mut self) {
+        if !self.partial.is_empty() {
+            self.flush(true);
+        }
+    }
+
+    fn section(&mut self, tool: bool) {
+        if self.section == Some(!tool) {
+            self.done.push(String::new());
+        }
+        self.section = Some(tool);
+    }
+
+    /// `* read src/a.rs  [28 lines]`, with the summary cut to fit one row.
+    fn tool_line(&mut self, name: &str, summary: &str, ok: bool, preview: &str) {
+        let w = self.width();
+        let preview = clean(preview);
+        let preview = clip(&preview, w / 2);
+        let room = w.saturating_sub(str_width(name) + str_width(preview) + 7);
+        let summary = clean(summary);
+        let mut l = Line::new(self.color);
+        if ok {
+            l.add("32", "*");
+        } else {
+            l.add("31", "!");
+        }
+        l.add("", " ")
+            .add("1", name)
+            .add("", &format!(" {}", clip(&summary, room)))
+            .add(DIM, &format!("  [{preview}]"));
+        self.done.push(l.take());
+    }
+
+    fn spinner(&self) -> &'static str {
+        let ms = self.busy.map_or(0, |t| t.elapsed().as_millis());
+        ["|", "/", "-", "\\"][(ms / 100 % 4) as usize]
     }
 
     /// Moves finished rows of model text to scrollback; with `all`, the last row too.
@@ -256,15 +361,26 @@ impl Ui {
         if !self.partial.is_empty() {
             f.push(format!("  {}", self.partial));
         }
-        f.push(String::new());
-
         let mut l = Line::new(self.color);
+        if let Some((name, summary)) = &self.tool {
+            let room = w.saturating_sub(str_width(name) + 14);
+            l.add(YELLOW, self.spinner())
+                .add("", " ")
+                .add("1", name)
+                .add("", &format!(" {}", clip(&clean(summary), room)))
+                .add(DIM, "  [running]");
+            f.push(l.take());
+        }
+        f.push(String::new());
+        if let Some(a) = &self.approval {
+            return self.approval_box(a, f);
+        }
+
         l.add(DIM, "+");
         if let Some(t) = self.busy {
             let e = t.elapsed();
-            let spin = ["|", "/", "-", "\\"][(e.as_millis() / 100 % 4) as usize];
             l.add(DIM, "-- ")
-                .add("33", spin)
+                .add(YELLOW, self.spinner())
                 .add("", &format!(" working {:.1}s", e.as_secs_f32()))
                 .add(DIM, " ");
             let right = " ctrl-c cancels --+";
@@ -272,7 +388,7 @@ impl Ui {
         } else {
             if self.quit_armed {
                 l.add(DIM, "-- ")
-                    .add("33", "ctrl-c again to quit")
+                    .add(YELLOW, "ctrl-c again to quit")
                     .add(DIM, " ");
             }
             l.fill(DIM, '-', w - 1).add(DIM, "+");
@@ -292,19 +408,71 @@ impl Ui {
             f.push(l.take());
         }
 
-        let status: String = self.status().chars().take(w - 6).collect();
-        l.add(DIM, "+-- ")
-            .add("", &status)
-            .add(DIM, " ")
-            .fill(DIM, '-', w - 1)
-            .add(DIM, "+");
-        f.push(l.take());
+        f.push(self.status_border(DIM));
         (f, (top + row, col + 2))
     }
 
+    /// The box while a tool waits for approval: the call in the top border, what it would
+    /// change inside, and the choices.
+    fn approval_box(&self, a: &Approval, mut f: Vec<String>) -> (Vec<String>, (usize, usize)) {
+        let w = self.width();
+        let mut l = Line::new(self.color);
+        let room = w.saturating_sub(str_width(&a.name) + 12);
+        l.add(YELLOW, "+-- ")
+            .add("33;1", "? ")
+            .add("1", &a.name)
+            .add("", &format!(" {} ", clip(&clean(&a.summary), room)))
+            .fill(YELLOW, '-', w - 1)
+            .add(YELLOW, "+");
+        f.push(l.take());
+        let row = |l: &mut Line, f: &mut Vec<String>, sgr: &str, s: &str| {
+            l.add(YELLOW, "| ")
+                .add(sgr, clip(s, w - 4))
+                .fill("", ' ', w - 2)
+                .add(YELLOW, " |");
+            f.push(l.take());
+        };
+        let lines: Vec<String> = a.detail.lines().map(clean).collect();
+        for s in lines.iter().take(DETAIL_ROWS) {
+            let sgr = match s.get(..2) {
+                Some("- ") => "31",
+                Some("+ ") => "32",
+                _ => "",
+            };
+            row(&mut l, &mut f, sgr, s);
+        }
+        if lines.len() > DETAIL_ROWS {
+            let more = format!("... {} more lines", lines.len() - DETAIL_ROWS);
+            row(&mut l, &mut f, DIM, &more);
+        }
+        row(&mut l, &mut f, "", "");
+        let at = f.len();
+        row(
+            &mut l,
+            &mut f,
+            "1",
+            "[y]es  [n]o  [a]lways for this session",
+        );
+        f.push(self.status_border(YELLOW));
+        (f, (at, w - 2))
+    }
+
+    fn status_border(&self, sgr: &str) -> String {
+        let w = self.width();
+        let status = self.status();
+        let mut l = Line::new(self.color);
+        l.add(sgr, "+-- ")
+            .add("", clip(&status, w - 6))
+            .add(sgr, " ")
+            .fill(sgr, '-', w - 1)
+            .add(sgr, "+");
+        l.take()
+    }
+
     fn status(&self) -> String {
+        let mode = if self.auto { "auto" } else { "ask" };
         let Some(u) = self.usage else {
-            return self.model.to_string();
+            return format!("{mode} | {}", self.model);
         };
         let ctx = if u.input >= 1000 {
             format!("{:.1}k", f64::from(u.input) / 1000.0)
@@ -312,7 +480,7 @@ impl Ui {
             u.input.to_string()
         };
         format!(
-            "{} | {ctx} ctx, {}% cached",
+            "{mode} | {} | {ctx} ctx, {}% cached",
             self.model,
             u.cached * 100 / u.input.max(1)
         )

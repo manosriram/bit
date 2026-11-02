@@ -17,7 +17,16 @@ pub struct Client {
 pub struct Completion {
     /// The assistant message in wire format, ready to append to the history.
     pub message: Box<RawValue>,
+    pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// JSON object text; `{}` when the model sent none.
+    pub args: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
@@ -85,6 +94,8 @@ struct Acc<F> {
     sse: sse::Sse,
     on_text: F,
     text: String,
+    reasoning: String,
+    calls: Vec<ToolCall>,
     usage: Usage,
     done: bool,
 }
@@ -95,6 +106,8 @@ impl<F: FnMut(&str)> Acc<F> {
             sse: sse::Sse::default(),
             on_text,
             text: String::new(),
+            reasoning: String::new(),
+            calls: Vec::new(),
             usage: Usage::default(),
             done: false,
         }
@@ -105,6 +118,8 @@ impl<F: FnMut(&str)> Acc<F> {
             sse,
             on_text,
             text,
+            reasoning,
+            calls,
             usage,
             done,
         } = self;
@@ -120,9 +135,27 @@ impl<F: FnMut(&str)> Acc<F> {
             if let Some(e) = c.error {
                 return Err(Error::Api(e.get().into()));
             }
-            for s in c.choices.iter().filter_map(|c| c.delta.content.as_deref()) {
-                on_text(s);
-                text.push_str(s);
+            for d in c.choices.into_iter().map(|c| c.delta) {
+                if let Some(s) = d.content.as_deref() {
+                    on_text(s);
+                    text.push_str(s);
+                }
+                reasoning.push_str(d.reasoning_content.as_deref().unwrap_or(""));
+                for t in d.tool_calls {
+                    if calls.len() <= t.index {
+                        calls.resize(t.index + 1, ToolCall::default());
+                    }
+                    let call = &mut calls[t.index];
+                    if let Some(id) = t.id.filter(|id| !id.is_empty()) {
+                        call.id = id.into_owned();
+                    }
+                    let f = t.function;
+                    // Some providers repeat the name in every chunk; it is never split.
+                    if let Some(name) = f.name.filter(|_| call.name.is_empty()) {
+                        call.name = name.into_owned();
+                    }
+                    call.args.push_str(f.arguments.as_deref().unwrap_or(""));
+                }
             }
             if let Some(u) = c.usage {
                 *usage = u;
@@ -131,16 +164,37 @@ impl<F: FnMut(&str)> Acc<F> {
         })
     }
 
-    fn finish(self) -> Result<Completion, Error> {
+    fn finish(mut self) -> Result<Completion, Error> {
         if !self.done {
             return Err(Error::Disconnected);
         }
+        for c in &mut self.calls {
+            if c.args.trim().is_empty() {
+                c.args = "{}".into();
+            }
+        }
+        let has_calls = !self.calls.is_empty();
         let message = serde_json::value::to_raw_value(&Message {
             role: "assistant",
-            content: &self.text,
+            content: (!self.text.is_empty() || !has_calls).then_some(&*self.text),
+            reasoning_content: (has_calls && !self.reasoning.is_empty())
+                .then_some(&*self.reasoning),
+            tool_calls: self
+                .calls
+                .iter()
+                .map(|c| WireCall {
+                    id: &c.id,
+                    kind: "function",
+                    function: WireFn {
+                        name: &c.name,
+                        arguments: &c.args,
+                    },
+                })
+                .collect(),
         })?;
         Ok(Completion {
             message,
+            tool_calls: self.calls,
             usage: self.usage,
         })
     }
@@ -149,7 +203,25 @@ impl<F: FnMut(&str)> Acc<F> {
 #[derive(Serialize)]
 struct Message<'a> {
     role: &'a str,
-    content: &'a str,
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<WireCall<'a>>,
+}
+
+#[derive(Serialize)]
+struct WireCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    function: WireFn<'a>,
+}
+
+#[derive(Serialize)]
+struct WireFn<'a> {
+    name: &'a str,
+    arguments: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -163,15 +235,37 @@ struct Chunk<'a> {
 
 #[derive(Deserialize)]
 struct Choice<'a> {
-    #[serde(borrow)]
+    #[serde(default, borrow)]
     delta: Delta<'a>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct Delta<'a> {
     // Borrowed unless the text has JSON escapes, so most deltas are not copied.
     #[serde(borrow)]
     content: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    reasoning_content: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    tool_calls: Vec<CallDelta<'a>>,
+}
+
+#[derive(Deserialize)]
+struct CallDelta<'a> {
+    #[serde(default)]
+    index: usize,
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    function: FnDelta<'a>,
+}
+
+#[derive(Deserialize, Default)]
+struct FnDelta<'a> {
+    #[serde(borrow)]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    arguments: Option<Cow<'a, str>>,
 }
 
 /// OpenAI reports cached tokens in `prompt_tokens_details.cached_tokens`; DeepSeek reports
@@ -289,6 +383,22 @@ mod tests {
                 output: 2
             }
         );
+    }
+
+    #[test]
+    fn tool_call_deltas_by_index() {
+        let data = include_bytes!("../testdata/tools.sse");
+        let (text, message, _) = run(data).unwrap();
+        assert_eq!(text, "Let me look.");
+        assert_eq!(
+            &*message,
+            r#"{"role":"assistant","content":"Let me look.","reasoning_content":"Need the file.","tool_calls":[{"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}},{"id":"call_b","type":"function","function":{"name":"glob","arguments":"{}"}}]}"#
+        );
+        let mut acc = Acc::new(|_: &str| {});
+        acc.feed(data).unwrap();
+        let calls = acc.finish().unwrap().tool_calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].args, r#"{"path":"a.rs"}"#);
     }
 
     #[test]
