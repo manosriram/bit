@@ -33,7 +33,8 @@ pub struct ToolCall {
 #[serde(from = "WireUsage")]
 pub struct Usage {
     pub input: u32,
-    pub cached: u32,
+    /// `None` when the provider didn't report cached tokens.
+    pub cached: Option<u32>,
     pub output: u32,
 }
 
@@ -269,7 +270,7 @@ impl From<WireUsage> for Usage {
     fn from(w: WireUsage) -> Self {
         let cached =
             w.prompt_cache_hit_tokens.or(w.prompt_tokens_details.and_then(|d| d.cached_tokens));
-        Usage { input: w.prompt_tokens, cached: cached.unwrap_or(0), output: w.completion_tokens }
+        Usage { input: w.prompt_tokens, cached, output: w.completion_tokens }
     }
 }
 
@@ -343,13 +344,16 @@ mod tests {
     fn openai_usage_only_final_chunk() {
         let (text, _, usage) = run(include_bytes!("../testdata/openai.sse")).unwrap();
         assert_eq!(text, "Hi there");
-        assert_eq!(usage, Usage { input: 1200, cached: 1024, output: 3 });
+        assert_eq!(usage, Usage { input: 1200, cached: Some(1024), output: 3 });
     }
 
     #[test]
     fn deepseek_usage() {
         let (_, _, usage) = run(include_bytes!("../testdata/deepseek.sse")).unwrap();
-        assert_eq!(usage, Usage { input: 900, cached: 832, output: 2 });
+        assert_eq!(usage, Usage { input: 900, cached: Some(832), output: 2 });
+        let none: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":5,"completion_tokens":1}"#).unwrap();
+        assert_eq!(none.cached, None);
     }
 
     #[test]

@@ -22,8 +22,9 @@ const DETAIL_ROWS: usize = 12;
 /// Rows of the model picker shown at once.
 const PICK_ROWS: usize = 10;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 2] = [
+const COMMANDS: [(&str, &str, &str); 3] = [
     ("/clear", "", "start over; the model forgets this conversation"),
+    ("/compact", "", "summarize the conversation to free up context"),
     ("/model", "[id]", "pick the model, or set it to id"),
 ];
 const CHOICES: [(&str, Decision); 3] = [
@@ -94,6 +95,7 @@ async fn event_loop(
         done: Vec::new(),
         busy: None,
         usage: None,
+        cache: (0, None),
         quit_armed: false,
         auto: mode == Mode::Auto,
         tool: None,
@@ -164,6 +166,9 @@ struct Ui {
     done: Vec<String>,
     busy: Option<Instant>,
     usage: Option<Usage>,
+    /// Input and cached tokens summed over the turn's requests; `None` once one didn't
+    /// report cached tokens.
+    cache: (u64, Option<u64>),
     quit_armed: bool,
     auto: bool,
     /// The running tool's name and summary, shown just above the box.
@@ -357,10 +362,16 @@ impl Ui {
         if self.model.is_empty() {
             return self.pick(true);
         }
+        if self.input.text.trim() == "/compact" {
+            self.input.take();
+            let _ = cmds.send(Command::Compact);
+            (self.busy, self.usage, self.cache) = (Some(Instant::now()), None, (0, Some(0)));
+            return;
+        }
         let text = self.input.take();
         self.user(&text);
         let _ = cmds.send(Command::Submit(text));
-        self.busy = Some(Instant::now());
+        (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
     }
 
     fn set_model(&mut self, model: Box<str>, cmds: &UnboundedSender<Command>) {
@@ -443,7 +454,14 @@ impl Ui {
                 }
                 self.flush(false);
             }
-            Event::Usage(u) => self.usage = Some(u),
+            Event::Usage(u) => {
+                self.usage = Some(u);
+                let (input, cached) = self.cache;
+                self.cache = (
+                    input + u64::from(u.input),
+                    cached.zip(u.cached).map(|(a, b)| a + u64::from(b)),
+                );
+            }
             Event::User(t) => {
                 self.input.remember(&t);
                 self.user(&t);
@@ -479,7 +497,15 @@ impl Ui {
                 let secs = self.busy.take().map_or(0.0, |t| t.elapsed().as_secs_f32());
                 let mut l = Line::new(self.color);
                 match r {
-                    StopReason::Done => l.add(DIM, &format!("  ({secs:.1}s)")),
+                    StopReason::Done => {
+                        let cached = match self.cache {
+                            (input, Some(c)) if input > 0 => {
+                                format!(", {}% cached", c * 100 / input)
+                            }
+                            _ => String::new(),
+                        };
+                        l.add(DIM, &format!("  ({secs:.1}s{cached})"))
+                    }
                     StopReason::Cancelled => l.add(YELLOW, "!").add("", " cancelled"),
                     StopReason::Error(e) => l.add("31", "!").add("", &format!(" {}", clean(&e))),
                 };

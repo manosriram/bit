@@ -47,6 +47,7 @@ impl Session {
             match (r.t, r.msg) {
                 ("header" | "model", _) => model = r.model.unwrap_or_default(),
                 ("clear", _) => messages.clear(),
+                ("compact", Some(m)) => messages = vec![m.to_owned()],
                 ("msg", Some(m)) => messages.push(m.to_owned()),
                 _ => {}
             }
@@ -99,6 +100,12 @@ impl Session {
             Some(_) => Ok(()),
             None => self.write("{\"t\":\"clear\"}\n"),
         }
+    }
+
+    /// Records that the history was replaced by `summary`.
+    pub(crate) fn compact(&mut self, summary: &RawValue) -> io::Result<()> {
+        self.logged = 1;
+        self.write(&format!("{{\"t\":\"compact\",\"msg\":{}}}\n", summary.get()))
     }
 
     fn write(&mut self, lines: &str) -> io::Result<()> {

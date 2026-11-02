@@ -3,6 +3,7 @@ use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::session::Session;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
@@ -36,8 +37,10 @@ pub async fn run(
     let auto = AtomicBool::new(agent.mode == Mode::Auto);
     let (approve_tx, mut approvals) = unbounded_channel();
     while let Some(cmd) = cmds.recv().await {
+        // `None` is `/compact`: a turn that only compacts.
         let text = match cmd {
-            Command::Submit(text) => text,
+            Command::Submit(text) => Some(text),
+            Command::Compact => None,
             Command::SetMode(m) => {
                 auto.store(m == Mode::Auto, Relaxed);
                 continue;
@@ -57,6 +60,7 @@ pub async fn run(
             }
             Command::Clear => {
                 cx.messages.clear();
+                cx.tokens = 0;
                 if let Err(e) = agent.session.clear() {
                     let _ = events.send(save_failed(&e));
                 }
@@ -66,10 +70,21 @@ pub async fn run(
         };
         while approvals.try_recv().is_ok() {}
         let len = cx.messages.len();
-        cx.messages.push(msg("user", &text));
+        if let Some(text) = &text {
+            cx.messages.push(msg("user", text));
+        }
         let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
+        let work = async {
+            match text {
+                Some(_) => turn.run(&mut cx, &mut approvals).await,
+                None => {
+                    turn.compact(&mut cx).await;
+                    Ok(())
+                }
+            }
+        };
         let reason = tokio::select! {
-            r = turn.run(&mut cx, &mut approvals) => r.err().unwrap_or(StopReason::Done),
+            r = work => r.err().unwrap_or(StopReason::Done),
             () = listen(&mut cmds, &auto, &approve_tx) => StopReason::Cancelled,
         };
         let why = match reason {
@@ -102,7 +117,11 @@ impl Turn<'_> {
         approvals: &mut UnboundedReceiver<(Box<str>, Decision)>,
     ) -> Result<(), StopReason> {
         loop {
+            if cx.full() {
+                self.compact(cx).await;
+            }
             let c = self.request(cx).await.map_err(|e| StopReason::Error(e.to_string().into()))?;
+            cx.tokens = c.usage.input;
             if let Err(e) = self.a.session.usage(&c.usage) {
                 self.save_failed(&e);
             }
@@ -158,6 +177,42 @@ impl Turn<'_> {
         }
     }
 
+    /// Replaces the history with a summary and the user's latest message (§4). Runs only
+    /// between steps, so no tool call is left without its result.
+    async fn compact(&mut self, cx: &mut Context) {
+        let text = |m: &RawValue| {
+            let v: Value = serde_json::from_str(m.get()).unwrap_or_default();
+            v["content"].as_str().unwrap_or("").to_owned()
+        };
+        let Some(last) = cx.messages.iter().rposition(|m| m.get().contains(r#""role":"user""#))
+        else {
+            return self.send(Event::Notice("nothing to compact yet".into()));
+        };
+        let latest = text(&cx.messages[last]);
+        let latest = latest.split_once(LATEST).map_or(latest.as_str(), |(_, l)| l).to_owned();
+        let body = cx.summary_body(&msg("user", SUMMARIZE));
+        let c = match self.a.client.stream(body, |_| {}).await {
+            Ok(c) => c,
+            Err(e) => {
+                let n = format!(
+                    "error: compaction failed: {e}. hint: the full history is kept; /compact retries"
+                );
+                return self.send(Event::Notice(n.into()));
+            }
+        };
+        if let Err(e) = self.a.session.usage(&c.usage) {
+            self.save_failed(&e);
+        }
+        let summary = msg("user", &format!("{SUMMARY}\n\n{}{LATEST}{latest}", text(&c.message)));
+        if let Err(e) = self.a.session.compact(&summary) {
+            self.save_failed(&e);
+        }
+        let n = cx.messages.len();
+        (cx.messages, cx.tokens) = (vec![summary], 0);
+        let k = f64::from(c.usage.input) / 1e3;
+        self.send(Event::Notice(format!("compacted {n} messages ({k:.1}k tokens)").into()));
+    }
+
     fn save_failed(&self, e: &std::io::Error) {
         self.send(save_failed(e));
     }
@@ -195,6 +250,10 @@ fn remember(path: &Option<PathBuf>, model: &str) -> std::io::Result<()> {
 fn save_failed(e: &std::io::Error) -> Event {
     Event::Notice(format!("error: could not save the session: {e}. hint: check disk space").into())
 }
+
+const SUMMARIZE: &str = "Summarize this conversation so that you can continue the work from the summary alone: it will replace the history. Include the user's goal and requests, decisions made and why, files read or changed (with paths), commands and results that still matter, unresolved errors, the current state and the next steps, and any preferences the user stated. Be specific and terse. Do not call tools.";
+const SUMMARY: &str = "[The conversation so far was compacted. Summary:]";
+const LATEST: &str = "\n\n[The user's latest message, verbatim:]\n\n";
 
 const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
 
@@ -273,7 +332,7 @@ async fn listen(
                 let _ = approve.send((id, decision));
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
-            Command::Submit(_) | Command::SetModel(_) | Command::Clear => {}
+            Command::Submit(_) | Command::SetModel(_) | Command::Clear | Command::Compact => {}
         }
     }
 }
@@ -399,7 +458,7 @@ mod tests {
         let replies = vec![sse(&["Hel", "lo"], true), sse(&["wai"], false), sse(&["ok"], true)];
         let cx = Context::new("m", None, Vec::new());
         let (cmd_tx, mut ev, mut bodies) = start(agent, cx, l, replies).await;
-        let usage = Event::Usage(Usage { input: 10, cached: 8, output: 2 });
+        let usage = Event::Usage(Usage { input: 10, cached: Some(8), output: 2 });
 
         cmd_tx.send(Command::Submit("one".into())).unwrap();
         for want in [
@@ -584,5 +643,44 @@ mod tests {
         assert_eq!(next(&mut ev).await, Event::Text("a".into()));
         assert!(bodies.recv().await.unwrap().starts_with(r#"{"model":"m2","#));
         assert_eq!(std::fs::read_to_string(state).unwrap(), "m2");
+    }
+
+    #[tokio::test]
+    async fn compacts_a_full_window_and_keeps_the_latest_message() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "compact");
+        let dir = agent.tools.cwd.join("sessions");
+        // 100k input tokens: past 70% of the 128k window an unknown model gets.
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100000,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
+        let replies =
+            vec![full.into(), sse(&["SUM"], true), sse(&["B"], true), sse(&["SUM2"], true)];
+        let cx = Context::new("m", None, Vec::new());
+        let (cmds, mut ev, mut bodies) = start(agent, cx, l, replies).await;
+        cmds.send(Command::Submit("one".into())).unwrap();
+        while next(&mut ev).await != Event::TurnEnd(StopReason::Done) {}
+        cmds.send(Command::Submit("two".into())).unwrap();
+        let Event::Notice(n) = next(&mut ev).await else { panic!("expected a notice") };
+        assert!(n.starts_with("compacted 3 messages"), "{n}");
+        assert_eq!(next(&mut ev).await, Event::Text("B".into()));
+        assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Done));
+
+        let (_, b2, b3) = (
+            bodies.recv().await.unwrap(),
+            bodies.recv().await.unwrap(),
+            bodies.recv().await.unwrap(),
+        );
+        assert!(b2.ends_with(r#"call tools.","role":"user"}],"tool_choice":"none"}"#), "{b2}");
+        let prefix = Context::new("m", None, Vec::new()).prefix().to_owned();
+        let summary = format!("{SUMMARY}\n\nSUM{LATEST}two");
+        let want = format!("{prefix},{}]}}", msg("user", &summary).get());
+        assert_eq!(b3, want);
+
+        // `/compact` on a compacted history keeps the latest message once, not nested.
+        cmds.send(Command::Compact).unwrap();
+        assert!(matches!(next(&mut ev).await, Event::Notice(n) if n.starts_with("compacted 2")));
+        assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Done));
+        let log = Session::open(&dir.join("s1.jsonl")).unwrap().messages;
+        let want = msg("user", &format!("{SUMMARY}\n\nSUM2{LATEST}two"));
+        assert_eq!(log.iter().map(|m| m.get()).collect::<Vec<_>>(), [want.get()]);
     }
 }

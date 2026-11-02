@@ -8,6 +8,8 @@ pub struct Context {
     prefix: String,
     pub(crate) model: String,
     cache_key: Option<String>,
+    /// Input tokens of the last request: how full the window is. 0 until one is sent.
+    pub(crate) tokens: u32,
     pub(crate) messages: Vec<Box<RawValue>>,
 }
 
@@ -17,7 +19,7 @@ impl Context {
     /// history of a resumed session.
     pub fn new(model: &str, cache_key: Option<&str>, messages: Vec<Box<RawValue>>) -> Self {
         let (prefix, cache_key) = (String::new(), cache_key.map(str::to_owned));
-        let mut cx = Self { prefix, model: String::new(), cache_key, messages };
+        let mut cx = Self { prefix, model: String::new(), cache_key, tokens: 0, messages };
         cx.set_model(model);
         // A crash can cut a turn short; mend it the same way a cancel would.
         cx.repair(0, "error: bit stopped before this call finished");
@@ -68,12 +70,19 @@ impl Context {
 
     /// Concatenates the stored pieces; nothing is serialized again.
     pub(crate) fn body(&self) -> String {
-        let mut body = self.prefix.clone();
-        for m in &self.messages {
-            body += ",";
-            body += m.get();
-        }
-        body + "]}"
+        self.messages.iter().fold(self.prefix.clone(), |b, m| b + "," + m.get()) + "]}"
+    }
+
+    /// The request that asks for a summary: the history plus `ask`, with tools off.
+    pub(crate) fn summary_body(&self, ask: &RawValue) -> String {
+        let body = self.body();
+        format!("{},{}],\"tool_choice\":\"none\"}}", &body[..body.len() - 2], ask.get())
+    }
+
+    /// Whether the last request used more than 70% of the model's context window.
+    pub(crate) fn full(&self) -> bool {
+        let window = llm::models::context(&self.model).unwrap_or(128_000);
+        u64::from(self.tokens) * 10 > u64::from(window) * 7
     }
 }
 
