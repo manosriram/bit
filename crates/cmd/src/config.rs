@@ -4,14 +4,16 @@ use std::path::PathBuf;
 
 pub struct Config {
     pub provider: String,
-    pub model: String,
+    /// `None` until the user picks one.
+    pub model: Option<String>,
     pub base_url: String,
     pub api_key: String,
     pub headers: Vec<(Box<str>, Box<str>)>,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
-    /// The model's price: from config if set there, else from the built-in table.
-    pub price: Option<agent::Price>,
+    pub prices: BTreeMap<String, agent::Price>,
+    /// What the model picker offers: config `[models]` entries, then the built-in ones.
+    pub models: Vec<String>,
     pub max_cost: Option<f64>,
     /// Shown in the TUI at startup, e.g. a missing API key.
     pub notices: Vec<String>,
@@ -49,12 +51,12 @@ struct Provider {
     unknown: toml::Table,
 }
 
-/// (name, base_url, api key env var, default model).
-const BUILTIN: &[(&str, &str, &str, &str)] = &[
-    ("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"),
-    ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-5-mini"),
+/// (name, base_url, api key env var).
+const BUILTIN: &[(&str, &str, &str)] = &[
+    ("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
+    ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
     // https://opencode.ai/v2/docs/console/go/; only its Chat Completions models work.
-    ("opencode-go", "https://opencode.ai/inference/go/openai/v1", "OPENCODE_API_KEY", "kimi-k3"),
+    ("opencode-go", "https://opencode.ai/inference/go/openai/v1", "OPENCODE_API_KEY"),
 ];
 
 fn path() -> Option<PathBuf> {
@@ -102,22 +104,20 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         ));
         String::new()
     });
-    let model = model.or(file.model).or_else(|| Some(builtin?.3.to_owned())).ok_or_else(|| {
-        format!(
-            "error: no model set for provider `{name}`. hint: pass --model, or set model in {}",
-            path.display()
-        )
-    })?;
-    let price = file.models.get(&model).copied().or_else(|| agent::models::find(&model));
+    let mut models: Vec<String> = file.models.keys().cloned().collect();
+    models.extend(
+        agent::models::list(name).filter(|m| !file.models.contains_key(*m)).map(Into::into),
+    );
     let headers = vec![("user-agent".into(), concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
     Ok(Config {
         provider: name.into(),
-        model,
+        model: model.or(file.model),
         base_url,
         api_key,
         headers,
         allow: file.bash.allow,
-        price,
+        prices: file.models,
+        models,
         max_cost: file.max_cost,
         notices,
     })

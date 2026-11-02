@@ -17,6 +17,13 @@ const DIM: &str = "2";
 const YELLOW: &str = "33";
 /// Approval bodies longer than this are cut; the model's call is still shown in full later.
 const DETAIL_ROWS: usize = 12;
+/// Rows of the model picker shown at once.
+const PICK_ROWS: usize = 10;
+const CHOICES: [(&str, Decision); 3] = [
+    ("[y]es", Decision::Yes),
+    ("[n]o", Decision::No),
+    ("[a]lways for this session", Decision::Always),
+];
 /// Each pixel is `██`, so strokes line up exactly.
 const LOGO: [(&str, &str); 7] = [
     ("1", "  ██        ██    ██"),
@@ -33,12 +40,13 @@ pub async fn run(
     cmds: UnboundedSender<Command>,
     events: UnboundedReceiver<Event>,
     model: &str,
+    models: &[String],
     mode: Mode,
     notices: &[String],
 ) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), ct::EnableBracketedPaste)?;
-    let r = event_loop(cmds, events, model, mode, notices).await;
+    let r = event_loop(cmds, events, model, models, mode, notices).await;
     let _ = execute!(io::stdout(), ct::DisableBracketedPaste);
     let _ = terminal::disable_raw_mode();
     r
@@ -48,6 +56,7 @@ async fn event_loop(
     cmds: UnboundedSender<Command>,
     mut events: UnboundedReceiver<Event>,
     model: &str,
+    models: &[String],
     mode: Mode,
     notices: &[String],
 ) -> io::Result<()> {
@@ -65,6 +74,8 @@ async fn event_loop(
     });
     let mut ui = Ui {
         model: model.into(),
+        models: models.into(),
+        picker: None,
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
         input: Input::default(),
@@ -88,8 +99,8 @@ async fn event_loop(
     let mut dirty = true;
     loop {
         if dirty && last.elapsed() >= FRAME {
-            let (frame, cursor) = ui.frame();
-            term.draw(&ui.done, &frame, cursor)?;
+            let (frame, split, cursor) = ui.frame();
+            term.draw(&ui.done, &frame, split, cursor)?;
             ui.done.clear();
             last = Instant::now();
             dirty = false;
@@ -116,7 +127,11 @@ async fn event_loop(
 }
 
 struct Ui {
+    /// Empty until the user picks one.
     model: Box<str>,
+    /// What the model picker offers.
+    models: Vec<String>,
+    picker: Option<Picker>,
     color: bool,
     cols: usize,
     input: Input,
@@ -142,6 +157,35 @@ struct Approval {
     name: Box<str>,
     summary: Box<str>,
     detail: Box<str>,
+    /// The marked row of `CHOICES`.
+    at: usize,
+}
+
+struct Picker {
+    query: String,
+    /// The marked row among the models that match `query`.
+    at: usize,
+    /// Whether picking a model also sends the prompt in the input.
+    then_submit: bool,
+}
+
+/// The models whose id contains `query`, ignoring case.
+fn search<'m>(models: &'m [String], query: &str) -> Vec<&'m str> {
+    let q = query.to_lowercase();
+    models.iter().map(String::as_str).filter(|m| m.to_lowercase().contains(&q)).collect()
+}
+
+/// `j`/`k` and the arrows move `at` within `len` rows. `Enter` gives `Some(true)`, `Esc`
+/// `Some(false)`.
+fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => *at = at.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => *at = (*at + 1).min(len.saturating_sub(1)),
+        KeyCode::Enter => return Some(true),
+        KeyCode::Esc => return Some(false),
+        _ => {}
+    }
+    None
 }
 
 /// Control characters could move the cursor and break the layout.
@@ -168,7 +212,7 @@ impl Ui {
             Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
             _ => dir.display().to_string(),
         };
-        let info = format!("  bit {} | {} | {dir}", env!("CARGO_PKG_VERSION"), self.model);
+        let info = format!("  bit {} | {} | {dir}", env!("CARGO_PKG_VERSION"), self.model());
         self.done.extend([String::new(), l.add(DIM, clip(&info, self.width())).take()]);
     }
 
@@ -187,27 +231,67 @@ impl Ui {
                     return true;
                 }
                 self.quit_armed = false;
-                if let Some(a) = &self.approval {
+                if let Some(a) = &mut self.approval {
                     let decision = match k.code {
-                        KeyCode::Char('y') => Decision::Yes,
-                        KeyCode::Char('n') | KeyCode::Esc => Decision::No,
-                        KeyCode::Char('a') => Decision::Always,
-                        _ => return true,
+                        KeyCode::Char('y') => Some(Decision::Yes),
+                        KeyCode::Char('n') => Some(Decision::No),
+                        KeyCode::Char('a') => Some(Decision::Always),
+                        code => nav(code, &mut a.at, CHOICES.len())
+                            .map(|pick| if pick { CHOICES[a.at].1 } else { Decision::No }),
                     };
-                    let id = a.id.clone();
-                    let _ = cmds.send(Command::Approve { id, decision });
-                    self.approval = None;
-                } else if k.code == KeyCode::BackTab {
-                    self.auto = !self.auto;
-                    let mode = if self.auto { Mode::Auto } else { Mode::Ask };
-                    let _ = cmds.send(Command::SetMode(mode));
-                } else if k.code == KeyCode::Enter {
-                    self.submit(cmds);
+                    if let Some(decision) = decision {
+                        let _ = cmds.send(Command::Approve { id: a.id.clone(), decision });
+                        self.approval = None;
+                    }
+                } else if let Some(p) = &mut self.picker {
+                    if let KeyCode::Char(c) = k.code {
+                        p.query.push(c);
+                        p.at = 0;
+                    } else if k.code == KeyCode::Backspace && p.query.pop().is_some() {
+                        p.at = 0;
+                    }
+                    let found = search(&self.models, &p.query);
+                    let pick = match k.code {
+                        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc => {
+                            nav(k.code, &mut p.at, found.len())
+                        }
+                        _ => None,
+                    };
+                    let chosen = found.get(p.at).map(|m| Box::<str>::from(*m));
+                    let then_submit = p.then_submit;
+                    match (pick, chosen) {
+                        (Some(true), Some(m)) => {
+                            self.picker = None;
+                            self.model = m;
+                            let _ = cmds.send(Command::SetModel(self.model.clone()));
+                            if then_submit {
+                                self.submit(cmds);
+                            }
+                        }
+                        (Some(false), _) => self.picker = None,
+                        _ => {}
+                    }
                 } else {
-                    self.input.key(k);
+                    match k.code {
+                        KeyCode::Esc if self.busy.is_some() => {
+                            let _ = cmds.send(Command::Cancel);
+                        }
+                        KeyCode::BackTab => {
+                            self.auto = !self.auto;
+                            let mode = if self.auto { Mode::Auto } else { Mode::Ask };
+                            let _ = cmds.send(Command::SetMode(mode));
+                        }
+                        KeyCode::Enter => self.submit(cmds),
+                        KeyCode::Up => self.input.recall(true),
+                        KeyCode::Down => self.input.recall(false),
+                        _ => self.input.key(k),
+                    }
                 }
             }
-            ct::Event::Paste(s) => self.input.insert(&s),
+            ct::Event::Paste(s) => match &mut self.picker {
+                Some(p) => p.query.push_str(&clean(&s)),
+                None => self.input.insert(&s),
+            },
             _ => {}
         }
         true
@@ -217,10 +301,25 @@ impl Ui {
         if self.busy.is_some() || self.input.text.trim().is_empty() {
             return;
         }
+        if self.input.text.trim() == "/model" {
+            self.input.take();
+            return self.pick(false);
+        }
+        if self.model.is_empty() {
+            return self.pick(true);
+        }
         let text = self.input.take();
         self.user(&text);
         let _ = cmds.send(Command::Submit(text));
         self.busy = Some(Instant::now());
+    }
+
+    fn pick(&mut self, then_submit: bool) {
+        if self.models.is_empty() {
+            let n = "error: bit knows no models for this provider. hint: pass --model, or set model in the config";
+            return self.event(Event::Notice(n.into()));
+        }
+        self.picker = Some(Picker { query: String::new(), at: 0, then_submit });
     }
 
     /// A user message in scrollback, typed now or replayed from a resumed session.
@@ -257,7 +356,10 @@ impl Ui {
                 self.flush(false);
             }
             Event::Usage(u) => self.usage = Some(u),
-            Event::User(t) => self.user(&t),
+            Event::User(t) => {
+                self.input.remember(&t);
+                self.user(&t);
+            }
             Event::Notice(n) => {
                 self.end_text();
                 let mut l = Line::new(self.color);
@@ -270,7 +372,7 @@ impl Ui {
             }
             Event::Approval { id, name, summary, detail } => {
                 self.end_text();
-                self.approval = Some(Approval { id, name, summary, detail });
+                self.approval = Some(Approval { id, name, summary, detail, at: 0 });
             }
             Event::ToolStart { name, summary, .. } => {
                 self.end_text();
@@ -348,7 +450,8 @@ impl Ui {
 
     /// The live region: unfinished text, then the input box. Returns the rows and the
     /// cursor's (row, column).
-    fn frame(&self) -> (Vec<String>, (usize, usize)) {
+    /// Also returns where the box starts, so padding goes between the text and the box.
+    fn frame(&self) -> (Vec<String>, usize, (usize, usize)) {
         let w = self.width();
         let mut f = Vec::new();
         if !self.partial.is_empty() {
@@ -364,9 +467,25 @@ impl Ui {
                 .add(DIM, "  [running]");
             f.push(l.take());
         }
+        let split = f.len();
         f.push(String::new());
         if let Some(a) = &self.approval {
-            return self.approval_box(a, f);
+            let (f, cursor) = self.approval_box(a, f);
+            return (f, split, cursor);
+        }
+        if let Some(p) = &self.picker {
+            f.push(self.title("pick a model"));
+            let cursor = (f.len(), 10 + str_width(&p.query));
+            f.push(self.row("", &format!("search: {}", clean(&p.query))));
+            let found = search(&self.models, &p.query);
+            if found.is_empty() {
+                f.push(self.row(DIM, "  no match"));
+            }
+            let start =
+                p.at.saturating_sub(PICK_ROWS / 2).min(found.len().saturating_sub(PICK_ROWS));
+            self.list(&mut f, found.into_iter().skip(start).take(PICK_ROWS), p.at - start);
+            f.push(self.status_border(YELLOW));
+            return (f, split, cursor);
         }
 
         l.add(DIM, "+");
@@ -376,7 +495,7 @@ impl Ui {
                 .add(YELLOW, self.spinner())
                 .add("", &format!(" working {:.1}s", e.as_secs_f32()))
                 .add(DIM, " ");
-            let right = " ctrl-c cancels --+";
+            let right = " esc cancels --+";
             l.fill(DIM, '-', w - right.len()).add(DIM, right);
         } else {
             if self.quit_armed {
@@ -400,26 +519,16 @@ impl Ui {
         }
 
         f.push(self.status_border(DIM));
-        (f, (top + row, col + 2))
+        (f, split, (top + row, col + 2))
     }
 
     /// The box while a tool waits for approval: the call in the top border, what it would
     /// change inside, and the choices.
     fn approval_box(&self, a: &Approval, mut f: Vec<String>) -> (Vec<String>, (usize, usize)) {
         let w = self.width();
-        let mut l = Line::new(self.color);
+        let summary = clean(&a.summary);
         let room = w.saturating_sub(str_width(&a.name) + 12);
-        l.add(YELLOW, "+-- ")
-            .add("33;1", "? ")
-            .add("1", &a.name)
-            .add("", &format!(" {} ", clip(&clean(&a.summary), room)))
-            .fill(YELLOW, '-', w - 1)
-            .add(YELLOW, "+");
-        f.push(l.take());
-        let row = |l: &mut Line, f: &mut Vec<String>, sgr: &str, s: &str| {
-            l.add(YELLOW, "| ").add(sgr, clip(s, w - 4)).fill("", ' ', w - 2).add(YELLOW, " |");
-            f.push(l.take());
-        };
+        f.push(self.title(&format!("{} {}", a.name, clip(&summary, room))));
         let lines: Vec<String> = a.detail.lines().map(clean).collect();
         for s in lines.iter().take(DETAIL_ROWS) {
             let sgr = match s.get(..2) {
@@ -427,17 +536,52 @@ impl Ui {
                 Some("+ ") => "32",
                 _ => "",
             };
-            row(&mut l, &mut f, sgr, s);
+            f.push(self.row(sgr, s));
         }
         if lines.len() > DETAIL_ROWS {
-            let more = format!("... {} more lines", lines.len() - DETAIL_ROWS);
-            row(&mut l, &mut f, DIM, &more);
+            f.push(self.row(DIM, &format!("... {} more lines", lines.len() - DETAIL_ROWS)));
         }
-        row(&mut l, &mut f, "", "");
-        let at = f.len();
-        row(&mut l, &mut f, "1", "[y]es  [n]o  [a]lways for this session");
+        f.push(self.row("", ""));
+        let row = self.list(&mut f, CHOICES.iter().map(|c| c.0), a.at);
         f.push(self.status_border(YELLOW));
-        (f, (at, w - 2))
+        (f, (row, 2))
+    }
+
+    /// The yellow box's top border: `+-- ? <title> ---+`.
+    fn title(&self, title: &str) -> String {
+        let w = self.width();
+        let mut l = Line::new(self.color);
+        l.add(YELLOW, "+-- ").add("33;1", "? ").add("1", clip(title, w - 8)).add("", " ");
+        l.fill(YELLOW, '-', w - 1).add(YELLOW, "+").take()
+    }
+
+    /// One row inside the yellow box.
+    fn row(&self, sgr: &str, s: &str) -> String {
+        let w = self.width();
+        let mut l = Line::new(self.color);
+        l.add(YELLOW, "| ").add(sgr, clip(s, w - 4)).fill("", ' ', w - 2).add(YELLOW, " |").take()
+    }
+
+    /// Rows of a list with `>` on the marked one; returns the frame row of the mark.
+    fn list<'s>(
+        &self,
+        f: &mut Vec<String>,
+        items: impl Iterator<Item = &'s str>,
+        at: usize,
+    ) -> usize {
+        let mut mark = f.len();
+        for (i, s) in items.enumerate() {
+            if i == at {
+                mark = f.len();
+            }
+            let (sgr, m) = if i == at { ("1", ">") } else { ("", " ") };
+            f.push(self.row(sgr, &format!("{m} {s}")));
+        }
+        mark
+    }
+
+    fn model(&self) -> &str {
+        if self.model.is_empty() { "no model" } else { &self.model }
     }
 
     fn status_border(&self, sgr: &str) -> String {
@@ -445,10 +589,10 @@ impl Ui {
         let mode = if self.auto { "auto" } else { "ask" };
         let status = match self.usage.map(|u| u.input) {
             Some(n) if n >= 1000 => {
-                format!("{mode} | {} | {:.1}k ctx", self.model, f64::from(n) / 1e3)
+                format!("{mode} | {} | {:.1}k ctx", self.model(), f64::from(n) / 1e3)
             }
-            Some(n) => format!("{mode} | {} | {n} ctx", self.model),
-            None => format!("{mode} | {}", self.model),
+            Some(n) => format!("{mode} | {} | {n} ctx", self.model()),
+            None => format!("{mode} | {}", self.model()),
         };
         let mut l = Line::new(self.color);
         l.add(sgr, "+-- ")

@@ -3,6 +3,7 @@ use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::session::Session;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -14,7 +15,8 @@ pub struct Agent {
     pub policy: Policy,
     pub mode: Mode,
     pub session: Session,
-    pub price: Option<llm::Price>,
+    /// Prices from the config; models not in it use the built-in table.
+    pub prices: BTreeMap<String, llm::Price>,
     pub max_cost: Option<f64>,
     /// What the session's log says it has cost so far.
     pub spent: f64,
@@ -35,6 +37,7 @@ pub async fn run(
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
     // only because `tokio::spawn` needs the future to be `Send`.
     let auto = AtomicBool::new(agent.mode == Mode::Auto);
+    let mut price = (!cx.model.is_empty()).then(|| agent.price(&cx.model, &events)).flatten();
     let (approve_tx, mut approvals) = unbounded_channel();
     while let Some(cmd) = cmds.recv().await {
         let text = match cmd {
@@ -43,12 +46,20 @@ pub async fn run(
                 auto.store(m == Mode::Auto, Relaxed);
                 continue;
             }
+            Command::SetModel(m) => {
+                cx.set_model(&m);
+                price = agent.price(&m, &events);
+                if let Err(e) = agent.session.set_model(&m) {
+                    let _ = events.send(save_failed(&e));
+                }
+                continue;
+            }
             Command::Approve { .. } | Command::Cancel => continue,
         };
         while approvals.try_recv().is_ok() {}
         let len = cx.messages.len();
         cx.messages.push(msg("user", &text));
-        let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
+        let mut turn = Turn { a: &mut agent, events: &events, auto: &auto, price };
         let reason = tokio::select! {
             r = turn.run(&mut cx, &mut approvals) => r.err().unwrap_or(StopReason::Done),
             () = listen(&mut cmds, &auto, &approve_tx) => StopReason::Cancelled,
@@ -71,10 +82,25 @@ pub async fn run(
     }
 }
 
+impl Agent {
+    /// Config first, then the built-in table. An unknown price can't enforce `max_cost`.
+    fn price(&self, model: &str, events: &UnboundedSender<Event>) -> Option<llm::Price> {
+        let p = self.prices.get(model).copied().or_else(|| llm::models::find(model));
+        if p.is_none() && self.max_cost.is_some() {
+            let n = format!(
+                "error: the price of {model} is unknown, so max_cost can't be enforced. hint: add [models.\"{model}\"] with input, cached and output prices to the config"
+            );
+            let _ = events.send(Event::Notice(n.into()));
+        }
+        p
+    }
+}
+
 struct Turn<'a> {
     a: &'a mut Agent,
     events: &'a UnboundedSender<Event>,
     auto: &'a AtomicBool,
+    price: Option<llm::Price>,
 }
 
 impl Turn<'_> {
@@ -85,7 +111,7 @@ impl Turn<'_> {
     ) -> Result<(), StopReason> {
         loop {
             // An unknown price means `spent` is incomplete, so the cap can't be judged.
-            if let (Some(max), Some(_)) = (self.a.max_cost, self.a.price)
+            if let (Some(max), Some(_)) = (self.a.max_cost, self.price)
                 && self.a.spent >= max
             {
                 let n = format!(
@@ -96,7 +122,7 @@ impl Turn<'_> {
                 return Err(StopReason::Budget);
             }
             let c = self.request(cx).await.map_err(|e| StopReason::Error(e.to_string().into()))?;
-            let cost = self.a.price.map(|p| p.cost(&c.usage));
+            let cost = self.price.map(|p| p.cost(&c.usage));
             self.a.spent += cost.unwrap_or(0.0);
             if let Err(e) = self.a.session.usage(&c.usage, cost) {
                 self.save_failed(&e);
@@ -154,8 +180,7 @@ impl Turn<'_> {
     }
 
     fn save_failed(&self, e: &std::io::Error) {
-        let n = format!("error: could not save the session: {e}. hint: check disk space");
-        self.send(Event::Notice(n.into()));
+        self.send(save_failed(e));
     }
 
     /// One model request, retried after 1s and 3s while nothing from it has reached the screen.
@@ -180,6 +205,10 @@ impl Turn<'_> {
     fn send(&self, e: Event) {
         let _ = self.events.send(e);
     }
+}
+
+fn save_failed(e: &std::io::Error) -> Event {
+    Event::Notice(format!("error: could not save the session: {e}. hint: check disk space").into())
 }
 
 const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
@@ -259,7 +288,7 @@ async fn listen(
                 let _ = approve.send((id, decision));
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
-            Command::Submit(_) => {}
+            Command::Submit(_) | Command::SetModel(_) => {}
         }
     }
 }
@@ -303,7 +332,7 @@ mod tests {
             policy: Policy::new(Vec::new()),
             mode: Mode::Ask,
             session,
-            price: None,
+            prices: BTreeMap::new(),
             max_cost: None,
             spent: 0.0,
         }
@@ -551,7 +580,8 @@ mod tests {
     async fn max_cost_stops_the_next_turn_before_its_request() {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut agent = agent(l.local_addr().unwrap(), "budget");
-        (agent.price, agent.max_cost) = (Some(PRICE), Some(0.00001));
+        agent.prices.insert("m".into(), PRICE);
+        agent.max_cost = Some(0.00001);
         let cx = Context::new("m", None, Vec::new());
         let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
         cmds.send(Command::Submit("one".into())).unwrap();
@@ -577,5 +607,17 @@ mod tests {
         assert_eq!(next(&mut ev).await, retry);
         assert_eq!(next(&mut ev).await, Event::Text("ok".into()));
         assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Done));
+    }
+
+    #[tokio::test]
+    async fn set_model_switches_the_request_model() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "model");
+        let cx = Context::new("", None, Vec::new());
+        let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
+        cmds.send(Command::SetModel("m2".into())).unwrap();
+        cmds.send(Command::Submit("hi".into())).unwrap();
+        assert_eq!(next(&mut ev).await, Event::Text("a".into()));
+        assert!(bodies.recv().await.unwrap().starts_with(r#"{"model":"m2","#));
     }
 }

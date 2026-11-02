@@ -108,13 +108,15 @@ impl Term {
         &mut self,
         done: &[String],
         frame: &[String],
+        split: usize,
         cursor: (usize, usize),
     ) -> io::Result<()> {
         // Padding keeps the region at least as tall as the rows it replaces, so its last row
-        // stays on the terminal's last row.
+        // stays on the terminal's last row. It goes at `split`, so the rows above it (text
+        // still streaming) stay right under the scrollback and the box stays at the bottom.
         let pad = self.prev.len().saturating_sub(done.len() + frame.len());
-        let mut rows = vec![String::new(); pad];
-        rows.extend_from_slice(frame);
+        let mut rows = frame[..split].to_vec();
+        rows.extend(std::iter::repeat_n(String::new(), pad).chain(frame[split..].iter().cloned()));
         let mut out = String::from("\x1b[?25l");
         self.top(&mut out);
         if !done.is_empty() {
@@ -134,7 +136,7 @@ impl Term {
                 out.push_str("\r\n");
             }
         }
-        let row = pad + cursor.0;
+        let row = cursor.0 + if cursor.0 >= split { pad } else { 0 };
         let up = rows.len() - 1 - row;
         if up > 0 {
             let _ = write!(out, "\x1b[{up}A");

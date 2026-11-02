@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 /// The append-only log of one conversation.
 pub struct Session {
     path: PathBuf,
-    /// The header line, held until the first write so an empty session leaves no file.
-    header: Option<String>,
+    /// The working directory for the header line, held until the first write so an empty
+    /// session leaves no file.
+    header: Option<PathBuf>,
+    model: String,
     file: Option<File>,
     /// How many of the context's messages are already in the file.
     pub(crate) logged: usize,
@@ -17,7 +19,6 @@ pub struct Session {
 pub struct Loaded {
     pub session: Session,
     pub messages: Vec<Box<RawValue>>,
-    pub model: String,
     /// The summed cost of every reply whose price was known.
     pub cost: f64,
 }
@@ -34,13 +35,8 @@ struct Record<'a> {
 
 impl Session {
     pub fn new(dir: &Path, id: &str, cwd: &Path, model: &str) -> Self {
-        let header = serde_json::json!({"t": "header", "v": 1, "cwd": cwd, "model": model});
-        Self {
-            path: dir.join(format!("{id}.jsonl")),
-            header: Some(header.to_string()),
-            file: None,
-            logged: 0,
-        }
+        let path = dir.join(format!("{id}.jsonl"));
+        Self { path, header: Some(cwd.into()), model: model.into(), file: None, logged: 0 }
     }
 
     pub fn open(path: &Path) -> io::Result<Loaded> {
@@ -52,14 +48,20 @@ impl Session {
                 continue;
             };
             match (r.t, r.msg) {
-                ("header", _) => model = r.model.unwrap_or_default(),
+                ("header" | "model", _) => model = r.model.unwrap_or_default(),
                 ("msg", Some(m)) => messages.push(m.to_owned()),
                 ("usage", _) => cost += r.cost.unwrap_or(0.0),
                 _ => {}
             }
         }
-        let session = Self { path: path.into(), header: None, file: None, logged: messages.len() };
-        Ok(Loaded { session, messages, model, cost })
+        let session =
+            Self { path: path.into(), header: None, model, file: None, logged: messages.len() };
+        Ok(Loaded { session, messages, cost })
+    }
+
+    /// The model of the last header or `model` record.
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     pub fn id(&self) -> &str {
@@ -83,8 +85,21 @@ impl Session {
         self.write(&format!("{r}\n"))
     }
 
+    /// Before the first write the header just changes; after it, a `model` record is added.
+    pub(crate) fn set_model(&mut self, model: &str) -> io::Result<()> {
+        self.model = model.into();
+        if self.header.is_some() {
+            return Ok(());
+        }
+        self.write(&format!("{}\n", serde_json::json!({"t": "model", "model": model})))
+    }
+
     fn write(&mut self, lines: &str) -> io::Result<()> {
-        let out = self.header.take().map(|h| h + "\n").unwrap_or_default() + lines;
+        let header = self.header.take().map(|cwd| {
+            let h = serde_json::json!({"t": "header", "v": 1, "cwd": cwd, "model": self.model});
+            format!("{h}\n")
+        });
+        let out = header.unwrap_or_default() + lines;
         let file = match &mut self.file {
             Some(f) => f,
             None => {
@@ -148,8 +163,9 @@ mod tests {
     fn writes_lazily_and_reads_back_exact_bytes() {
         let dir = std::env::temp_dir().join(format!("bit-session-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut s = Session::new(&dir, "abc123", Path::new("/w"), "m1");
+        let mut s = Session::new(&dir, "abc123", Path::new("/w"), "");
         s.append(&[]).unwrap();
+        s.set_model("m1").unwrap();
         assert!(!dir.exists());
         // Odd spacing and key order must survive: the cache depends on the exact bytes.
         let msgs: Vec<Box<RawValue>> =
@@ -162,6 +178,7 @@ mod tests {
         s.usage(&u, Some(0.25)).unwrap();
         s.usage(&u, None).unwrap();
         s.append(&msgs[1..]).unwrap();
+        s.set_model("m2").unwrap();
         s.usage(&u, Some(0.5)).unwrap();
         s.sync().unwrap();
         // A torn line and an unknown record type are skipped.
@@ -172,8 +189,10 @@ mod tests {
             .write_all(b"{\"t\":\"later\",\"x\":1}\n{\"t\":\"msg\",\"msg\":{\"ro")
             .unwrap();
 
+        let log = std::fs::read_to_string(dir.join("abc123.jsonl")).unwrap();
+        assert!(log.starts_with(r#"{"cwd":"/w","model":"m1","t":"header","v":1}"#), "{log}");
         let l = Session::open(&find(&dir, "abc").unwrap()).unwrap();
-        assert_eq!((l.model.as_str(), l.cost), ("m1", 0.75));
+        assert_eq!((l.session.model(), l.cost), ("m2", 0.75));
         assert_eq!(l.session.id(), "abc123");
         assert_eq!(l.session.logged, 2);
         let got: Vec<&str> = l.messages.iter().map(|m| m.get()).collect();

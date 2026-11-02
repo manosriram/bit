@@ -6,6 +6,12 @@ pub struct Input {
     pub text: String,
     /// Byte offset, always on a char boundary.
     cursor: usize,
+    /// Earlier prompts, oldest first.
+    history: Vec<String>,
+    /// How many steps back `recall` has gone; 0 is the text being typed.
+    back: usize,
+    /// The text being typed, kept while older prompts are shown.
+    draft: String,
 }
 
 impl Input {
@@ -51,8 +57,34 @@ impl Input {
     }
 
     pub fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
+        let text = std::mem::take(&mut self.text);
+        self.remember(&text);
+        text
+    }
+
+    pub fn remember(&mut self, text: &str) {
+        if self.history.last().is_none_or(|h| h != text) {
+            self.history.push(text.into());
+        }
+        (self.back, self.cursor) = (0, 0);
+    }
+
+    /// Shows the previous prompt (`older`) or the next one, ending at the text being typed.
+    pub fn recall(&mut self, older: bool) {
+        let back = match older {
+            true if self.back < self.history.len() => self.back + 1,
+            false if self.back > 0 => self.back - 1,
+            _ => return,
+        };
+        if self.back == 0 {
+            self.draft = std::mem::take(&mut self.text);
+        }
+        self.back = back;
+        self.text = match back {
+            0 => std::mem::take(&mut self.draft),
+            _ => self.history[self.history.len() - back].clone(),
+        };
+        self.cursor = self.text.len();
     }
 
     /// Lays the input out as rows of at most `max` columns behind a `> ` prompt, hard-wrapped
@@ -85,5 +117,26 @@ impl Input {
             at = (rows.len() - 1, col);
         }
         (rows, at)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Input;
+
+    #[test]
+    fn recall_walks_history_and_keeps_the_draft() {
+        let mut i = Input::default();
+        for t in ["one", "two", "two"] {
+            i.insert(t);
+            i.take();
+        }
+        i.insert("dra");
+        let mut seen = Vec::new();
+        for older in [true, true, true, false, false, false] {
+            i.recall(older);
+            seen.push(i.text.clone());
+        }
+        assert_eq!(seen, ["two", "one", "one", "two", "dra", "dra"]);
     }
 }

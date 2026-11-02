@@ -3,9 +3,14 @@ pub use llm::Usage;
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Submit(String),
-    Approve { id: Box<str>, decision: Decision },
+    Approve {
+        id: Box<str>,
+        decision: Decision,
+    },
     Cancel,
     SetMode(Mode),
+    /// Sent only while idle.
+    SetModel(Box<str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -3,19 +3,31 @@ use serde_json::value::RawValue;
 const PROMPT: &str = include_str!("prompt.md");
 
 pub struct Context {
-    /// Request head up to and including the system message. Fixed for the session, so the
-    /// provider's prompt cache hits on every turn.
+    /// Request head up to and including the system message. Fixed while the model is, so
+    /// the provider's prompt cache hits on every turn.
     prefix: String,
+    pub(crate) model: String,
+    cache_key: Option<String>,
     pub(crate) messages: Vec<Box<RawValue>>,
 }
 
 impl Context {
-    /// `cache_key` is sent as `prompt_cache_key`, for providers that route their cache by it.
-    /// `messages` is the history of a resumed session.
+    /// `model` may be empty until the user picks one. `cache_key` is sent as
+    /// `prompt_cache_key`, for providers that route their cache by it. `messages` is the
+    /// history of a resumed session.
     pub fn new(model: &str, cache_key: Option<&str>, messages: Vec<Box<RawValue>>) -> Self {
+        let (prefix, cache_key) = (String::new(), cache_key.map(str::to_owned));
+        let mut cx = Self { prefix, model: String::new(), cache_key, messages };
+        cx.set_model(model);
+        // A crash can cut a turn short; mend it the same way a cancel would.
+        cx.repair(0, "error: bit stopped before this call finished");
+        cx
+    }
+
+    pub(crate) fn set_model(&mut self, model: &str) {
         let mut head = serde_json::json!({"model": model, "stream": true, "stream_options": {"include_usage": true}});
-        if let Some(k) = cache_key {
-            head["prompt_cache_key"] = k.into();
+        if let Some(k) = &self.cache_key {
+            head["prompt_cache_key"] = k.as_str().into();
         }
         let mut prefix = head.to_string();
         prefix.pop();
@@ -23,10 +35,7 @@ impl Context {
         prefix.push_str(tools::SCHEMAS);
         prefix.push_str(",\"messages\":[");
         prefix.push_str(msg("system", PROMPT).get());
-        let mut cx = Self { prefix, messages };
-        // A crash can cut a turn short; mend it the same way a cancel would.
-        cx.repair(0, "error: bit stopped before this call finished");
-        cx
+        (self.prefix, self.model) = (prefix, model.into());
     }
 
     /// The §4 rules for a turn that started at `start` and didn't finish: a user message with

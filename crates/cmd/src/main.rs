@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 
 fn run(args: args::Args) -> Result<(), String> {
     if args.print_prompt {
-        let model = args.model.as_deref().unwrap_or("deepseek-chat");
+        let model = args.model.as_deref().unwrap_or("");
         println!("{}", agent::Context::new(model, None, Vec::new()).prefix());
         return Ok(());
     }
@@ -48,22 +48,25 @@ fn run(args: args::Args) -> Result<(), String> {
         )?),
         (None, false) => None,
     };
-    let max_cost = args.max_cost.or(cfg.max_cost);
-    if max_cost.is_some() && cfg.price.is_none() {
-        let m = &cfg.model;
-        cfg.notices.push(format!("error: the price of {m} is unknown, so max_cost can't be enforced. hint: add [models.\"{m}\"] with input, cached and output prices to the config"));
-    }
     let (session, messages, spent) = match found {
         Some(path) => {
             let l = agent::session::Session::open(&path)
                 .map_err(|e| format!("error: {}: {e}", path.display()))?;
-            if !l.model.is_empty() && l.model != cfg.model {
-                let note = format!("this session used {}; continuing with {}", l.model, cfg.model);
-                cfg.notices.push(note);
+            let used = l.session.model();
+            match &cfg.model {
+                Some(m) if !used.is_empty() && used != m => {
+                    cfg.notices.push(format!("this session used {used}; continuing with {m}"))
+                }
+                Some(_) => {}
+                None => cfg.model = Some(used.to_owned()).filter(|m| !m.is_empty()),
             }
             (l.session, l.messages, l.cost)
         }
-        None => (agent::session::Session::new(&dir, &new_id(), &cwd, &cfg.model), Vec::new(), 0.0),
+        None => (
+            agent::session::Session::new(&dir, &new_id(), &cwd, cfg.model.as_deref().unwrap_or("")),
+            Vec::new(),
+            0.0,
+        ),
     };
     // One id per conversation routes every request, resumed or not, to the cache that saw it.
     let id = session.id().to_owned();
@@ -71,7 +74,8 @@ fn run(args: args::Args) -> Result<(), String> {
         cfg.headers.push(("x-opencode-session".into(), id.as_str().into()));
     }
     let cache_key = (cfg.provider == "openai").then_some(id.as_str());
-    let cx = agent::Context::new(&cfg.model, cache_key, messages);
+    let model = cfg.model.unwrap_or_default();
+    let cx = agent::Context::new(&model, cache_key, messages);
     let mode = if args.auto { agent::proto::Mode::Auto } else { agent::proto::Mode::Ask };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -89,12 +93,12 @@ fn run(args: args::Args) -> Result<(), String> {
             policy: agent::Policy::new(cfg.allow),
             mode,
             session,
-            price: cfg.price,
-            max_cost,
+            prices: cfg.prices,
+            max_cost: args.max_cost.or(cfg.max_cost),
             spent,
         };
         tokio::spawn(agent::run(agent, cx, cmd_rx, ev_tx));
-        tui::run(cmd_tx, ev_rx, &cfg.model, mode, &cfg.notices).await
+        tui::run(cmd_tx, ev_rx, &model, &cfg.models, mode, &cfg.notices).await
     })
     .map_err(|e| format!("error: terminal: {e}"))?;
     if dir.join(format!("{id}.jsonl")).exists() {
