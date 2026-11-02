@@ -313,6 +313,8 @@ impl Ui {
                 let mut l = Line::new(self.color);
                 match r {
                     StopReason::Done => l.add(DIM, &format!("  ({secs:.1}s)")),
+                    // The agent's notice already says what was spent.
+                    StopReason::Budget => return,
                     StopReason::Cancelled => l.add(YELLOW, "!").add("", " cancelled"),
                     StopReason::Error(e) => l.add("31", "!").add("", &format!(" {}", clean(&e))),
                 };
@@ -497,10 +499,6 @@ impl Ui {
         } else {
             u.input.to_string()
         };
-        format!(
-            "{mode} | {} | {ctx} ctx, {}% cached",
-            self.model,
-            u.cached * 100 / u.input.max(1)
-        )
+        format!("{mode} | {} | {ctx} ctx", self.model)
     }
 }

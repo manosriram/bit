@@ -52,7 +52,12 @@ fn run(args: args::Args) -> Result<(), String> {
         )?),
         (None, false) => None,
     };
-    let (session, messages) = match found {
+    let max_cost = args.max_cost.or(cfg.max_cost);
+    if max_cost.is_some() && cfg.price.is_none() {
+        let m = &cfg.model;
+        cfg.notices.push(format!("error: the price of {m} is unknown, so max_cost can't be enforced. hint: add [models.\"{m}\"] with input, cached and output prices to the config"));
+    }
+    let (session, messages, spent) = match found {
         Some(path) => {
             let l = agent::session::Session::open(&path)
                 .map_err(|e| format!("error: {}: {e}", path.display()))?;
@@ -63,11 +68,12 @@ fn run(args: args::Args) -> Result<(), String> {
                 );
                 cfg.notices.push(note);
             }
-            (l.session, l.messages)
+            (l.session, l.messages, l.cost)
         }
         None => (
             agent::session::Session::new(&dir, &new_id(), &cwd, &cfg.model),
             Vec::new(),
+            0.0,
         ),
     };
     // One id per conversation routes every request, resumed or not, to the cache that saw it.
@@ -99,6 +105,9 @@ fn run(args: args::Args) -> Result<(), String> {
             policy: agent::Policy::new(cfg.allow),
             mode,
             session,
+            price: cfg.price,
+            max_cost,
+            spent,
         };
         tokio::spawn(agent::run(agent, cx, cmd_rx, ev_tx));
         tui::run(cmd_tx, ev_rx, &cfg.model, mode, &cfg.notices).await

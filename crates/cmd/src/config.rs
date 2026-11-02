@@ -10,6 +10,9 @@ pub struct Config {
     pub headers: Vec<(Box<str>, Box<str>)>,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
+    /// The model's price: from config if set there, else from the built-in table.
+    pub price: Option<agent::Price>,
+    pub max_cost: Option<f64>,
     /// Shown in the TUI at startup, e.g. a missing API key.
     pub notices: Vec<String>,
 }
@@ -19,6 +22,9 @@ pub struct Config {
 struct File {
     model: Option<String>,
     provider: Option<String>,
+    max_cost: Option<f64>,
+    #[serde(default)]
+    models: BTreeMap<String, agent::Price>,
     #[serde(default)]
     providers: BTreeMap<String, Provider>,
     #[serde(default)]
@@ -128,6 +134,11 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
                 path.display()
             )
         })?;
+    let price = file
+        .models
+        .get(&model)
+        .copied()
+        .or_else(|| agent::models::find(&model));
     let headers = vec![(
         "user-agent".into(),
         concat!("bit/", env!("CARGO_PKG_VERSION")).into(),
@@ -139,6 +150,8 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         api_key,
         headers,
         allow: file.bash.allow,
+        price,
+        max_cost: file.max_cost,
         notices,
     })
 }

@@ -18,6 +18,8 @@ pub struct Loaded {
     pub session: Session,
     pub messages: Vec<Box<RawValue>>,
     pub model: String,
+    /// The summed cost of every reply whose price was known.
+    pub cost: f64,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +29,7 @@ struct Record<'a> {
     msg: Option<&'a RawValue>,
     cwd: Option<PathBuf>,
     model: Option<String>,
+    cost: Option<f64>,
 }
 
 impl Session {
@@ -41,7 +44,7 @@ impl Session {
     }
 
     pub fn open(path: &Path) -> io::Result<Loaded> {
-        let (mut messages, mut model) = (Vec::new(), String::new());
+        let (mut messages, mut model, mut cost) = (Vec::new(), String::new(), 0.0);
         for line in BufReader::new(File::open(path)?).lines() {
             let line = line?;
             // A crash can tear the last line; everything before it is still good.
@@ -51,6 +54,7 @@ impl Session {
             match (r.t, r.msg) {
                 ("header", _) => model = r.model.unwrap_or_default(),
                 ("msg", Some(m)) => messages.push(m.to_owned()),
+                ("usage", _) => cost += r.cost.unwrap_or(0.0),
                 _ => {}
             }
         }
@@ -64,6 +68,7 @@ impl Session {
             session,
             messages,
             model,
+            cost,
         })
     }
 
@@ -75,10 +80,23 @@ impl Session {
         if messages.is_empty() {
             return Ok(());
         }
-        let mut out = self.header.take().map(|h| h + "\n").unwrap_or_default();
-        for m in messages {
-            out += &format!("{{\"t\":\"msg\",\"msg\":{}}}\n", m.get());
-        }
+        let lines: String = messages
+            .iter()
+            .map(|m| format!("{{\"t\":\"msg\",\"msg\":{}}}\n", m.get()))
+            .collect();
+        self.write(&lines)?;
+        self.logged += messages.len();
+        Ok(())
+    }
+
+    pub(crate) fn usage(&mut self, u: &llm::Usage, cost: Option<f64>) -> io::Result<()> {
+        let (input, cached, output) = (u.input, u.cached, u.output);
+        let r = serde_json::json!({"t": "usage", "input": input, "cached": cached, "output": output, "cost": cost});
+        self.write(&format!("{r}\n"))
+    }
+
+    fn write(&mut self, lines: &str) -> io::Result<()> {
+        let out = self.header.take().map(|h| h + "\n").unwrap_or_default() + lines;
         let file = match &mut self.file {
             Some(f) => f,
             None => {
@@ -92,9 +110,7 @@ impl Session {
                 self.file.insert(f)
             }
         };
-        file.write_all(out.as_bytes())?;
-        self.logged += messages.len();
-        Ok(())
+        file.write_all(out.as_bytes())
     }
 
     pub(crate) fn sync(&self) -> io::Result<()> {
@@ -162,7 +178,11 @@ mod tests {
         .map(|m| RawValue::from_string((*m).into()).unwrap())
         .collect();
         s.append(&msgs[..1]).unwrap();
+        let u = llm::Usage::default();
+        s.usage(&u, Some(0.25)).unwrap();
+        s.usage(&u, None).unwrap();
         s.append(&msgs[1..]).unwrap();
+        s.usage(&u, Some(0.5)).unwrap();
         s.sync().unwrap();
         // A torn line and an unknown record type are skipped.
         std::fs::OpenOptions::new()
@@ -173,7 +193,7 @@ mod tests {
             .unwrap();
 
         let l = Session::open(&find(&dir, "abc").unwrap()).unwrap();
-        assert_eq!(l.model, "m1");
+        assert_eq!((l.model.as_str(), l.cost), ("m1", 0.75));
         assert_eq!(l.session.id(), "abc123");
         assert_eq!(l.session.logged, 2);
         let got: Vec<&str> = l.messages.iter().map(|m| m.get()).collect();

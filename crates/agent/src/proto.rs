@@ -42,6 +42,7 @@ pub enum Event {
         ok: bool,
         preview: Box<str>,
     },
+    /// The tokens of the last reply.
     Usage(Usage),
     Notice(Box<str>),
     TurnEnd(StopReason),
@@ -51,5 +52,6 @@ pub enum Event {
 pub enum StopReason {
     Done,
     Cancelled,
+    Budget,
     Error(Box<str>),
 }

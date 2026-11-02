@@ -4,6 +4,7 @@ use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::session::Session;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Everything a session needs besides its history and channels.
@@ -13,6 +14,18 @@ pub struct Agent {
     pub policy: Policy,
     pub mode: Mode,
     pub session: Session,
+    pub price: Option<llm::Price>,
+    pub max_cost: Option<f64>,
+    /// What the session's log says it has cost so far.
+    pub spent: f64,
+}
+
+/// What a session changes as it goes, apart from the history.
+struct State {
+    policy: Policy,
+    session: Session,
+    /// The session's cost in USD; `None` once a reply's price was unknown.
+    spent: Option<f64>,
 }
 
 /// Runs until the command channel closes.
@@ -25,14 +38,22 @@ pub async fn run(
     let Agent {
         client,
         tools,
-        mut policy,
+        policy,
         mode,
-        mut session,
+        session,
+        price,
+        max_cost,
+        spent,
     } = agent;
+    let mut state = State {
+        policy,
+        session,
+        spent: Some(spent),
+    };
     if !cx.messages.is_empty() {
         replay(&cx, &events);
         let n = cx.messages.len();
-        let note = format!("resumed {} ({n} messages)", session.id());
+        let note = format!("resumed {} ({n} messages)", state.session.id());
         let _ = events.send(Event::Notice(note.into()));
     }
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
@@ -56,23 +77,24 @@ pub async fn run(
             tools: &tools,
             events: &events,
             auto: &auto,
+            price,
+            max_cost,
         };
         let reason = tokio::select! {
-            r = turn.run(&mut cx, &mut policy, &mut approvals, &mut session) => r.map_or_else(|e| StopReason::Error(e.to_string().into()), |()| StopReason::Done),
+            r = turn.run(&mut cx, &mut state, &mut approvals) => r.err().unwrap_or(StopReason::Done),
             () = listen(&mut cmds, &auto, &approve_tx) => StopReason::Cancelled,
         };
-        match reason {
-            StopReason::Done => {}
-            StopReason::Cancelled => cx.repair(
-                len,
-                "error: the user cancelled this call before it finished",
-            ),
-            StopReason::Error(_) => {
-                cx.repair(len, "error: the turn failed before this call finished")
-            }
+        let why = match reason {
+            StopReason::Done => None,
+            StopReason::Cancelled => Some("the user cancelled this call"),
+            StopReason::Budget => Some("the session reached max_cost"),
+            StopReason::Error(_) => Some("the turn failed"),
+        };
+        if let Some(why) = why {
+            cx.repair(len, &format!("error: {why} before it finished"));
         }
-        turn.save(&cx, &mut session);
-        if let Err(e) = session.sync() {
+        turn.save(&cx, &mut state.session);
+        if let Err(e) = state.session.sync() {
             turn.save_failed(&e);
         }
         // A send fails only once the UI is gone, and then the command channel closes too.
@@ -85,21 +107,41 @@ struct Turn<'a> {
     tools: &'a tools::Ctx,
     events: &'a UnboundedSender<Event>,
     auto: &'a AtomicBool,
+    price: Option<llm::Price>,
+    max_cost: Option<f64>,
 }
 
 impl Turn<'_> {
     async fn run(
         &self,
         cx: &mut Context,
-        policy: &mut Policy,
+        state: &mut State,
         approvals: &mut UnboundedReceiver<(Box<str>, Decision)>,
-        session: &mut Session,
-    ) -> Result<(), llm::Error> {
+    ) -> Result<(), StopReason> {
+        let State {
+            policy,
+            session,
+            spent,
+        } = state;
         loop {
+            if let (Some(max), Some(s)) = (self.max_cost, *spent)
+                && s >= max
+            {
+                let n = format!(
+                    "error: the session has cost ${s:.4}, reaching max_cost ${max}. hint: raise --max-cost or max_cost, or start a new session"
+                );
+                self.send(Event::Notice(n.into()));
+                return Err(StopReason::Budget);
+            }
             let c = self
-                .client
-                .stream(cx.body(), |t| self.send(Event::Text(t.into())))
-                .await?;
+                .request(cx)
+                .await
+                .map_err(|e| StopReason::Error(e.to_string().into()))?;
+            let cost = self.price.map(|p| p.cost(&c.usage));
+            *spent = spent.zip(cost).map(|(a, b)| a + b);
+            if let Err(e) = session.usage(&c.usage, cost) {
+                self.save_failed(&e);
+            }
             cx.messages.push(c.message);
             self.send(Event::Usage(c.usage));
             if c.tool_calls.is_empty() {
@@ -165,6 +207,31 @@ impl Turn<'_> {
     fn save_failed(&self, e: &std::io::Error) {
         let n = format!("error: could not save the session: {e}. hint: check disk space");
         self.send(Event::Notice(n.into()));
+    }
+
+    /// One model request, retried while nothing from it has reached the screen.
+    async fn request(&self, cx: &Context) -> Result<llm::Completion, llm::Error> {
+        for wait in [1, 3] {
+            let mut shown = false;
+            let r = self
+                .client
+                .stream(cx.body(), |t| {
+                    shown = true;
+                    self.send(Event::Text(t.into()));
+                })
+                .await;
+            match r {
+                Err(e) if !shown && e.retryable() => {
+                    let n = format!("{e}; retrying in {wait}s");
+                    self.send(Event::Notice(n.into()));
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                }
+                r => return r,
+            }
+        }
+        self.client
+            .stream(cx.body(), |t| self.send(Event::Text(t.into())))
+            .await
     }
 
     fn send(&self, e: Event) {
@@ -294,8 +361,19 @@ mod tests {
             policy: Policy::new(Vec::new()),
             mode: Mode::Ask,
             session,
+            price: None,
+            max_cost: None,
+            spent: 0.0,
         }
     }
+
+    /// $1, $0.50 and $2 per million: a reply from `sse` costs $0.00001.
+    const PRICE: llm::Price = llm::Price {
+        context: 0,
+        input: 1.0,
+        cached: 0.5,
+        output: 2.0,
+    };
 
     /// Runs `agent` against the scripted `replies`; returns its command sender, its events and
     /// the request bodies the server saw.
@@ -358,12 +436,17 @@ mod tests {
             bodies
                 .send(String::from_utf8(req[body_at..].to_vec()).unwrap())
                 .unwrap();
-            let head =
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            // A reply that is a whole HTTP response, such as an error, is sent as is.
+            let head = match reply.starts_with("HTTP/") {
+                true => "",
+                false => {
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+                }
+            };
             s.write_all(format!("{head}{reply}").as_bytes())
                 .await
                 .unwrap();
-            if reply.ends_with("[DONE]\n\n") {
+            if head.is_empty() || reply.ends_with("[DONE]\n\n") {
                 s.shutdown().await.unwrap();
             } else {
                 open.push(s);
@@ -561,5 +644,42 @@ mod tests {
         let reply = r#"{"role":"assistant","content":"B"}"#;
         let user = r#"{"content":"three","role":"user"}"#;
         assert_eq!(b3, format!("{unclosed},{reply},{user}]}}"));
+    }
+
+    #[tokio::test]
+    async fn max_cost_stops_the_next_turn_before_its_request() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "budget");
+        (agent.price, agent.max_cost) = (Some(PRICE), Some(0.00001));
+        let cx = Context::new("m", None, Vec::new());
+        let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
+        cmds.send(Command::Submit("one".into())).unwrap();
+        while next(&mut ev).await != Event::TurnEnd(StopReason::Done) {}
+        cmds.send(Command::Submit("two".into())).unwrap();
+        let Event::Notice(n) = next(&mut ev).await else {
+            panic!("expected a notice")
+        };
+        assert!(n.starts_with("error: the session has cost $0.0000, reaching max_cost $0.00001."));
+        assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Budget));
+        bodies.recv().await.unwrap();
+        assert!(
+            bodies.try_recv().is_err(),
+            "the stopped turn must not send a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_a_server_error_before_any_text() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "retry");
+        let error = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\nconnection: close\r\n\r\nboom";
+        let replies = vec![error.into(), sse(&["ok"], true)];
+        let cx = Context::new("m", None, Vec::new());
+        let (cmds, mut ev, _bodies) = start(agent, cx, l, replies).await;
+        cmds.send(Command::Submit("hi".into())).unwrap();
+        let retry = Event::Notice("status 500: boom; retrying in 1s".into());
+        assert_eq!(next(&mut ev).await, retry);
+        assert_eq!(next(&mut ev).await, Event::Text("ok".into()));
+        assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Done));
     }
 }

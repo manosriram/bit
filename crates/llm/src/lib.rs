@@ -1,4 +1,6 @@
 pub mod models;
+
+pub use models::Price;
 mod sse;
 
 use serde::{Deserialize, Serialize};
@@ -310,6 +312,16 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Rate limits, server errors and dropped connections often pass; anything else won't.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Error::Status(429 | 500..=599, _) | Error::Http(_) | Error::Disconnected
+        )
+    }
+}
+
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
         Error::Http(e)
@@ -420,12 +432,14 @@ mod tests {
 
     #[test]
     fn cost() {
-        let m = models::find("deepseek-chat").unwrap();
-        let c = m.cost(&Usage {
+        let u = Usage {
             input: 1_000_000,
             cached: 500_000,
             output: 1_000_000,
-        });
+        };
+        let c = models::find("deepseek-chat").unwrap().cost(&u);
         assert!((c - (0.14 + 0.014 + 0.42)).abs() < 1e-9);
+        assert_eq!(models::find("kimi-k3").unwrap().output, 15.0);
+        assert_eq!(models::find("nope"), None);
     }
 }

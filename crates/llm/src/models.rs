@@ -1,57 +1,65 @@
 use crate::Usage;
+use serde::Deserialize;
 
-/// Prices are USD per million tokens.
-pub struct Model {
-    pub id: &'static str,
+/// USD per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Price {
+    #[serde(default = "default_context")]
     pub context: u32,
-    pub price_in: f64,
-    pub price_cached: f64,
-    pub price_out: f64,
+    pub input: f64,
+    pub cached: f64,
+    pub output: f64,
 }
 
-pub const DEFAULT_CONTEXT: u32 = 128_000;
+fn default_context() -> u32 {
+    128_000
+}
 
-const MODELS: &[Model] = &[
-    Model {
-        id: "deepseek-chat",
-        context: 128_000,
-        price_in: 0.28,
-        price_cached: 0.028,
-        price_out: 0.42,
-    },
-    Model {
-        id: "deepseek-reasoner",
-        context: 128_000,
-        price_in: 0.28,
-        price_cached: 0.028,
-        price_out: 0.42,
-    },
-    Model {
-        id: "gpt-5",
-        context: 400_000,
-        price_in: 1.25,
-        price_cached: 0.125,
-        price_out: 10.0,
-    },
-    Model {
-        id: "gpt-5-mini",
-        context: 400_000,
-        price_in: 0.25,
-        price_cached: 0.025,
-        price_out: 2.0,
-    },
+const fn p(context: u32, input: f64, cached: f64, output: f64) -> Price {
+    Price {
+        context,
+        input,
+        cached,
+        output,
+    }
+}
+
+/// OpenCode Go prices are from `opencode.ai/inference/go/v1/models` (Nov 2026).
+const MODELS: &[(&str, Price)] = &[
+    ("deepseek-chat", p(128_000, 0.28, 0.028, 0.42)),
+    ("deepseek-reasoner", p(128_000, 0.28, 0.028, 0.42)),
+    ("gpt-5", p(400_000, 1.25, 0.125, 10.0)),
+    ("gpt-5-mini", p(400_000, 0.25, 0.025, 2.0)),
+    ("deepseek-v4.1-flash", p(1_000_000, 0.15, 0.003, 0.6)),
+    ("deepseek-v4-pro", p(1_000_000, 0.66, 0.022, 1.98)),
+    ("glm-5.2", p(1_000_000, 1.4, 0.26, 4.4)),
+    ("glm-5.3", p(1_000_000, 1.4, 0.26, 4.4)),
+    ("glm-5.3-flash", p(1_000_000, 0.15, 0.03, 0.5)),
+    ("hy3", p(256_000, 0.14, 0.035, 0.58)),
+    ("hy4-preview", p(1_024_000, 0.834, 0.042, 2.501)),
+    ("kimi-k2.7-code", p(262_144, 0.95, 0.19, 4.0)),
+    ("kimi-k3", p(1_048_576, 3.0, 0.3, 15.0)),
+    ("kimi-k3.1-pro", p(1_048_576, 2.0, 0.2, 10.0)),
+    ("mimo-v2.6-flash", p(1_048_576, 0.14, 0.0028, 0.28)),
+    ("mimo-v2.6-pro", p(1_048_576, 0.435, 0.003625, 0.87)),
+    ("minimax-m3.1-flash", p(1_000_000, 0.15, 0.015, 0.6)),
+    ("longcat-2.0", p(1_000_000, 0.3, 0.006, 1.2)),
+    ("step-5-preview", p(1_000_000, 1.0, 0.1, 2.7)),
+    ("beam-free", p(1_048_576, 0.0, 0.0, 0.0)),
+    ("iceman-contributor-free", p(262_144, 0.0, 0.0, 0.0)),
 ];
 
-pub fn find(id: &str) -> Option<&'static Model> {
-    MODELS.iter().find(|m| m.id == id)
+pub fn find(id: &str) -> Option<Price> {
+    MODELS.iter().find(|m| m.0 == id).map(|m| m.1)
 }
 
-impl Model {
+impl Price {
     pub fn cost(&self, u: &Usage) -> f64 {
         let fresh = u.input.saturating_sub(u.cached);
-        (fresh as f64 * self.price_in
-            + u.cached as f64 * self.price_cached
-            + u.output as f64 * self.price_out)
+        (f64::from(fresh) * self.input
+            + f64::from(u.cached) * self.cached
+            + f64::from(u.output) * self.output)
             / 1e6
     }
 }
