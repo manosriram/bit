@@ -7,7 +7,6 @@ use lexopt::{
 pub struct Args {
     pub model: Option<String>,
     pub auto: bool,
-    pub max_cost: Option<f64>,
     /// `-c`: continue the last session in this directory.
     pub cont: bool,
     /// `-r <id>`: resume a session by id or id prefix.
@@ -29,7 +28,6 @@ pub fn parse() -> Result<Args, lexopt::Error> {
                     m => return Err(format!("invalid --mode `{m}`: use ask or auto").into()),
                 }
             }
-            Long("max-cost") => a.max_cost = Some(p.value()?.parse()?),
             Short('c') | Long("continue") => a.cont = true,
             Short('r') | Long("resume") => a.resume = Some(p.value()?.string()?),
             Long("print-prompt") => a.print_prompt = true,

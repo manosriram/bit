@@ -11,10 +11,8 @@ pub struct Config {
     pub headers: Vec<(Box<str>, Box<str>)>,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
-    pub prices: BTreeMap<String, agent::Price>,
-    /// What the model picker offers: config `[models]` entries, then the built-in ones.
+    /// What the model picker offers: config `models`, then the built-in ones.
     pub models: Vec<String>,
-    pub max_cost: Option<f64>,
     /// Shown in the TUI at startup, e.g. a missing API key.
     pub notices: Vec<String>,
 }
@@ -24,9 +22,8 @@ pub struct Config {
 struct File {
     model: Option<String>,
     provider: Option<String>,
-    max_cost: Option<f64>,
     #[serde(default)]
-    models: BTreeMap<String, agent::Price>,
+    models: Vec<String>,
     #[serde(default)]
     providers: BTreeMap<String, Provider>,
     #[serde(default)]
@@ -104,10 +101,12 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         ));
         String::new()
     });
-    let mut models: Vec<String> = file.models.keys().cloned().collect();
-    models.extend(
-        agent::models::list(name).filter(|m| !file.models.contains_key(*m)).map(Into::into),
-    );
+    let mut models = file.models;
+    for m in agent::models::list(name) {
+        if !models.iter().any(|x| x == m) {
+            models.push(m.into());
+        }
+    }
     let headers = vec![("user-agent".into(), concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
     Ok(Config {
         provider: name.into(),
@@ -116,9 +115,7 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         api_key,
         headers,
         allow: file.bash.allow,
-        prices: file.models,
         models,
-        max_cost: file.max_cost,
         notices,
     })
 }

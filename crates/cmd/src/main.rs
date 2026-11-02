@@ -48,7 +48,7 @@ fn run(args: args::Args) -> Result<(), String> {
         )?),
         (None, false) => None,
     };
-    let (session, messages, spent) = match found {
+    let (session, messages) = match found {
         Some(path) => {
             let l = agent::session::Session::open(&path)
                 .map_err(|e| format!("error: {}: {e}", path.display()))?;
@@ -60,12 +60,11 @@ fn run(args: args::Args) -> Result<(), String> {
                 Some(_) => {}
                 None => cfg.model = Some(used.to_owned()).filter(|m| !m.is_empty()),
             }
-            (l.session, l.messages, l.cost)
+            (l.session, l.messages)
         }
         None => (
             agent::session::Session::new(&dir, &new_id(), &cwd, cfg.model.as_deref().unwrap_or("")),
             Vec::new(),
-            0.0,
         ),
     };
     // One id per conversation routes every request, resumed or not, to the cache that saw it.
@@ -93,9 +92,6 @@ fn run(args: args::Args) -> Result<(), String> {
             policy: agent::Policy::new(cfg.allow),
             mode,
             session,
-            prices: cfg.prices,
-            max_cost: args.max_cost.or(cfg.max_cost),
-            spent,
         };
         tokio::spawn(agent::run(agent, cx, cmd_rx, ev_tx));
         tui::run(cmd_tx, ev_rx, &model, &cfg.models, mode, &cfg.notices).await

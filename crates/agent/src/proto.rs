@@ -57,6 +57,5 @@ pub enum Event {
 pub enum StopReason {
     Done,
     Cancelled,
-    Budget,
     Error(Box<str>),
 }

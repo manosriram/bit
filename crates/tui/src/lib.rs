@@ -454,8 +454,6 @@ impl Ui {
                 let mut l = Line::new(self.color);
                 match r {
                     StopReason::Done => l.add(DIM, &format!("  ({secs:.1}s)")),
-                    // The agent's notice already says what was spent.
-                    StopReason::Budget => return,
                     StopReason::Cancelled => l.add(YELLOW, "!").add("", " cancelled"),
                     StopReason::Error(e) => l.add("31", "!").add("", &format!(" {}", clean(&e))),
                 };

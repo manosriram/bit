@@ -19,8 +19,6 @@ pub struct Session {
 pub struct Loaded {
     pub session: Session,
     pub messages: Vec<Box<RawValue>>,
-    /// The summed cost of every reply whose price was known.
-    pub cost: f64,
 }
 
 #[derive(Deserialize)]
@@ -30,7 +28,6 @@ struct Record<'a> {
     msg: Option<&'a RawValue>,
     cwd: Option<PathBuf>,
     model: Option<String>,
-    cost: Option<f64>,
 }
 
 impl Session {
@@ -40,7 +37,7 @@ impl Session {
     }
 
     pub fn open(path: &Path) -> io::Result<Loaded> {
-        let (mut messages, mut model, mut cost) = (Vec::new(), String::new(), 0.0);
+        let (mut messages, mut model) = (Vec::new(), String::new());
         for line in BufReader::new(File::open(path)?).lines() {
             let line = line?;
             // A crash can tear the last line; everything before it is still good.
@@ -50,13 +47,12 @@ impl Session {
             match (r.t, r.msg) {
                 ("header" | "model", _) => model = r.model.unwrap_or_default(),
                 ("msg", Some(m)) => messages.push(m.to_owned()),
-                ("usage", _) => cost += r.cost.unwrap_or(0.0),
                 _ => {}
             }
         }
         let session =
             Self { path: path.into(), header: None, model, file: None, logged: messages.len() };
-        Ok(Loaded { session, messages, cost })
+        Ok(Loaded { session, messages })
     }
 
     /// The model of the last header or `model` record.
@@ -79,9 +75,10 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn usage(&mut self, u: &llm::Usage, cost: Option<f64>) -> io::Result<()> {
+    pub(crate) fn usage(&mut self, u: &llm::Usage) -> io::Result<()> {
         let (input, cached, output) = (u.input, u.cached, u.output);
-        let r = serde_json::json!({"t": "usage", "input": input, "cached": cached, "output": output, "cost": cost});
+        let r =
+            serde_json::json!({"t": "usage", "input": input, "cached": cached, "output": output});
         self.write(&format!("{r}\n"))
     }
 
@@ -175,11 +172,10 @@ mod tests {
                 .collect();
         s.append(&msgs[..1]).unwrap();
         let u = llm::Usage::default();
-        s.usage(&u, Some(0.25)).unwrap();
-        s.usage(&u, None).unwrap();
+        s.usage(&u).unwrap();
         s.append(&msgs[1..]).unwrap();
         s.set_model("m2").unwrap();
-        s.usage(&u, Some(0.5)).unwrap();
+        s.usage(&u).unwrap();
         s.sync().unwrap();
         // A torn line and an unknown record type are skipped.
         std::fs::OpenOptions::new()
@@ -192,7 +188,7 @@ mod tests {
         let log = std::fs::read_to_string(dir.join("abc123.jsonl")).unwrap();
         assert!(log.starts_with(r#"{"cwd":"/w","model":"m1","t":"header","v":1}"#), "{log}");
         let l = Session::open(&find(&dir, "abc").unwrap()).unwrap();
-        assert_eq!((l.session.model(), l.cost), ("m2", 0.75));
+        assert_eq!(l.session.model(), "m2");
         assert_eq!(l.session.id(), "abc123");
         assert_eq!(l.session.logged, 2);
         let got: Vec<&str> = l.messages.iter().map(|m| m.get()).collect();

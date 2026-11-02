@@ -1,6 +1,4 @@
 pub mod models;
-
-pub use models::Price;
 mod sse;
 
 use serde::{Deserialize, Serialize};
@@ -381,14 +379,5 @@ mod tests {
     #[test]
     fn api_error() {
         assert!(run(include_bytes!("../testdata/error.sse")).unwrap_err().starts_with("api: "));
-    }
-
-    #[test]
-    fn cost() {
-        let u = Usage { input: 1_000_000, cached: 500_000, output: 1_000_000 };
-        let c = models::find("deepseek-chat").unwrap().cost(&u);
-        assert!((c - (0.14 + 0.014 + 0.42)).abs() < 1e-9);
-        assert_eq!(models::find("kimi-k3").unwrap().output, 15.0);
-        assert_eq!(models::find("nope"), None);
     }
 }

@@ -3,7 +3,6 @@ use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::session::Session;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -15,11 +14,6 @@ pub struct Agent {
     pub policy: Policy,
     pub mode: Mode,
     pub session: Session,
-    /// Prices from the config; models not in it use the built-in table.
-    pub prices: BTreeMap<String, llm::Price>,
-    pub max_cost: Option<f64>,
-    /// What the session's log says it has cost so far.
-    pub spent: f64,
 }
 
 /// Runs until the command channel closes.
@@ -37,7 +31,6 @@ pub async fn run(
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
     // only because `tokio::spawn` needs the future to be `Send`.
     let auto = AtomicBool::new(agent.mode == Mode::Auto);
-    let mut price = (!cx.model.is_empty()).then(|| agent.price(&cx.model, &events)).flatten();
     let (approve_tx, mut approvals) = unbounded_channel();
     while let Some(cmd) = cmds.recv().await {
         let text = match cmd {
@@ -48,7 +41,6 @@ pub async fn run(
             }
             Command::SetModel(m) => {
                 cx.set_model(&m);
-                price = agent.price(&m, &events);
                 if let Err(e) = agent.session.set_model(&m) {
                     let _ = events.send(save_failed(&e));
                 }
@@ -59,7 +51,7 @@ pub async fn run(
         while approvals.try_recv().is_ok() {}
         let len = cx.messages.len();
         cx.messages.push(msg("user", &text));
-        let mut turn = Turn { a: &mut agent, events: &events, auto: &auto, price };
+        let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
         let reason = tokio::select! {
             r = turn.run(&mut cx, &mut approvals) => r.err().unwrap_or(StopReason::Done),
             () = listen(&mut cmds, &auto, &approve_tx) => StopReason::Cancelled,
@@ -67,7 +59,6 @@ pub async fn run(
         let why = match reason {
             StopReason::Done => None,
             StopReason::Cancelled => Some("the user cancelled this call"),
-            StopReason::Budget => Some("the session reached max_cost"),
             StopReason::Error(_) => Some("the turn failed"),
         };
         if let Some(why) = why {
@@ -82,25 +73,10 @@ pub async fn run(
     }
 }
 
-impl Agent {
-    /// Config first, then the built-in table. An unknown price can't enforce `max_cost`.
-    fn price(&self, model: &str, events: &UnboundedSender<Event>) -> Option<llm::Price> {
-        let p = self.prices.get(model).copied().or_else(|| llm::models::find(model));
-        if p.is_none() && self.max_cost.is_some() {
-            let n = format!(
-                "error: the price of {model} is unknown, so max_cost can't be enforced. hint: add [models.\"{model}\"] with input, cached and output prices to the config"
-            );
-            let _ = events.send(Event::Notice(n.into()));
-        }
-        p
-    }
-}
-
 struct Turn<'a> {
     a: &'a mut Agent,
     events: &'a UnboundedSender<Event>,
     auto: &'a AtomicBool,
-    price: Option<llm::Price>,
 }
 
 impl Turn<'_> {
@@ -110,21 +86,8 @@ impl Turn<'_> {
         approvals: &mut UnboundedReceiver<(Box<str>, Decision)>,
     ) -> Result<(), StopReason> {
         loop {
-            // An unknown price means `spent` is incomplete, so the cap can't be judged.
-            if let (Some(max), Some(_)) = (self.a.max_cost, self.price)
-                && self.a.spent >= max
-            {
-                let n = format!(
-                    "error: the session has cost ${:.4}, reaching max_cost ${max}. hint: raise --max-cost or max_cost, or start a new session",
-                    self.a.spent
-                );
-                self.send(Event::Notice(n.into()));
-                return Err(StopReason::Budget);
-            }
             let c = self.request(cx).await.map_err(|e| StopReason::Error(e.to_string().into()))?;
-            let cost = self.price.map(|p| p.cost(&c.usage));
-            self.a.spent += cost.unwrap_or(0.0);
-            if let Err(e) = self.a.session.usage(&c.usage, cost) {
+            if let Err(e) = self.a.session.usage(&c.usage) {
                 self.save_failed(&e);
             }
             cx.messages.push(c.message);
@@ -332,14 +295,8 @@ mod tests {
             policy: Policy::new(Vec::new()),
             mode: Mode::Ask,
             session,
-            prices: BTreeMap::new(),
-            max_cost: None,
-            spent: 0.0,
         }
     }
-
-    /// $1, $0.50 and $2 per million: a reply from `sse` costs $0.00001.
-    const PRICE: llm::Price = llm::Price { context: 0, input: 1.0, cached: 0.5, output: 2.0 };
 
     /// Runs `agent` against the scripted `replies`; returns its command sender, its events and
     /// the request bodies the server saw.
@@ -574,24 +531,6 @@ mod tests {
         let reply = r#"{"role":"assistant","content":"B"}"#;
         let user = r#"{"content":"three","role":"user"}"#;
         assert_eq!(b3, format!("{unclosed},{reply},{user}]}}"));
-    }
-
-    #[tokio::test]
-    async fn max_cost_stops_the_next_turn_before_its_request() {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut agent = agent(l.local_addr().unwrap(), "budget");
-        agent.prices.insert("m".into(), PRICE);
-        agent.max_cost = Some(0.00001);
-        let cx = Context::new("m", None, Vec::new());
-        let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
-        cmds.send(Command::Submit("one".into())).unwrap();
-        while next(&mut ev).await != Event::TurnEnd(StopReason::Done) {}
-        cmds.send(Command::Submit("two".into())).unwrap();
-        let Event::Notice(n) = next(&mut ev).await else { panic!("expected a notice") };
-        assert!(n.starts_with("error: the session has cost $0.0000, reaching max_cost $0.00001."));
-        assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Budget));
-        bodies.recv().await.unwrap();
-        assert!(bodies.try_recv().is_err(), "the stopped turn must not send a request");
     }
 
     #[tokio::test]
