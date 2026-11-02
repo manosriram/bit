@@ -62,6 +62,12 @@ impl Input {
         text
     }
 
+    /// Replaces the text, with the cursor at the end.
+    pub fn set(&mut self, text: &str) {
+        self.text = text.into();
+        self.cursor = self.text.len();
+    }
+
     pub fn remember(&mut self, text: &str) {
         if self.history.last().is_none_or(|h| h != text) {
             self.history.push(text.into());

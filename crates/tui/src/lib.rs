@@ -19,6 +19,8 @@ const YELLOW: &str = "33";
 const DETAIL_ROWS: usize = 12;
 /// Rows of the model picker shown at once.
 const PICK_ROWS: usize = 10;
+/// Slash commands: name, arguments, help.
+const COMMANDS: [(&str, &str, &str); 1] = [("/model", "[id]", "pick the model, or set it to id")];
 const CHOICES: [(&str, Decision); 3] = [
     ("[y]es", Decision::Yes),
     ("[n]o", Decision::No),
@@ -76,6 +78,7 @@ async fn event_loop(
         model: model.into(),
         models: models.into(),
         picker: None,
+        menu: 0,
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
         input: Input::default(),
@@ -132,6 +135,8 @@ struct Ui {
     /// What the model picker offers.
     models: Vec<String>,
     picker: Option<Picker>,
+    /// The marked row of the slash-command list.
+    menu: usize,
     color: bool,
     cols: usize,
     input: Input,
@@ -167,6 +172,15 @@ struct Picker {
     at: usize,
     /// Whether picking a model also sends the prompt in the input.
     then_submit: bool,
+}
+
+/// The commands a `/word` being typed could mean; none once a space follows the word.
+fn commands(text: &str) -> Vec<String> {
+    let Some(word) = text.strip_prefix('/').filter(|w| !w.contains(char::is_whitespace)) else {
+        return Vec::new();
+    };
+    let found = COMMANDS.iter().filter(|c| c.0[1..].contains(&word.to_lowercase()));
+    found.map(|c| format!("{} {}  {}", c.0, c.1, c.2)).collect()
 }
 
 /// The models whose id contains `query`, ignoring case.
@@ -262,8 +276,7 @@ impl Ui {
                     match (pick, chosen) {
                         (Some(true), Some(m)) => {
                             self.picker = None;
-                            self.model = m;
-                            let _ = cmds.send(Command::SetModel(self.model.clone()));
+                            self.set_model(m, cmds);
                             if then_submit {
                                 self.submit(cmds);
                             }
@@ -271,6 +284,8 @@ impl Ui {
                         (Some(false), _) => self.picker = None,
                         _ => {}
                     }
+                } else if self.in_menu(k.code) {
+                    self.menu_key(k.code, cmds);
                 } else {
                     match k.code {
                         KeyCode::Esc if self.busy.is_some() => {
@@ -284,13 +299,19 @@ impl Ui {
                         KeyCode::Enter => self.submit(cmds),
                         KeyCode::Up => self.input.recall(true),
                         KeyCode::Down => self.input.recall(false),
-                        _ => self.input.key(k),
+                        _ => {
+                            self.input.key(k);
+                            self.menu = 0;
+                        }
                     }
                 }
             }
             ct::Event::Paste(s) => match &mut self.picker {
                 Some(p) => p.query.push_str(&clean(&s)),
-                None => self.input.insert(&s),
+                None => {
+                    self.input.insert(&s);
+                    self.menu = 0;
+                }
             },
             _ => {}
         }
@@ -301,9 +322,12 @@ impl Ui {
         if self.busy.is_some() || self.input.text.trim().is_empty() {
             return;
         }
-        if self.input.text.trim() == "/model" {
+        if let Some(id) = self.input.text.trim().strip_prefix("/model")
+            && (id.is_empty() || id.starts_with(' '))
+        {
+            let id: Box<str> = id.trim().into();
             self.input.take();
-            return self.pick(false);
+            return if id.is_empty() { self.pick(false) } else { self.set_model(id, cmds) };
         }
         if self.model.is_empty() {
             return self.pick(true);
@@ -312,6 +336,44 @@ impl Ui {
         self.user(&text);
         let _ = cmds.send(Command::Submit(text));
         self.busy = Some(Instant::now());
+    }
+
+    fn set_model(&mut self, model: Box<str>, cmds: &UnboundedSender<Command>) {
+        self.event(Event::Notice(format!("model set to {model}").into()));
+        self.model = model;
+        let _ = cmds.send(Command::SetModel(self.model.clone()));
+    }
+
+    /// Whether `code` goes to the slash-command list: it is showing, and the key moves in
+    /// it, picks from it or closes it. `Esc` while busy still cancels the turn.
+    fn in_menu(&self, code: KeyCode) -> bool {
+        let keys = match code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Tab => true,
+            KeyCode::Esc => self.busy.is_none(),
+            _ => false,
+        };
+        keys && !commands(&self.input.text).is_empty()
+    }
+
+    fn menu_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
+        let menu = commands(&self.input.text);
+        if code == KeyCode::Tab {
+            return self.input.set(&format!("{} ", self.marked(&menu)));
+        }
+        match nav(code, &mut self.menu, menu.len()) {
+            Some(true) => {
+                self.input.set(self.marked(&menu));
+                self.submit(cmds);
+            }
+            Some(false) => self.input.set(""),
+            None => {}
+        }
+    }
+
+    /// The name of the marked slash command, e.g. `/model`.
+    fn marked<'m>(&self, menu: &'m [String]) -> &'m str {
+        let row = &menu[self.menu.min(menu.len() - 1)];
+        row.split(' ').next().unwrap_or(row)
     }
 
     fn pick(&mut self, then_submit: bool) {
@@ -488,6 +550,12 @@ impl Ui {
             return (f, split, cursor);
         }
 
+        // Slash-command suggestions pop up above the box, like a menu from a bottom bar.
+        let menu = commands(&self.input.text);
+        for (i, c) in menu.iter().enumerate() {
+            let (sgr, m) = if i == self.menu.min(menu.len() - 1) { ("1", ">") } else { ("", " ") };
+            f.push(l.add(sgr, clip(&format!("{m} {c}"), w)).take());
+        }
         l.add(DIM, "+");
         if let Some(t) = self.busy {
             let e = t.elapsed();
