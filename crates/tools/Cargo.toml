@@ -2,3 +2,12 @@
 name = "tools"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
