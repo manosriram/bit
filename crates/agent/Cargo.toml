@@ -2,3 +2,11 @@
 name = "agent"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+llm = { path = "../llm" }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["sync", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util"] }
