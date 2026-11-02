@@ -14,6 +14,16 @@ use tokio::time::{Instant, sleep_until};
 const FRAME: Duration = Duration::from_millis(33);
 const SPIN: Duration = Duration::from_millis(100);
 const DIM: &str = "2";
+/// Each pixel is `██`, so strokes line up exactly.
+const LOGO: [(&str, &str); 7] = [
+    ("1", "  ██        ██    ██"),
+    ("1", "  ██              ██"),
+    ("1", "  ██████    ██  ██████"),
+    ("1", "  ██    ██  ██    ██"),
+    ("1", "  ██    ██  ██    ██"),
+    ("1", "  ██████    ██      ████"),
+    (DIM, "  01100010 01101001 01110100"),
+];
 
 /// Runs the terminal UI until the user quits or the agent goes away.
 pub async fn run(
@@ -36,6 +46,9 @@ async fn event_loop(
     model: &str,
     notice: Option<&str>,
 ) -> io::Result<()> {
+    // Asked before the reader thread starts, which would otherwise swallow the reply.
+    let (_, height) = terminal::size()?;
+    let used = crossterm::cursor::position().map_or(height, |p| p.1 + 1);
     // A blocking reader thread avoids pulling in `futures` for crossterm's EventStream.
     let (key_tx, mut keys) = unbounded_channel();
     std::thread::spawn(move || {
@@ -56,12 +69,14 @@ async fn event_loop(
         usage: None,
         quit_armed: false,
     };
+    ui.logo();
     if let Some(n) = notice {
         let mut l = Line::new(ui.color);
         ui.done
             .push(l.add("33", "!").add("", &format!(" {n}")).take());
     }
     let mut term = Term::default();
+    term.pin(height, used)?;
     let mut last = Instant::now() - FRAME;
     let mut dirty = true;
     loop {
@@ -115,6 +130,28 @@ struct Ui {
 impl Ui {
     fn width(&self) -> usize {
         self.cols.max(30)
+    }
+
+    fn logo(&mut self) {
+        if self.cols < 40 {
+            return;
+        }
+        let mut l = Line::new(self.color);
+        for (sgr, row) in LOGO {
+            self.done.push(l.add(sgr, row).take());
+        }
+        let dir = std::env::current_dir().unwrap_or_default();
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        let dir = match dir.strip_prefix(&home) {
+            Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
+            _ => dir.display().to_string(),
+        };
+        let info = format!(
+            "  bit {} | {} | {dir}",
+            env!("CARGO_PKG_VERSION"),
+            self.model
+        );
+        self.done.extend([String::new(), l.add(DIM, &info).take()]);
     }
 
     /// Returns false when the user quits.

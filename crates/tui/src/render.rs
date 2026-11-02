@@ -102,6 +102,11 @@ impl Term {
         frame: &[String],
         cursor: (usize, usize),
     ) -> io::Result<()> {
+        // Padding keeps the region at least as tall as the rows it replaces, so its last row
+        // stays on the terminal's last row.
+        let pad = self.prev.len().saturating_sub(done.len() + frame.len());
+        let mut rows = vec![String::new(); pad];
+        rows.extend_from_slice(frame);
         let mut out = String::from("\x1b[?25l");
         self.top(&mut out);
         if !done.is_empty() {
@@ -112,25 +117,35 @@ impl Term {
             }
             self.prev.clear();
         }
-        for (i, l) in frame.iter().enumerate() {
+        for (i, l) in rows.iter().enumerate() {
             if self.prev.get(i) != Some(l) {
                 out.push_str("\x1b[2K");
                 out.push_str(l);
             }
-            if i + 1 < frame.len() {
+            if i + 1 < rows.len() {
                 out.push_str("\r\n");
             }
         }
-        if self.prev.len() > frame.len() {
-            out.push_str("\r\n\x1b[J\x1b[A");
-        }
-        let up = frame.len().saturating_sub(1 + cursor.0);
+        let row = pad + cursor.0;
+        let up = rows.len() - 1 - row;
         if up > 0 {
             let _ = write!(out, "\x1b[{up}A");
         }
         let _ = write!(out, "\x1b[{}G\x1b[?25h", cursor.1 + 1);
-        self.row = cursor.0;
-        self.prev = frame.to_vec();
+        self.row = row;
+        self.prev = rows;
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(out.as_bytes())?;
+        stdout.flush()
+    }
+
+    /// Scrolls the first `used` rows of the screen into scrollback and takes the whole
+    /// screen as the region. The next frame is then padded to full height, so what is
+    /// written first (the logo) lands on the top row and the box on the bottom row.
+    pub fn pin(&mut self, height: u16, used: u16) -> io::Result<()> {
+        let out = format!("\x1b[{height};1H{}\x1b[H", "\n".repeat(used.into()));
+        self.prev = vec![String::new(); height.into()];
+        self.row = 0;
         let mut stdout = io::stdout().lock();
         stdout.write_all(out.as_bytes())?;
         stdout.flush()
