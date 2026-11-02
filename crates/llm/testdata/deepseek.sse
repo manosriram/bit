@@ -1,0 +1,6 @@
+data: {"id":"3","choices":[{"index":0,"delta":{"role":"assistant","content":"Ok."},"finish_reason":null}]}
+
+data: {"id":"3","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":900,"completion_tokens":2,"total_tokens":902,"prompt_cache_hit_tokens":832,"prompt_cache_miss_tokens":68}}
+
+data: [DONE]
+

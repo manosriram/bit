@@ -1,0 +1,16 @@
+: keep-alive
+
+data: {"id":"1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"1","choices":[{"index":0,"delta":{"content":"héllo 世"},"finish_reason":null}]}
+
+data:{"id":"1","choices":[{"index":0,"delta":{"content":"界 🦀"},"finish_reason":null}]}
+
+data: {"id":"1","choices":[{"index":0,"delta":{"content":"\n\"ok\""},"finish_reason":null}]}
+
+data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+data: {"id":"1","choices":[{"index":0,"delta":{"content":"ignored after DONE"}}]}
+

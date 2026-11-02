@@ -1,0 +1,3 @@
+data: {"id":"4","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}
+
+data: {"id":"4","choices":[{"index":0,"delta":{"content":" rep
