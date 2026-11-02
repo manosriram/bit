@@ -73,10 +73,11 @@ impl Context {
         self.messages.iter().fold(self.prefix.clone(), |b, m| b + "," + m.get()) + "]}"
     }
 
-    /// The request that asks for a summary: the history plus `ask`, with tools off.
+    /// The request that asks for a summary: the history plus `ask`. Tools stay on, since
+    /// turning them off makes providers drop them from the prompt and miss the cache.
     pub(crate) fn summary_body(&self, ask: &RawValue) -> String {
         let body = self.body();
-        format!("{},{}],\"tool_choice\":\"none\"}}", &body[..body.len() - 2], ask.get())
+        format!("{},{}]}}", &body[..body.len() - 2], ask.get())
     }
 
     /// Whether the last request used more than 70% of the model's context window.

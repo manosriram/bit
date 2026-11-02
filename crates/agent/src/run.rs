@@ -35,7 +35,7 @@ pub async fn run(
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
     // only because `tokio::spawn` needs the future to be `Send`.
     let auto = AtomicBool::new(agent.mode == Mode::Auto);
-    let (approve_tx, mut approvals) = unbounded_channel();
+    let (replies_tx, mut replies) = unbounded_channel();
     while let Some(cmd) = cmds.recv().await {
         // `None` is `/compact`: a turn that only compacts.
         let text = match cmd {
@@ -66,9 +66,9 @@ pub async fn run(
                 }
                 continue;
             }
-            Command::Approve { .. } | Command::Cancel => continue,
+            Command::Approve { .. } | Command::Answer { .. } | Command::Cancel => continue,
         };
-        while approvals.try_recv().is_ok() {}
+        while replies.try_recv().is_ok() {}
         let len = cx.messages.len();
         if let Some(text) = &text {
             cx.messages.push(msg("user", text));
@@ -76,7 +76,7 @@ pub async fn run(
         let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
         let work = async {
             match text {
-                Some(_) => turn.run(&mut cx, &mut approvals).await,
+                Some(_) => turn.run(&mut cx, &mut replies).await,
                 None => {
                     turn.compact(&mut cx).await;
                     Ok(())
@@ -85,7 +85,7 @@ pub async fn run(
         };
         let reason = tokio::select! {
             r = work => r.err().unwrap_or(StopReason::Done),
-            () = listen(&mut cmds, &auto, &approve_tx) => StopReason::Cancelled,
+            () = listen(&mut cmds, &auto, &replies_tx) => StopReason::Cancelled,
         };
         let why = match reason {
             StopReason::Done => None,
@@ -114,7 +114,7 @@ impl Turn<'_> {
     async fn run(
         &mut self,
         cx: &mut Context,
-        approvals: &mut UnboundedReceiver<(Box<str>, Decision)>,
+        replies: &mut UnboundedReceiver<Command>,
     ) -> Result<(), StopReason> {
         loop {
             if cx.full() {
@@ -137,12 +137,9 @@ impl Turn<'_> {
                         summary: summary.as_str().into(),
                         detail: tools::detail(name, args).into(),
                     });
-                    let d = loop {
-                        match approvals.recv().await {
-                            Some((for_id, d)) if *for_id == *id => break d,
-                            Some(_) => {}
-                            None => break Decision::No,
-                        }
+                    let d = match reply(replies, id).await {
+                        Some(Command::Approve { decision, .. }) => decision,
+                        _ => Decision::No,
                     };
                     if d == Decision::Always {
                         self.a.policy.always(name, args);
@@ -154,9 +151,10 @@ impl Turn<'_> {
                     name: name.into(),
                     summary: summary.into(),
                 });
-                let out = match allowed {
-                    true => tools::exec(name, args, &self.a.tools).await,
-                    false => tools::Output { ok: false, content: DECLINED.into() },
+                let out = match (name, allowed) {
+                    ("ask", _) => self.ask(id, args, replies).await,
+                    (_, true) => tools::exec(name, args, &self.a.tools).await,
+                    (_, false) => tools::Output { ok: false, content: DECLINED.into() },
                 };
                 let preview = preview(name, out.ok, &out.content).into();
                 self.send(Event::ToolEnd { id: id.into(), ok: out.ok, preview });
@@ -167,6 +165,28 @@ impl Turn<'_> {
                 return Ok(());
             }
         }
+    }
+
+    /// Puts the model's question to the user and waits for the answer.
+    async fn ask(
+        &self,
+        id: &str,
+        args: &str,
+        replies: &mut UnboundedReceiver<Command>,
+    ) -> tools::Output {
+        let a: Value = serde_json::from_str(args).unwrap_or_default();
+        let options = a["options"].as_array().into_iter().flatten().filter_map(Value::as_str);
+        let question = a["question"].as_str().unwrap_or("").into();
+        self.send(Event::Ask {
+            id: id.into(),
+            question,
+            options: options.map(Into::into).collect(),
+        });
+        let content = match reply(replies, id).await {
+            Some(Command::Answer { text, .. }) => text,
+            _ => "error: the user gave no answer".into(),
+        };
+        tools::Output { ok: true, content }
     }
 
     /// Writes the messages the log doesn't have yet. Each call ends a whole step, so the log
@@ -192,8 +212,9 @@ impl Turn<'_> {
         let latest = latest.split_once(LATEST).map_or(latest.as_str(), |(_, l)| l).to_owned();
         let body = cx.summary_body(&msg("user", SUMMARIZE));
         let c = match self.a.client.stream(body, |_| {}).await {
-            Ok(c) => c,
-            Err(e) => {
+            Ok(c) if !text(&c.message).trim().is_empty() => c,
+            r => {
+                let e = r.map_or_else(|e| e.to_string(), |_| "the model sent no summary".into());
                 let n = format!(
                     "error: compaction failed: {e}. hint: the full history is kept; /compact retries"
                 );
@@ -262,6 +283,7 @@ fn preview(name: &str, ok: bool, content: &str) -> String {
     let mut lines = content.lines();
     match (ok, name) {
         (true, "write" | "edit") => "ok".into(),
+        (true, "ask") => content.into(),
         (true, _) => format!("{} lines", content.lines().count()),
         (false, _) => lines
             .clone()
@@ -318,18 +340,30 @@ fn replay(cx: &Context, events: &UnboundedSender<Event>) {
     }
 }
 
-/// Resolves on `Cancel`, or when the UI hangs up. Meanwhile it forwards approvals to the
+/// The user's reply (`Approve` or `Answer`) for call `id`; `None` if the UI is gone.
+async fn reply(replies: &mut UnboundedReceiver<Command>, id: &str) -> Option<Command> {
+    loop {
+        let c = replies.recv().await?;
+        if let Command::Approve { id: i, .. } | Command::Answer { id: i, .. } = &c
+            && **i == *id
+        {
+            return Some(c);
+        }
+    }
+}
+
+/// Resolves on `Cancel`, or when the UI hangs up. Meanwhile it forwards replies to the
 /// turn and applies mode switches.
 async fn listen(
     cmds: &mut UnboundedReceiver<Command>,
     auto: &AtomicBool,
-    approve: &UnboundedSender<(Box<str>, Decision)>,
+    replies: &UnboundedSender<Command>,
 ) {
     while let Some(cmd) = cmds.recv().await {
         match cmd {
             Command::Cancel => return,
-            Command::Approve { id, decision } => {
-                let _ = approve.send((id, decision));
+            c @ (Command::Approve { .. } | Command::Answer { .. }) => {
+                let _ = replies.send(c);
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
             Command::Submit(_) | Command::SetModel(_) | Command::Clear | Command::Compact => {}
@@ -669,7 +703,7 @@ mod tests {
             bodies.recv().await.unwrap(),
             bodies.recv().await.unwrap(),
         );
-        assert!(b2.ends_with(r#"call tools.","role":"user"}],"tool_choice":"none"}"#), "{b2}");
+        assert!(b2.ends_with(r#"call tools.","role":"user"}]}"#), "{b2}");
         let prefix = Context::new("m", None, Vec::new()).prefix().to_owned();
         let summary = format!("{SUMMARY}\n\nSUM{LATEST}two");
         let want = format!("{prefix},{}]}}", msg("user", &summary).get());
@@ -682,5 +716,30 @@ mod tests {
         let log = Session::open(&dir.join("s1.jsonl")).unwrap().messages;
         let want = msg("user", &format!("{SUMMARY}\n\nSUM2{LATEST}two"));
         assert_eq!(log.iter().map(|m| m.get()).collect::<Vec<_>>(), [want.get()]);
+    }
+
+    #[tokio::test]
+    async fn ask_waits_for_the_answer_and_returns_it() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "ask");
+        let args = r#"{"question":"Which?","options":["a","b"]}"#;
+        let replies = vec![call("q1", "ask", args), sse(&["ok"], true)];
+        let cx = Context::new("m", None, Vec::new());
+        let (cmds, mut ev, mut bodies) = start(agent, cx, l, replies).await;
+        cmds.send(Command::Submit("go".into())).unwrap();
+        assert!(matches!(next(&mut ev).await, Event::ToolStart { .. }));
+        let ask = Event::Ask {
+            id: "q1".into(),
+            question: "Which?".into(),
+            options: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(next(&mut ev).await, ask);
+        cmds.send(Command::Answer { id: "q1".into(), text: "b".into() }).unwrap();
+        let end = Event::ToolEnd { id: "q1".into(), ok: true, preview: "b".into() };
+        assert_eq!(next(&mut ev).await, end);
+        assert_eq!(next(&mut ev).await, Event::Text("ok".into()));
+        let _ = bodies.recv().await.unwrap();
+        let b2 = bodies.recv().await.unwrap();
+        assert!(b2.ends_with(r#"{"content":"b","role":"tool","tool_call_id":"q1"}]}"#), "{b2}");
     }
 }

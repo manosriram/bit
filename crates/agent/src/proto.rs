@@ -7,6 +7,11 @@ pub enum Command {
         id: Box<str>,
         decision: Decision,
     },
+    /// The user's reply to `Event::Ask`.
+    Answer {
+        id: Box<str>,
+        text: String,
+    },
     Cancel,
     SetMode(Mode),
     /// Sent only while idle.
@@ -50,6 +55,12 @@ pub enum Event {
         id: Box<str>,
         ok: bool,
         preview: Box<str>,
+    },
+    /// The model asks the user to choose; answered with `Command::Answer`.
+    Ask {
+        id: Box<str>,
+        question: Box<str>,
+        options: Vec<Box<str>>,
     },
     /// The tokens of the last reply.
     Usage(Usage),

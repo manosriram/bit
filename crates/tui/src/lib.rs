@@ -54,7 +54,16 @@ pub async fn run(
 ) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), ct::EnableBracketedPaste)?;
+    // Without the kitty keyboard protocol, terminals send Shift-Enter as plain Enter.
+    let kitty = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if kitty {
+        let flags = ct::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+        execute!(io::stdout(), ct::PushKeyboardEnhancementFlags(flags))?;
+    }
     let r = event_loop(cmds, events, model, models, mode, notices).await;
+    if kitty {
+        let _ = execute!(io::stdout(), ct::PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(io::stdout(), ct::DisableBracketedPaste);
     let _ = terminal::disable_raw_mode();
     r
@@ -100,6 +109,8 @@ async fn event_loop(
         auto: mode == Mode::Auto,
         tool: None,
         approval: None,
+        question: None,
+        answering: None,
         section: None,
     };
     ui.logo();
@@ -174,6 +185,9 @@ struct Ui {
     /// The running tool's name and summary, shown just above the box.
     tool: Option<(Box<str>, Box<str>)>,
     approval: Option<Approval>,
+    question: Option<Question>,
+    /// Set by `something else`: the next `Enter` answers this `ask` call with the input.
+    answering: Option<Box<str>>,
     /// Whether the last scrollback rows were tool lines (`true`) or model text (`false`),
     /// so a blank row can separate the two.
     section: Option<bool>,
@@ -185,6 +199,14 @@ struct Approval {
     summary: Box<str>,
     detail: Box<str>,
     /// The marked row of `CHOICES`.
+    at: usize,
+}
+
+struct Question {
+    id: Box<str>,
+    text: Box<str>,
+    options: Vec<Box<str>>,
+    /// The marked row; one past the options is `something else`.
     at: usize,
 }
 
@@ -279,6 +301,8 @@ impl Ui {
                         let _ = cmds.send(Command::Approve { id: a.id.clone(), decision });
                         self.approval = None;
                     }
+                } else if self.question.is_some() {
+                    self.question_key(k.code, cmds);
                 } else if let Some(p) = &mut self.picker {
                     if let KeyCode::Char(c) = k.code {
                         p.query.push(c);
@@ -318,6 +342,15 @@ impl Ui {
                             let mode = if self.auto { Mode::Auto } else { Mode::Ask };
                             let _ = cmds.send(Command::SetMode(mode));
                         }
+                        // Shift-Enter needs the kitty protocol; Alt-Enter and Ctrl-J work without it.
+                        KeyCode::Enter
+                            if k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                        {
+                            self.input.insert("\n");
+                        }
+                        KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.input.insert("\n");
+                        }
                         KeyCode::Enter => self.submit(cmds),
                         KeyCode::Up => self.input.recall(true),
                         KeyCode::Down => self.input.recall(false),
@@ -340,7 +373,35 @@ impl Ui {
         true
     }
 
+    /// Picks an option by digit or by moving and `Enter`; `something else` or `Esc` hands the
+    /// input back for a typed answer.
+    fn question_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
+        let Some(q) = &mut self.question else { return };
+        let n = q.options.len();
+        let pick = match code {
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '0' as usize) <= n => {
+                q.at = c as usize - '1' as usize;
+                Some(true)
+            }
+            code => nav(code, &mut q.at, n + 1),
+        };
+        let Some(pick) = pick else { return };
+        let id = q.id.clone();
+        match q.options.get(q.at).filter(|_| pick) {
+            Some(o) => {
+                let _ = cmds.send(Command::Answer { id, text: o.to_string() });
+            }
+            None => self.answering = Some(id),
+        }
+        self.question = None;
+    }
+
     fn submit(&mut self, cmds: &UnboundedSender<Command>) {
+        if self.answering.is_some() && !self.input.text.trim().is_empty() {
+            let (id, text) = (self.answering.take().unwrap_or_default(), self.input.take());
+            let _ = cmds.send(Command::Answer { id, text });
+            return;
+        }
         if self.busy.is_some() || self.input.text.trim().is_empty() {
             return;
         }
@@ -476,6 +537,10 @@ impl Ui {
                 }
                 self.done.push(l.take());
             }
+            Event::Ask { id, question, options } => {
+                self.end_text();
+                self.question = Some(Question { id, text: question, options, at: 0 });
+            }
             Event::Approval { id, name, summary, detail } => {
                 self.end_text();
                 self.approval = Some(Approval { id, name, summary, detail, at: 0 });
@@ -493,7 +558,7 @@ impl Ui {
             Event::TurnEnd(r) => {
                 self.end_text();
                 self.tool = None;
-                self.approval = None;
+                (self.approval, self.question, self.answering) = (None, None, None);
                 let secs = self.busy.take().map_or(0.0, |t| t.elapsed().as_secs_f32());
                 let mut l = Line::new(self.color);
                 match r {
@@ -594,6 +659,20 @@ impl Ui {
         }
         let split = f.len();
         f.push(String::new());
+        if let Some(q) = &self.question {
+            f.push(self.title("question"));
+            let text = clean(&q.text);
+            for r in wrap(&text, w - 4) {
+                f.push(self.row("1", &text[r]));
+            }
+            f.push(self.row("", ""));
+            let numbered =
+                q.options.iter().enumerate().map(|(i, o)| format!("{}. {}", i + 1, clean(o)));
+            let rows: Vec<String> = numbered.chain(["something else".into()]).collect();
+            let row = self.list(&mut f, rows.iter().map(String::as_str), q.at);
+            f.push(self.status_border(YELLOW));
+            return (f, split, (row, 2));
+        }
         if let Some(a) = &self.approval {
             let (f, cursor) = self.approval_box(a, f);
             return (f, split, cursor);
@@ -624,7 +703,13 @@ impl Ui {
             let e = t.elapsed();
             l.add(DIM, "-- ")
                 .add(YELLOW, &self.bits())
-                .add("", &format!(" working {:.1}s", e.as_secs_f32()))
+                .add(
+                    "",
+                    &match self.answering {
+                        Some(_) => " type your answer, then Enter".into(),
+                        None => format!(" working {:.1}s", e.as_secs_f32()),
+                    },
+                )
                 .add(DIM, " ");
             let right = " esc cancels --+";
             l.fill(DIM, '-', w - right.len()).add(DIM, right);

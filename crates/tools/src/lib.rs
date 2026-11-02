@@ -14,6 +14,7 @@ pub const SCHEMAS: &str = r#"[
 {"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
 {"type":"function","function":{"name":"edit","description":"Replace the exact text `old` with `new` in a file. `old` must match exactly once, including whitespace.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}}},
 {"type":"function","function":{"name":"bash","description":"Run a shell command in the working directory. stderr is merged into stdout. Background jobs are killed when the command exits.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"Seconds, default 120, max 600"}},"required":["command"]}}},
+{"type":"function","function":{"name":"ask","description":"Ask the user to choose. Use this instead of listing options in text and asking for a number. Returns the user's answer, which may be one of the options or their own text.","parameters":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"},"description":"2 to 9 short choices"}},"required":["question","options"]}}},
 {"type":"function","function":{"name":"grep","description":"Search file contents with a ripgrep regex. Respects .gitignore.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string","description":"Only search files matching this glob, e.g. *.rs"}},"required":["pattern"]}}},
 {"type":"function","function":{"name":"glob","description":"List files matching a glob, e.g. *.rs or src/**/mod.rs. Respects .gitignore.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}}
 ]"#;
@@ -40,6 +41,7 @@ pub fn summary(name: &str, args: &str) -> String {
     let s = |k: &str| v.get(k).and_then(|x| x.as_str());
     match (name, s("path")) {
         ("bash", _) => s("command").unwrap_or("").lines().next().unwrap_or("").into(),
+        ("ask", _) => s("question").unwrap_or("").into(),
         ("grep" | "glob", None) => format!("{:?}", s("pattern").unwrap_or("")),
         ("grep" | "glob", Some(p)) => format!("{:?} in {p}", s("pattern").unwrap_or("")),
         (_, p) => p.unwrap_or("").into(),
