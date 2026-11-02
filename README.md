@@ -9,7 +9,7 @@ bit is a terminal coding agent with strong focus on tiny core, size, and memory 
 
 ## Why
 
-- **Small.** About 3k lines of Rust in five crates, with hard per-crate line budgets
+- **Small.** About 3k lines in five crates, with hard per-crate line budgets
   enforced in CI. You can read all of it.
 - **Lean.** One binary of about 2.5 MB, running on a single-threaded tokio runtime.
 - **Cheap to run.** The request prefix (model, tools, system prompt) is byte-identical on
