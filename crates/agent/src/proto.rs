@@ -70,6 +70,12 @@ pub enum Event {
         question: Box<str>,
         options: Vec<Box<str>>,
     },
+    /// `/login` asks for an API key; answered with `Command::Answer`. What's typed is
+    /// hidden, and kept out of the input history.
+    Secret {
+        id: Box<str>,
+        prompt: Box<str>,
+    },
     /// The tokens of the last reply.
     Usage(Usage),
     Notice(Box<str>),

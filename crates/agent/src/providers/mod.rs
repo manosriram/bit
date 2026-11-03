@@ -22,8 +22,8 @@ pub struct Spec {
 pub enum Auth {
     /// The variable that holds the key.
     Key(&'static str),
-    /// Signed in with `/login`, under this choice.
-    Oauth(&'static str),
+    /// Signed in through the browser with `/login`.
+    Oauth,
 }
 
 impl Spec {
@@ -31,13 +31,21 @@ impl Spec {
     pub fn key_env(&self) -> &'static str {
         match self.auth {
             Auth::Key(env) => env,
-            Auth::Oauth(_) => "/login",
+            Auth::Oauth => "/login",
         }
     }
 }
 
 /// In the order the picker lists them; the first is the default without any key.
-pub const ALL: &[&Spec] = &[&keyed::DEEPSEEK, &keyed::OPENAI, &chatgpt::SPEC, &keyed::OPENCODE_GO];
+pub const ALL: &[&Spec] = &[
+    &keyed::DEEPSEEK,
+    &keyed::OPENAI,
+    &chatgpt::SPEC,
+    &keyed::ANTHROPIC,
+    &keyed::OPENCODE_GO,
+    &keyed::OPENROUTER,
+    &keyed::ZAI,
+];
 
 pub fn find(name: &str) -> Option<&'static Spec> {
     ALL.iter().copied().find(|s| s.name == name)

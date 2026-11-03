@@ -1,6 +1,12 @@
 /// (provider, id, context window in tokens). OpenCode Go entries are from
-/// `opencode.ai/inference/go/v1/models`, ChatGPT ones from the models Codex lists (Nov 2026).
+/// `opencode.ai/inference/go/v1/models`, ChatGPT ones from the models Codex lists, Anthropic
+/// ones from its model list, OpenRouter and Z.ai ones from
+/// `openrouter.ai/api/v1/models` (Nov 2026).
 const MODELS: &[(&str, &str, u32)] = &[
+    ("anthropic", "claude-opus-5-5", 1_000_000),
+    ("anthropic", "claude-sonnet-5-5", 1_000_000),
+    ("anthropic", "claude-haiku-5-5", 1_000_000),
+    ("anthropic", "claude-fable-5-1", 1_000_000),
     ("chatgpt", "gpt-6.1-sol", 500_000),
     ("chatgpt", "gpt-6.1-terra", 500_000),
     ("chatgpt", "gpt-6-sol", 272_000),
@@ -30,6 +36,18 @@ const MODELS: &[(&str, &str, u32)] = &[
     ("opencode-go", "step-5-preview", 1_000_000),
     ("opencode-go", "beam-free", 1_048_576),
     ("opencode-go", "iceman-contributor-free", 262_144),
+    ("openrouter", "anthropic/claude-opus-5.5", 1_000_000),
+    ("openrouter", "anthropic/claude-sonnet-5.5", 1_000_000),
+    ("openrouter", "openai/gpt-6.1-sol", 1_050_000),
+    ("openrouter", "google/gemini-4-argon", 1_048_576),
+    ("openrouter", "x-ai/grok-4.7", 500_000),
+    ("openrouter", "moonshotai/kimi-k3.1-pro", 1_048_576),
+    ("openrouter", "z-ai/glm-5.3", 1_048_576),
+    ("openrouter", "deepseek/deepseek-v4.1-flash", 1_048_576),
+    ("zai", "glm-5.3", 1_048_576),
+    ("zai", "glm-5.3-prime", 1_000_000),
+    ("zai", "glm-5.3-flash", 1_048_576),
+    ("zai", "glm-5.2", 1_048_576),
 ];
 
 /// The context window of a built-in model, in tokens.

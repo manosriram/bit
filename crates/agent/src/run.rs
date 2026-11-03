@@ -211,32 +211,82 @@ impl Turn<'_> {
         }
     }
 
-    /// `/login`: asks which provider, then signs in to the one that choice stands for.
+    /// `/login`: asks for a sign-in or an API key, then which provider, then signs in
+    /// through the browser, or takes the key and saves it in `auth.json`, so nobody has to
+    /// edit the file.
     async fn login(&mut self, replies: &mut UnboundedReceiver<Command>) -> Result<(), StopReason> {
         let fail = |e: &str| StopReason::Error(e.into());
-        let choices: Vec<_> = (providers::ALL.iter())
-            .filter_map(|s| if let Auth::Oauth(c) = s.auth { Some((c, *s)) } else { None })
+        let kinds: Vec<Box<str>> = vec![SIGN_IN.into(), API_KEY.into()];
+        let question = "Log in with?".into();
+        self.send(Event::Ask { id: "login-kind".into(), question, options: kinds });
+        let oauth = match reply(replies, "login-kind").await {
+            Some(Command::Answer { text, .. }) if text.trim() == SIGN_IN => true,
+            Some(Command::Answer { text, .. }) if text.trim() == API_KEY => false,
+            _ => return Err(fail(&format!("error: pick {SIGN_IN} or {API_KEY}"))),
+        };
+        let is_oauth =
+            |name: &str| providers::find(name).is_some_and(|s| matches!(s.auth, Auth::Oauth));
+        let options: Vec<Box<str>> = self
+            .a
+            .providers
+            .iter()
+            .filter(|p| is_oauth(&p.name) == oauth)
+            .map(|p| {
+                format!("{} {}", p.name, if p.key.is_ok() { CONNECTED } else { NOT_CONNECTED })
+                    .into()
+            })
             .collect();
-        let options: Vec<Box<str>> = choices.iter().map(|c| c.0.into()).collect();
         let question = "Sign in to which provider?".into();
         self.send(Event::Ask { id: "login".into(), question, options: options.clone() });
-        let spec = match reply(replies, "login").await {
-            Some(Command::Answer { text, .. }) => choices.iter().find(|c| c.0 == text),
+        let p = match reply(replies, "login").await {
+            Some(Command::Answer { text, .. }) => self
+                .a
+                .providers
+                .iter()
+                .find(|p| {
+                    text.split_whitespace().next() == Some(&*p.name) && is_oauth(&p.name) == oauth
+                })
+                .cloned(),
             _ => None,
         };
-        let Some(&(_, spec)) = spec else {
-            return Err(fail(&format!("error: bit can sign in only to {}", options.join(", "))));
+        let Some(p) = p else {
+            return Err(fail(&format!(
+                "error: pick one of {}",
+                options
+                    .iter()
+                    .filter_map(|o| o.split_whitespace().next())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         };
-        let show = |url: &str| self.send(Event::Notice(format!("{OPEN}{url}").into()));
-        let key = providers::sign_in(spec, &self.a.auth, show).await.map_err(|e| fail(&e))?;
-        if let Some(p) = self.a.providers.iter_mut().find(|p| p.name == spec.name) {
-            p.key = Ok(key);
-            if self.a.provider == spec.name {
-                (self.a.client, self.a.no_key) = (connect(p, self.a.session.id()), None);
+        let key = match providers::find(&p.name) {
+            Some(s) if matches!(s.auth, Auth::Oauth) => {
+                let show = |url: &str| self.send(Event::Notice(format!("{OPEN}{url}").into()));
+                providers::sign_in(s, &self.a.auth, show).await.map_err(|e| fail(&e))?
+            }
+            _ => {
+                let prompt = format!("enter your {} API key ({}), then Enter", p.name, p.key_env);
+                self.send(Event::Secret { id: "key".into(), prompt: prompt.into() });
+                let key = match reply(replies, "key").await {
+                    Some(Command::Answer { text, .. }) => text.trim().to_owned(),
+                    _ => String::new(),
+                };
+                if key.is_empty() {
+                    return Err(fail("error: no key given. hint: run /login again"));
+                }
+                let cred = providers::auth::Cred::ApiKey { key: key.clone() };
+                providers::auth::put(&self.a.auth, &p.name, cred).map_err(|e| fail(&e))?;
+                key
+            }
+        };
+        if let Some(q) = self.a.providers.iter_mut().find(|q| q.name == p.name) {
+            q.key = Ok(key);
+            if self.a.provider == q.name {
+                (self.a.client, self.a.no_key) = (connect(q, self.a.session.id()), None);
             }
         }
-        self.send(Event::SignedIn(spec.name.into()));
-        self.send(Event::Notice(SIGNED_IN.into()));
+        self.send(Event::SignedIn(p.name.as_str().into()));
+        self.send(Event::Notice(format!("{} is ready; its models are in /model", p.name).into()));
         Ok(())
     }
 
@@ -385,7 +435,12 @@ const LATEST: &str = "\n\n[The user's latest message, verbatim:]\n\n";
 const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
 const NOT_ALLOWED: &str = "error: bit -p runs without a user, so this call needs --mode auto or a [bash] allow entry. hint: do without it, or tell the user how to allow it";
 const OPEN: &str = "sign in in your browser; if it didn't open, visit ";
-const SIGNED_IN: &str = "signed in to openai; its ChatGPT models are under chatgpt in /model";
+/// The two answers to `/login`'s first question.
+const SIGN_IN: &str = "subscription";
+const API_KEY: &str = "api key";
+/// After each provider's name in `/login`'s list.
+const CONNECTED: &str = "· connected";
+const NOT_CONNECTED: &str = "· not connected";
 const NO_USER: &str =
     "error: bit -p runs without a user to answer. hint: decide yourself and say what you chose";
 
@@ -964,18 +1019,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_asks_for_the_provider_and_takes_only_openai() {
+    async fn login_takes_an_api_key_and_saves_it_in_auth_json() {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let agent = agent(l.local_addr().unwrap(), "login");
+        let mut agent = agent(l.local_addr().unwrap(), "login");
+        let auth = agent.auth.clone();
+        agent.providers = vec![Provider {
+            name: "openai".into(),
+            base_url: String::new(),
+            key_env: "OPENAI_API_KEY".into(),
+            key: Err("error: not set".into()),
+            models: Vec::new(),
+        }];
         let (cmds, mut ev, mut bodies) =
             start(agent, Context::new("m", None, vec![]), l, vec![]).await;
+        let login = |text: &str| Command::Answer { id: "login".into(), text: text.into() };
+        let options = vec!["openai · not connected".into()];
+        let ask = Event::Ask {
+            id: "login".into(),
+            question: "Sign in to which provider?".into(),
+            options,
+        };
+
+        let kind_ask = Event::Ask {
+            id: "login-kind".into(),
+            question: "Log in with?".into(),
+            options: vec![SIGN_IN.into(), API_KEY.into()],
+        };
+        let kind = |text: &str| Command::Answer { id: "login-kind".into(), text: text.into() };
+
         cmds.send(Command::Login).unwrap();
-        let (id, question, options) =
-            ("login".into(), "Sign in to which provider?".into(), vec!["openai".into()]);
-        assert_eq!(next(&mut ev).await, Event::Ask { id, question, options });
-        cmds.send(Command::Answer { id: "login".into(), text: "gemini".into() }).unwrap();
-        let end = Event::TurnEnd(StopReason::Error("error: bit can sign in only to openai".into()));
+        assert_eq!(next(&mut ev).await, kind_ask);
+        cmds.send(kind("nope")).unwrap();
+        let end = Event::TurnEnd(StopReason::Error("error: pick subscription or api key".into()));
         assert_eq!(next(&mut ev).await, end);
+
+        // An API-key provider isn't offered as a sign-in.
+        cmds.send(Command::Login).unwrap();
+        assert_eq!(next(&mut ev).await, kind_ask);
+        cmds.send(kind(SIGN_IN)).unwrap();
+        let none = Event::Ask {
+            id: "login".into(),
+            question: "Sign in to which provider?".into(),
+            options: vec![],
+        };
+        assert_eq!(next(&mut ev).await, none);
+        cmds.send(login("openai")).unwrap();
+        let end = Event::TurnEnd(StopReason::Error("error: pick one of ".into()));
+        assert_eq!(next(&mut ev).await, end);
+
+        cmds.send(Command::Login).unwrap();
+        assert_eq!(next(&mut ev).await, kind_ask);
+        cmds.send(kind(API_KEY)).unwrap();
+        assert_eq!(next(&mut ev).await, ask);
+        cmds.send(login("gemini")).unwrap();
+        let end = Event::TurnEnd(StopReason::Error("error: pick one of openai".into()));
+        assert_eq!(next(&mut ev).await, end);
+
+        cmds.send(Command::Login).unwrap();
+        assert_eq!(next(&mut ev).await, kind_ask);
+        cmds.send(kind(API_KEY)).unwrap();
+        assert_eq!(next(&mut ev).await, ask);
+        cmds.send(login("openai · not connected")).unwrap();
+        let prompt = "enter your openai API key (OPENAI_API_KEY), then Enter".into();
+        assert_eq!(next(&mut ev).await, Event::Secret { id: "key".into(), prompt });
+        cmds.send(Command::Answer { id: "key".into(), text: " sk-1\n".into() }).unwrap();
+        assert_eq!(next(&mut ev).await, Event::SignedIn("openai".into()));
+        let ready = Event::Notice("openai is ready; its models are in /model".into());
+        assert_eq!(next(&mut ev).await, ready);
+        let saved = crate::providers::auth::load(&auth).unwrap();
+        assert!(
+            matches!(&saved["openai"], crate::providers::auth::Cred::ApiKey { key } if key == "sk-1")
+        );
         assert!(bodies.try_recv().is_err(), "a login sends no model request");
     }
 

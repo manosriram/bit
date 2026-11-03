@@ -94,7 +94,7 @@ pub fn load() -> Result<Config, String> {
         let base_url = pick(c_url, builtin.map(|s| s.base_url), "base_url")?;
         let key_env = pick(c_env, builtin.map(|s| s.key_env()), "api_key_env")?;
         let key = match builtin.map(|s| (s, &s.auth)) {
-            Some((s, Auth::Oauth(_))) => signed_in(s, &auth),
+            Some((s, Auth::Oauth)) => signed_in(s, &auth),
             _ => api_key(&name, &key_env, std::env::var(&key_env).ok(), saved.remove(&name), &auth),
         };
         let mut models = c_models;

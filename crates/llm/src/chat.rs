@@ -6,6 +6,19 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::borrow::Cow;
 
+/// The request as it is, less Anthropic's `content_blocks`, which a Chat Completions server
+/// may reject; only a session that ran on Anthropic has them.
+pub fn body(body: String) -> Result<String, serde_json::Error> {
+    if !body.contains("\"content_blocks\"") {
+        return Ok(body);
+    }
+    let mut c: serde_json::Value = serde_json::from_str(&body)?;
+    for m in c["messages"].as_array_mut().into_iter().flatten() {
+        m.as_object_mut().map(|m| m.remove("content_blocks"));
+    }
+    Ok(c.to_string())
+}
+
 pub fn data<F: FnMut(&str)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> {
     if data == b"[DONE]" {
         acc.done = true;

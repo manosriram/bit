@@ -27,7 +27,7 @@ const TAIL_ROWS: usize = 4;
 const COMMANDS: [(&str, &str, &str); 4] = [
     ("/clear", "", "start over; the model forgets this conversation"),
     ("/compact", "", "summarize the conversation to free up context"),
-    ("/login", "", "sign in with a subscription instead of an API key"),
+    ("/login", "", "add a provider: paste its API key, or sign in"),
     ("/model", "[id]", "pick the model, or set it to id"),
 ];
 const CHOICES: [(&str, Decision); 3] = [
@@ -177,6 +177,9 @@ struct Ui {
     question: Option<Question>,
     /// Set by `something else`: the next `Enter` answers this `ask` call with the input.
     answering: Option<Box<str>>,
+    /// The answer is an API key: drawn as dots, never kept in the input history.
+    /// The key prompt while a pasted key is hidden.
+    secret: Option<Box<str>>,
     /// Whether the last scrollback rows were tool lines (`true`) or model text (`false`),
     /// so a blank row can separate the two.
     section: Option<bool>,
@@ -429,7 +432,14 @@ impl Ui {
             return;
         }
         if let Some(id) = self.answering.take() {
-            let _ = cmds.send(Command::Answer { id, text: self.input.take() });
+            let text = if self.secret.take().is_some() {
+                let key = self.input.text.clone();
+                self.input.set("");
+                key
+            } else {
+                self.input.take()
+            };
+            let _ = cmds.send(Command::Answer { id, text });
             return;
         }
         if self.busy.is_some() {
@@ -620,6 +630,9 @@ impl Ui {
                 self.end_text();
                 self.question = Some(Question { id, text: question, options, at: 0 });
             }
+            Event::Secret { id, prompt } => {
+                (self.answering, self.secret) = (Some(id), Some(prompt));
+            }
             Event::Approval { id, name, summary, detail } => {
                 self.end_text();
                 self.approval = Some(Approval { id, name, summary, detail, at: 0 });
@@ -643,6 +656,10 @@ impl Ui {
                 self.end_text();
                 self.tool = None;
                 (self.approval, self.question, self.answering) = (None, None, None);
+                // A cancelled key prompt must not leave the key in the box.
+                if self.secret.take().is_some() {
+                    self.input.set("");
+                }
                 let secs = self.busy.take().map_or(0.0, |t| t.elapsed().as_secs_f32());
                 let mut l = Line::new(self.color);
                 match r {
@@ -797,12 +814,14 @@ impl Ui {
         if let Some(t) = self.busy {
             let e = t.elapsed();
             l.add(DIM, "-- ")
-                .add(YELLOW, &self.bits())
+                // No animation over a key prompt: nothing is running while it's typed.
+                .add(YELLOW, &if self.secret.is_some() { String::new() } else { self.bits() })
                 .add(
                     "",
-                    &match self.answering {
-                        Some(_) => " type your answer, then Enter".into(),
-                        None => format!(" working {:.1}s", e.as_secs_f32()),
+                    &match (&self.answering, &self.secret) {
+                        (Some(_), Some(p)) => p.to_string(),
+                        (Some(_), None) => " type your answer, then Enter".into(),
+                        (None, _) => format!(" working {:.1}s", e.as_secs_f32()),
                     },
                 )
                 .add(DIM, " ");
@@ -816,7 +835,8 @@ impl Ui {
         }
         f.push(l.take());
 
-        let (rows, (row, col)) = self.input.layout(w - 4);
+        let masked = self.secret.is_some().then(|| self.input.masked());
+        let (rows, (row, col)) = masked.as_ref().unwrap_or(&self.input).layout(w - 4);
         let top = f.len();
         for (i, r) in rows.iter().enumerate() {
             l.add(DIM, "| ");
@@ -1025,6 +1045,33 @@ mod tests {
         ui.question_key(KeyCode::Esc, &tx);
         assert_eq!(ui.answering.as_deref(), Some("login"));
         assert!(ui.frame().2.is_some(), "typed answers need a cursor");
+    }
+
+    #[test]
+    fn a_pasted_key_is_hidden_and_never_kept() {
+        let mut ui = Ui { cols: 80, busy: Some(Instant::now()), ..Ui::default() };
+        let (tx, mut rx) = unbounded_channel();
+        ui.event(Event::Secret { id: "key".into(), prompt: "paste your key".into() });
+        ui.input.set("sk-secret");
+        let (frame, ..) = ui.frame();
+        assert!(!frame.iter().any(|r| r.contains("sk-secret")), "the key is never drawn");
+        assert!(frame.iter().any(|r| r.contains("•••••••••")));
+        assert!(frame.iter().any(|r| r.contains("-- paste your key")), "the prompt is on the box");
+        assert!(
+            !frame.iter().any(|r| r.contains(&ui.bits())),
+            "no bit animation over a key prompt"
+        );
+        ui.submit(&tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::Answer { id, text })
+            if &*id == "key" && text == "sk-secret"));
+        ui.input.recall(true);
+        assert!(ui.input.text.is_empty(), "Up doesn't bring the key back");
+
+        // Cancelled mid-paste, the half-typed key goes too.
+        ui.event(Event::Secret { id: "key".into(), prompt: "paste your key".into() });
+        ui.input.set("sk-half");
+        ui.event(Event::TurnEnd(StopReason::Done));
+        assert!(ui.input.text.is_empty() && ui.secret.is_none());
     }
 
     /// Scrollback after an `edit` with this diff ends `ok` or not.

@@ -14,10 +14,11 @@ bit is a terminal coding agent with strong focus on tiny core, size, and memory 
 ## Why
 
 - **Small.** A few thousand lines in five crates. You can read all of it.
-- **Lean.** One binary of about 2.5 MB, running on a single-threaded tokio runtime.
+- **Lean.** One binary of about 2.7 MB, running on a single-threaded tokio runtime.
 - **Cheap to run.** The request prefix (model, tools, system prompt) is byte-identical on
   every turn, and history is only ever appended, so provider prompt caches keep hitting.
-  The session id routes requests to the same cache, even after a resume.
+  The session id routes requests to the same cache, even after a resume, and on Anthropic
+  bit places the cache markers itself.
 
 ## Install
 
@@ -38,6 +39,8 @@ cargo build --release      # target/release/bit
 
 ## Use
 
+On first run, type `/login` and pick a provider to add its key (see [Providers](#providers)).
+
 ```
 bit                start a session
 bit -c             continue the last session in this directory
@@ -51,7 +54,14 @@ In `-p` mode nobody can approve, so write, edit and bash are declined unless `--
 or `[bash] allow` permits them.
 
 Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Shift-Tab` toggle
-ask/auto, `Up`/`Down` earlier prompts, `/` commands.
+ask/auto, `Up`/`Down` earlier prompts, `/` commands:
+
+```
+/login             add a provider: paste its API key, or sign in
+/model [id]        pick the model, or set it to id
+/compact           summarize the conversation to free up context
+/clear             start over; the model forgets this conversation
+```
 
 ## Providers
 
@@ -59,26 +69,21 @@ ask/auto, `Up`/`Down` earlier prompts, `/` commands.
 starts on your last pick. Without one, it starts on `provider` in the config, or the first
 provider whose key is set:
 
-| Provider | Key |
-|---|---|
-| `deepseek` | `DEEPSEEK_API_KEY` |
-| `openai` | `OPENAI_API_KEY` |
-| `chatgpt` | `/login` |
-| `opencode-go` | `OPENCODE_API_KEY` |
+| Provider | `/login` takes | Or export |
+|---|---|---|
+| `deepseek` | API key | `DEEPSEEK_API_KEY` |
+| `openai` | API key | `OPENAI_API_KEY` |
+| `anthropic` | API key | `ANTHROPIC_API_KEY` |
+| `opencode-go` | API key | `OPENCODE_API_KEY` |
+| `openrouter` | API key | `OPENROUTER_API_KEY` |
+| `zai` | API key | `ZAI_API_KEY` |
+| `chatgpt` | a browser sign-in to your ChatGPT plan (Plus, Pro, ...) | |
 
-`chatgpt` uses your ChatGPT subscription (Plus, Pro, ...) instead of an API key: type
-`/login`, pick `openai`, and sign in on the page that opens in your browser. bit saves the
-tokens and refreshes them itself.
-
-Instead of exporting a key, you can save it in `~/.config/bit/auth.json` (keep it private;
-bit writes it owner-only). A key in the environment wins over a saved one:
-
-```json
-{
-  "deepseek": { "type": "api_key", "key": "sk-..." },
-  "opencode-go": { "type": "api_key", "key": "..." }
-}
-```
+To add one, type `/login` and pick it. For an API key, paste it (it's hidden as you type);
+for `chatgpt`, sign in on the page that opens in your browser. bit saves either in
+`~/.config/bit/auth.json`, owner-only, and refreshes the ChatGPT sign-in itself. Or export
+the key's variable, which wins over a saved key. More in
+[docs/providers.md](docs/providers.md).
 
 Everything bit keeps is in `~/.config/bit/` (or `$XDG_CONFIG_HOME/bit/`): `config.toml`,
 `auth.json`, `model` (the last pick) and `sessions/`.
@@ -91,7 +96,7 @@ Everything bit keeps is in `~/.config/bit/` (or `$XDG_CONFIG_HOME/bit/`): `confi
 model = "kimi-k3"
 provider = "opencode-go"
 
-[providers.local]                 # any OpenAI-compatible endpoint
+[providers.local]                 # any OpenAI-compatible endpoint; /login takes its key
 base_url = "http://localhost:8080/v1"
 api_key_env = "LOCAL_API_KEY"
 models = ["qwen3-coder"]          # what /model offers for it

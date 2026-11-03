@@ -2,7 +2,7 @@
 //! back to localhost:1455), and served over the Responses API. bit keeps its own tokens,
 //! since refresh tokens rotate and sharing Codex's file would sign one of the two out.
 
-use super::auth::{Cred, Tokens, load, save};
+use super::auth::{Cred, Tokens, load, put, save};
 use super::{Auth, Spec};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -20,7 +20,7 @@ pub const SPEC: Spec = Spec {
     name: "chatgpt",
     base_url: "https://chatgpt.com/backend-api/codex",
     wire: llm::Api::Responses,
-    auth: Auth::Oauth("openai"),
+    auth: Auth::Oauth,
     cache_key: true,
     headers: |session, key| {
         vec![
@@ -91,9 +91,8 @@ pub async fn sign_in(path: &Path, show: impl FnOnce(&str)) -> Result<String, Str
         ("code_verifier", &verifier),
     ];
     let t = exchange(&grant).await?;
-    let (access, mut creds) = (t.access_token.clone(), load(path)?);
-    creds.insert(SPEC.name.into(), Cred::Oauth(t));
-    save(path, &creds)?;
+    let access = t.access_token.clone();
+    put(path, SPEC.name, Cred::Oauth(t))?;
     Ok(access)
 }
 

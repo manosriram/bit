@@ -28,6 +28,13 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, Cred>, String> {
     }
 }
 
+/// Saves `cred` as `name`'s entry, keeping the others.
+pub(crate) fn put(path: &Path, name: &str, cred: Cred) -> Result<(), String> {
+    let mut creds = load(path)?;
+    creds.insert(name.into(), cred);
+    save(path, &creds)
+}
+
 /// Owner-only, since the keys and tokens are as good as a password.
 pub(crate) fn save(path: &Path, creds: &BTreeMap<String, Cred>) -> Result<(), String> {
     use std::io::Write;

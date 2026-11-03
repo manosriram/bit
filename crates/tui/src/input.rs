@@ -83,6 +83,14 @@ impl Input {
     }
 
     /// Replaces the text, with the cursor at the end.
+    /// A copy with every character shown as a dot, for an API key.
+    pub fn masked(&self) -> Input {
+        let dots = |s: &str| "•".repeat(s.chars().count());
+        let before = dots(&self.text[..self.cursor]);
+        let text = before.clone() + &dots(&self.text[self.cursor..]);
+        Input { text, cursor: before.len(), ..Input::default() }
+    }
+
     pub fn set(&mut self, text: &str) {
         self.text = text.into();
         self.cursor = self.text.len();

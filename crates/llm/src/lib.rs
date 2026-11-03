@@ -1,3 +1,4 @@
+mod anthropic;
 mod chat;
 pub mod models;
 mod responses;
@@ -23,6 +24,8 @@ pub enum Api {
     Chat,
     /// The Responses API (`responses.rs`): ChatGPT subscriptions.
     Responses,
+    /// The Messages API (`anthropic.rs`): Anthropic.
+    Anthropic,
 }
 
 pub struct Completion {
@@ -84,14 +87,18 @@ impl Client {
         on_text: impl FnMut(&str),
     ) -> Result<Completion, Error> {
         let (path, body) = match self.api {
-            Api::Chat => ("chat/completions", body),
+            Api::Chat => ("chat/completions", chat::body(body)?),
             Api::Responses => ("responses", responses::body(&body)?),
+            Api::Anthropic => ("messages", anthropic::body(&body)?),
         };
-        let mut req = self
-            .http
-            .post(format!("{}/{path}", self.base_url))
-            .bearer_auth(&*self.api_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let req = self.http.post(format!("{}/{path}", self.base_url));
+        let mut req = match self.api {
+            Api::Anthropic => {
+                req.header("x-api-key", &*self.api_key).header("anthropic-version", "2026-10-21")
+            }
+            _ => req.bearer_auth(&*self.api_key),
+        }
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
         for (k, v) in &self.headers {
             req = req.header(&**k, &**v);
         }
@@ -115,6 +122,8 @@ struct Acc<F> {
     text: String,
     reasoning: String,
     calls: Vec<ToolCall>,
+    /// Anthropic's reply blocks, in order, to be sent back as they came.
+    blocks: Vec<serde_json::Value>,
     usage: Usage,
     done: bool,
     api: Api,
@@ -128,6 +137,7 @@ impl<F: FnMut(&str)> Acc<F> {
             text: String::new(),
             reasoning: String::new(),
             calls: Vec::new(),
+            blocks: Vec::new(),
             usage: Usage::default(),
             done: false,
             api,
@@ -149,6 +159,7 @@ impl<F: FnMut(&str)> Acc<F> {
         match self.api {
             Api::Chat => chat::data(self, data),
             Api::Responses => responses::data(self, data),
+            Api::Anthropic => anthropic::data(self, data),
         }
     }
 
@@ -182,6 +193,7 @@ impl<F: FnMut(&str)> Acc<F> {
                     function: WireFn { name: &c.name, arguments: &c.args },
                 })
                 .collect(),
+            content_blocks: &self.blocks,
         })?;
         Ok(Completion { message, tool_calls: self.calls, usage: self.usage })
     }
@@ -195,6 +207,8 @@ struct Message<'a> {
     reasoning_content: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<WireCall<'a>>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    content_blocks: &'a [serde_json::Value],
 }
 
 #[derive(Serialize)]
@@ -364,6 +378,29 @@ mod tests {
         let failed =
             b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"x\"}}}\n\n";
         assert_eq!(run_as(failed, Api::Responses), Err(r#"api: {"code":"x"}"#.into()));
+    }
+
+    #[test]
+    fn anthropic_keeps_its_blocks_and_counts_cached_input() {
+        let data = include_bytes!("../testdata/anthropic.sse");
+        let (text, message, usage) = run_as(data, Api::Anthropic).unwrap();
+        assert_eq!(text, "Let me look.");
+        assert_eq!(
+            &*message,
+            r#"{"role":"assistant","content":"Let me look.","tool_calls":[{"id":"toolu_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}],"content_blocks":[{"signature":"sig==","thinking":"","type":"thinking"},{"text":"Let me look.","type":"text"},{"id":"toolu_a","input":{"path":"a.rs"},"name":"read","type":"tool_use"}]}"#
+        );
+        assert_eq!(usage, Usage { input: 1120, cached: Some(1000), output: 42 });
+        let cut = &data[..data.len() - 40];
+        assert_eq!(run_as(cut, Api::Anthropic), Err("stream ended early".into()));
+        let refused =
+            b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"}}\n\n";
+        assert!(run_as(refused, Api::Anthropic).unwrap_err().contains("refusal"));
+        // A Chat Completions server never sees them.
+        let body = r#"{"messages":[{"role":"assistant","content":"x","content_blocks":[]}]}"#;
+        assert_eq!(
+            chat::body(body.into()).unwrap(),
+            r#"{"messages":[{"content":"x","role":"assistant"}]}"#
+        );
     }
 
     #[test]
