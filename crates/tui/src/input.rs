@@ -62,6 +62,21 @@ impl Input {
         text
     }
 
+    /// The `@word` that ends at the cursor: where it starts, and the text after the `@`.
+    pub fn at_word(&self) -> Option<(usize, &str)> {
+        let before = &self.text[..self.cursor];
+        let start = before
+            .rfind(char::is_whitespace)
+            .map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
+        before[start..].strip_prefix('@').map(|q| (start, q))
+    }
+
+    /// Replaces the text from `start` to the cursor with `with`.
+    pub fn replace(&mut self, start: usize, with: &str) {
+        self.text.replace_range(start..self.cursor, with);
+        self.cursor = start + with.len();
+    }
+
     /// Whether the text is an earlier prompt brought back by `recall`.
     pub fn recalling(&self) -> bool {
         self.back > 0
@@ -149,5 +164,16 @@ mod tests {
             seen.push(i.text.clone());
         }
         assert_eq!(seen, ["two", "one", "one", "two", "dra", "dra"]);
+    }
+
+    #[test]
+    fn at_word_is_the_word_before_the_cursor() {
+        let mut i = Input::default();
+        i.insert("look at @src/ma");
+        assert_eq!(i.at_word(), Some((8, "src/ma")));
+        i.replace(8, "@src/main.rs ");
+        assert_eq!((i.text.as_str(), i.at_word()), ("look at @src/main.rs ", None));
+        i.insert("me@x");
+        assert_eq!(i.at_word(), None);
     }
 }

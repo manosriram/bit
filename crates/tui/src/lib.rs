@@ -95,6 +95,7 @@ async fn event_loop(
         picker: None,
         menu: 0,
         wipe: false,
+        files: None,
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
         input: Input::default(),
@@ -162,6 +163,8 @@ struct Ui {
     picker: Option<Picker>,
     /// The marked row of the slash-command list.
     menu: usize,
+    /// The project's files for `@` completion; read on the first `@` after each send.
+    files: Option<Vec<String>>,
     /// Set by `/clear`: wipe the screen and scrollback before the next frame.
     wipe: bool,
     color: bool,
@@ -219,12 +222,24 @@ struct Picker {
 }
 
 /// The commands a `/word` being typed could mean; none once a space follows the word.
-fn commands(text: &str) -> Vec<String> {
+/// As (name, row): the name is what gets filled in.
+fn commands(text: &str) -> Vec<(String, String)> {
     let Some(word) = text.strip_prefix('/').filter(|w| !w.contains(char::is_whitespace)) else {
         return Vec::new();
     };
     let found = COMMANDS.iter().filter(|c| c.0[1..].contains(&word.to_lowercase()));
-    found.map(|c| format!("{:<13}{}", format!("{} {}", c.0, c.1).trim_end(), c.2)).collect()
+    let row =
+        |c: &(&str, &str, &str)| format!("{:<13}{}", format!("{} {}", c.0, c.1).trim_end(), c.2);
+    found.map(|c| (c.0.into(), row(c))).collect()
+}
+
+/// Up to 8 paths containing `query`, ignoring case: file-name matches first, then shorter.
+fn file_matches(files: &[String], query: &str) -> Vec<String> {
+    let q = query.to_lowercase();
+    let name = |f: &str| f.rsplit('/').next().unwrap_or(f).to_lowercase();
+    let mut found: Vec<&String> = files.iter().filter(|f| f.to_lowercase().contains(&q)).collect();
+    found.sort_by_key(|f| (!name(f).contains(&q), f.len()));
+    found.into_iter().take(8).cloned().collect()
 }
 
 /// The models whose id contains `query`, ignoring case.
@@ -357,6 +372,7 @@ impl Ui {
                         _ => {
                             self.input.key(k);
                             self.menu = 0;
+                            self.load_files();
                         }
                     }
                 }
@@ -366,6 +382,7 @@ impl Ui {
                 None => {
                     self.input.insert(&s);
                     self.menu = 0;
+                    self.load_files();
                 }
             },
             _ => {}
@@ -432,6 +449,7 @@ impl Ui {
         let text = self.input.take();
         self.user(&text);
         let _ = cmds.send(Command::Submit(text));
+        self.files = None;
         (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
     }
 
@@ -450,28 +468,45 @@ impl Ui {
             _ => false,
         };
         let arrow = matches!(code, KeyCode::Up | KeyCode::Down);
-        keys && !(arrow && self.input.recalling()) && !commands(&self.input.text).is_empty()
+        let esc = code == KeyCode::Esc && self.input.at_word().is_some();
+        keys && !esc && !(arrow && self.input.recalling()) && !self.menu().is_empty()
+    }
+
+    /// What the input could be completing: slash commands, or files for an `@` word.
+    fn menu(&self) -> Vec<(String, String)> {
+        let Some((_, q)) = self.input.at_word() else { return commands(&self.input.text) };
+        let found = self.files.as_deref().map_or_else(Vec::new, |f| file_matches(f, q));
+        found.into_iter().map(|p| (p.clone(), p)).collect()
     }
 
     fn menu_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
-        let menu = commands(&self.input.text);
-        if code == KeyCode::Tab {
-            return self.input.set(&format!("{} ", self.marked(&menu)));
-        }
-        match nav(code, &mut self.menu, menu.len()) {
-            Some(true) => {
-                self.input.set(self.marked(&menu));
-                self.submit(cmds);
+        let menu = self.menu();
+        let name = menu[self.menu.min(menu.len() - 1)].0.clone();
+        match (self.input.at_word(), code) {
+            (Some((start, _)), KeyCode::Tab | KeyCode::Enter) => {
+                self.input.replace(start, &format!("@{name} "));
+                self.menu = 0;
             }
-            Some(false) => self.input.set(""),
-            None => {}
+            (Some(_), code) => {
+                nav(code, &mut self.menu, menu.len());
+            }
+            (None, KeyCode::Tab) => self.input.set(&format!("{name} ")),
+            (None, code) => match nav(code, &mut self.menu, menu.len()) {
+                Some(true) => {
+                    self.input.set(&name);
+                    self.submit(cmds);
+                }
+                Some(false) => self.input.set(""),
+                None => {}
+            },
         }
     }
 
-    /// The name of the marked slash command, e.g. `/model`.
-    fn marked<'m>(&self, menu: &'m [String]) -> &'m str {
-        let row = &menu[self.menu.min(menu.len() - 1)];
-        row.split(' ').next().unwrap_or(row)
+    /// Reads the project's files the first time an `@` word appears after a send.
+    fn load_files(&mut self) {
+        if self.files.is_none() && self.input.at_word().is_some() {
+            self.files = Some(agent::files(&std::env::current_dir().unwrap_or_default()));
+        }
     }
 
     fn pick(&mut self, then_submit: bool) {
@@ -692,9 +727,9 @@ impl Ui {
             return (f, split, cursor);
         }
 
-        // Slash-command suggestions pop up above the box, like a menu from a bottom bar.
-        let menu = commands(&self.input.text);
-        for (i, c) in menu.iter().enumerate() {
+        // Command and file suggestions pop up above the box, like a menu from a bottom bar.
+        let menu = self.menu();
+        for (i, (_, c)) in menu.iter().enumerate() {
             let (sgr, m) = if i == self.menu.min(menu.len() - 1) { ("1", ">") } else { ("", " ") };
             f.push(l.add(sgr, clip(&format!("{m} {c}"), w)).take());
         }
@@ -817,5 +852,18 @@ impl Ui {
             .fill(sgr, '-', w - 1)
             .add(sgr, "+");
         l.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn file_names_match_before_paths() {
+        let files: Vec<String> =
+            ["src/lib.rs", "render/x.rs", "src/render.rs", "a/b/render.rs"].map(Into::into).into();
+        assert_eq!(
+            super::file_matches(&files, "REND"),
+            ["src/render.rs", "a/b/render.rs", "render/x.rs"]
+        );
     }
 }

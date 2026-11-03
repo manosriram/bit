@@ -4,6 +4,8 @@ mod read;
 mod search;
 mod write;
 
+pub use search::files;
+
 use serde::de::DeserializeOwned;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};

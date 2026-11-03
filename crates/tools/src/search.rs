@@ -37,6 +37,13 @@ pub async fn glob(a: Glob, cx: &Ctx) -> Result<String, String> {
     rg(vec!["--files", "--sort=path", "-g", &a.pattern], a.path.as_deref(), cx).await
 }
 
+/// The project's files for `@` completion, as `rg --files` lists them; empty without `rg`.
+pub fn files(cwd: &std::path::Path) -> Vec<String> {
+    let out = std::process::Command::new("rg").arg("--files").current_dir(cwd).output();
+    let out = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    out.lines().take(50_000).map(Into::into).collect()
+}
+
 async fn rg(mut args: Vec<&str>, path: Option<&str>, cx: &Ctx) -> Result<String, String> {
     // Without a path rg prints paths relative to cwd, with no `./` prefix.
     if let Some(p) = path {
