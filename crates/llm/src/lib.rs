@@ -128,13 +128,13 @@ impl<F: FnMut(&str)> Acc<F> {
         if let Some(e) = c.error {
             return Err(Error::Api(e.get().into()));
         }
-        for d in c.choices.into_iter().map(|c| c.delta) {
+        for d in c.choices.into_iter().flatten().filter_map(|c| c.delta) {
             if let Some(s) = d.content.as_deref() {
                 (self.on_text)(s);
                 self.text.push_str(s);
             }
             self.reasoning.push_str(d.reasoning_content.as_deref().unwrap_or(""));
-            for t in d.tool_calls {
+            for t in d.tool_calls.into_iter().flatten() {
                 if self.calls.len() <= t.index {
                     self.calls.resize(t.index + 1, ToolCall::default());
                 }
@@ -142,7 +142,7 @@ impl<F: FnMut(&str)> Acc<F> {
                 if let Some(id) = t.id.filter(|id| !id.is_empty()) {
                     call.id = id.into_owned();
                 }
-                let f = t.function;
+                let f = t.function.unwrap_or_default();
                 // Some providers repeat the name in every chunk; it is never split.
                 if let Some(name) = f.name.filter(|_| call.name.is_empty()) {
                     call.name = name.into_owned();
@@ -207,10 +207,12 @@ struct WireFn<'a> {
     arguments: &'a str,
 }
 
+// Optional fields are `Option` rather than `#[serde(default)]`: some providers send an explicit
+// `null` (`"tool_calls":null`), which `default` alone rejects.
 #[derive(Deserialize)]
 struct Chunk<'a> {
-    #[serde(default, borrow)]
-    choices: Vec<Choice<'a>>,
+    #[serde(borrow)]
+    choices: Option<Vec<Choice<'a>>>,
     usage: Option<Usage>,
     #[serde(borrow)]
     error: Option<&'a RawValue>,
@@ -218,8 +220,8 @@ struct Chunk<'a> {
 
 #[derive(Deserialize)]
 struct Choice<'a> {
-    #[serde(default, borrow)]
-    delta: Delta<'a>,
+    #[serde(borrow)]
+    delta: Option<Delta<'a>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -229,8 +231,8 @@ struct Delta<'a> {
     content: Option<Cow<'a, str>>,
     #[serde(borrow)]
     reasoning_content: Option<Cow<'a, str>>,
-    #[serde(default, borrow)]
-    tool_calls: Vec<CallDelta<'a>>,
+    #[serde(borrow)]
+    tool_calls: Option<Vec<CallDelta<'a>>>,
 }
 
 #[derive(Deserialize)]
@@ -239,8 +241,8 @@ struct CallDelta<'a> {
     index: usize,
     #[serde(borrow)]
     id: Option<Cow<'a, str>>,
-    #[serde(default, borrow)]
-    function: FnDelta<'a>,
+    #[serde(borrow)]
+    function: Option<FnDelta<'a>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -370,6 +372,18 @@ mod tests {
         let calls = acc.finish().unwrap().tool_calls;
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].args, r#"{"path":"a.rs"}"#);
+    }
+
+    #[test]
+    fn explicit_nulls_are_absent_fields() {
+        let data = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\",\"tool_calls\":null,\"reasoning_content\":null}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":null}]}\n\n",
+            "data: {\"choices\":null,\"usage\":null}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (text, message, _) = run(data.as_bytes()).unwrap();
+        assert_eq!((text.as_str(), &*message), ("hi", r#"{"role":"assistant","content":"hi"}"#));
     }
 
     #[test]
