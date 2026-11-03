@@ -13,7 +13,6 @@ pub struct Client {
     headers: Box<[(Box<str>, Box<str>)]>,
 }
 
-#[derive(Debug)]
 pub struct Completion {
     /// The assistant message in wire format, ready to append to the history.
     pub message: Box<RawValue>,
@@ -21,7 +20,7 @@ pub struct Completion {
     pub usage: Usage,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Default, Clone)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -287,8 +286,6 @@ impl fmt::Display for Error {
         }
     }
 }
-
-impl std::error::Error for Error {}
 
 impl Error {
     /// Rate limits, server errors and dropped connections often pass; anything else won't.

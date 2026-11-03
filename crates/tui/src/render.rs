@@ -62,8 +62,8 @@ pub fn wrap(s: &str, max: usize) -> Vec<Range<usize>> {
 
 /// Builds one terminal line, tracking its width so borders can be filled to the edge.
 pub struct Line {
-    pub text: String,
-    pub width: usize,
+    text: String,
+    width: usize,
     color: bool,
 }
 

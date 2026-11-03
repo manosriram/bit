@@ -6,16 +6,15 @@ pub struct Config {
     /// Every provider: the built-in ones (with config overrides) then the config's own.
     /// Those with a key set come first.
     pub providers: Vec<agent::Provider>,
-    /// From the config's `provider` and `model`, else the first provider with a key.
-    pub configured: (String, Option<String>),
+    /// From the config's `provider` and `model`, else the first provider with a key. The
+    /// model is empty when the config names none.
+    pub configured: (String, String),
     /// The last pick, as (provider, model), if its provider still exists.
     pub last: Option<(String, String)>,
     /// Where the last pick is kept.
     pub remember: Option<PathBuf>,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
-    /// Shown in the TUI at startup.
-    pub notices: Vec<String>,
 }
 
 /// Unknown keys land in `unknown` so they can be warned about instead of failing the load.
@@ -58,15 +57,10 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("opencode-go", "https://opencode.ai/inference/go/openai/v1", "OPENCODE_API_KEY"),
 ];
 
-fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("bit/config.toml"))
-}
-
 pub fn load() -> Result<Config, String> {
-    let path = path().ok_or("error: cannot find the config directory. hint: set HOME")?;
+    let path = dir("XDG_CONFIG_HOME", ".config")
+        .map(|d| d.join("bit/config.toml"))
+        .ok_or("error: cannot find the config directory. hint: set HOME")?;
     let mut file: File = match std::fs::read_to_string(&path) {
         Ok(s) => toml::from_str(&s).map_err(|e| format!("error: {}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
@@ -125,11 +119,10 @@ pub fn load() -> Result<Config, String> {
     });
     Ok(Config {
         providers,
-        configured: (name, file.model),
+        configured: (name, file.model.unwrap_or_default()),
         last,
         remember,
         allow: file.bash.allow,
-        notices: Vec::new(),
     })
 }
 

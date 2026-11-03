@@ -1,6 +1,5 @@
 pub use llm::Usage;
 
-#[derive(Debug, PartialEq)]
 pub enum Command {
     Submit(String),
     Approve {
@@ -58,6 +57,8 @@ pub enum Event {
         id: Box<str>,
         ok: bool,
         preview: Box<str>,
+        /// The full result, as the model got it.
+        output: Box<str>,
     },
     /// The model asks the user to choose; answered with `Command::Answer`.
     Ask {

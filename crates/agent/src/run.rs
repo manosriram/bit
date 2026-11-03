@@ -4,7 +4,7 @@ use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::session::Session;
 use serde_json::Value;
 use serde_json::value::RawValue;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -78,26 +78,8 @@ pub async fn run(
                 auto.store(m == Mode::Auto, Relaxed);
                 continue;
             }
-            Command::SetModel { provider, model: m } => {
-                if *provider != *agent.provider
-                    && let Some(p) = agent.providers.iter().find(|p| *p.name == *provider)
-                {
-                    let id = agent.session.id().to_owned();
-                    (agent.client, agent.no_key) = (connect(p, &id), p.key.clone().err());
-                    cx.cache_key = cache_key(&p.name, &id).map(Into::into);
-                    agent.provider = p.name.clone();
-                }
-                cx.set_model(&m);
-                if let Err(e) = agent.session.set_model(&agent.provider, &m) {
-                    let _ = events.send(save_failed(&e));
-                }
-                let m = format!("{}/{m}", agent.provider);
-                if let Err(e) = remember(&agent.remember, &m) {
-                    let n = format!(
-                        "error: could not remember {m} for next time: {e}. hint: check that the state directory is writable"
-                    );
-                    let _ = events.send(Event::Notice(n.into()));
-                }
+            Command::SetModel { provider, model } => {
+                set_model(&mut agent, &mut cx, &provider, &model, &events);
                 continue;
             }
             Command::Clear => {
@@ -201,8 +183,9 @@ impl Turn<'_> {
                     (_, true) => tools::exec(name, args, &self.a.tools).await,
                     (_, false) => tools::Output { ok: false, content: DECLINED.into() },
                 };
-                let preview = preview(name, out.ok, &out.content).into();
-                self.send(Event::ToolEnd { id: id.into(), ok: out.ok, preview });
+                let (ok, output) = (out.ok, out.content.as_str().into());
+                let preview = preview(name, ok, &out.content).into();
+                self.send(Event::ToolEnd { id: id.into(), ok, preview, output });
                 cx.messages.push(tool_msg(id, &out.content));
             }
             self.save(cx);
@@ -307,10 +290,40 @@ impl Turn<'_> {
     }
 }
 
-fn remember(path: &Option<PathBuf>, model: &str) -> std::io::Result<()> {
+/// Switches to `model` on `provider`, reconnecting if the provider changed, and records the
+/// pick in the session and for the next one.
+fn set_model(
+    agent: &mut Agent,
+    cx: &mut Context,
+    provider: &str,
+    model: &str,
+    events: &UnboundedSender<Event>,
+) {
+    if provider != agent.provider
+        && let Some(p) = agent.providers.iter().find(|p| p.name == provider)
+    {
+        let id = agent.session.id().to_owned();
+        (agent.client, agent.no_key) = (connect(p, &id), p.key.clone().err());
+        cx.cache_key = cache_key(&p.name, &id).map(Into::into);
+        agent.provider = p.name.clone();
+    }
+    cx.set_model(model);
+    if let Err(e) = agent.session.set_model(&agent.provider, model) {
+        let _ = events.send(save_failed(&e));
+    }
+    let pick = format!("{}/{model}", agent.provider);
+    if let Err(e) = remember(agent.remember.as_deref(), &pick) {
+        let n = format!(
+            "error: could not remember {pick} for next time: {e}. hint: check that the state directory is writable"
+        );
+        let _ = events.send(Event::Notice(n.into()));
+    }
+}
+
+fn remember(path: Option<&Path>, pick: &str) -> std::io::Result<()> {
     let Some(path) = path else { return Ok(()) };
     std::fs::create_dir_all(path.parent().unwrap_or(path))?;
-    std::fs::write(path, model)
+    std::fs::write(path, pick)
 }
 
 fn save_failed(e: &std::io::Error) -> Event {
@@ -325,20 +338,17 @@ const DECLINED: &str = "error: the user declined this call. hint: ask them what 
 
 /// The few words shown at the end of a tool's gutter line.
 fn preview(name: &str, ok: bool, content: &str) -> String {
-    let mut lines = content.lines();
     match (ok, name) {
         (true, "write" | "edit") => "ok".into(),
         (true, "ask") => content.into(),
         (true, _) => count(content.lines().count(), "line"),
         // The gutter adds its own brackets, so `[exit 1]` loses its own.
-        (false, _) => lines
-            .clone()
-            .find(|l| l.starts_with("error:") || l.starts_with("[exit"))
-            .or(lines.next_back())
-            .unwrap_or("failed")
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .into(),
+        (false, _) => {
+            let mut lines = content.lines();
+            let error = lines.clone().find(|l| l.starts_with("error:") || l.starts_with("[exit"));
+            let line = error.or(lines.next_back()).unwrap_or("failed");
+            line.trim_start_matches('[').trim_end_matches(']').into()
+        }
     }
 }
 
@@ -393,6 +403,7 @@ fn replay(cx: &Context, events: &UnboundedSender<Event>) {
                     id: id.into(),
                     ok: !failed,
                     preview: preview(name, !failed, text).into(),
+                    output: text.into(),
                 });
             }
             _ => {}
@@ -623,7 +634,12 @@ mod tests {
         let decision = Decision::No;
         cmd_tx.send(Command::Approve { id: "w1".into(), decision }).unwrap();
         assert_eq!(next(&mut ev).await, start("w1"));
-        let end = Event::ToolEnd { id: "w1".into(), ok: false, preview: DECLINED.into() };
+        let end = Event::ToolEnd {
+            id: "w1".into(),
+            ok: false,
+            preview: DECLINED.into(),
+            output: DECLINED.into(),
+        };
         assert_eq!(next(&mut ev).await, end);
         assert_eq!(next(&mut ev).await, Event::Text("fine".into()));
         assert_eq!(next(&mut ev).await, Event::TurnEnd(StopReason::Done));
@@ -632,7 +648,12 @@ mod tests {
         cmd_tx.send(Command::SetMode(Mode::Auto)).unwrap();
         cmd_tx.send(Command::Submit("again".into())).unwrap();
         assert_eq!(next(&mut ev).await, start("w2"));
-        let end = Event::ToolEnd { id: "w2".into(), ok: true, preview: "ok".into() };
+        let end = Event::ToolEnd {
+            id: "w2".into(),
+            ok: true,
+            preview: "ok".into(),
+            output: "wrote 1 lines to f.txt".into(),
+        };
         assert_eq!(next(&mut ev).await, end);
         assert_eq!(next(&mut ev).await, Event::Text("done".into()));
         assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "hi");
@@ -642,6 +663,24 @@ mod tests {
         let assistant = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"w1","type":"function","function":{"name":"write","arguments":"{\"path\":\"f.txt\",\"content\":\"hi\"}"}}]}"#;
         let result = format!(r#"{{"content":"{DECLINED}","role":"tool","tool_call_id":"w1"}}]}}"#);
         assert!(b2.ends_with(&format!("{assistant},{result}")), "{b2}");
+    }
+
+    #[tokio::test]
+    async fn auto_set_mid_turn_applies_to_the_next_call() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "midturn");
+        let write = r#"{"path":"f.txt","content":"hi"}"#;
+        let replies =
+            vec![call("w1", "write", write), call("w2", "write", write), sse(&["ok"], true)];
+        let (cmds, mut ev, _bodies) =
+            start(agent, Context::new("m", None, Vec::new()), l, replies).await;
+        cmds.send(Command::Submit("go".into())).unwrap();
+        assert!(matches!(next(&mut ev).await, Event::Approval { .. }));
+        // Switched while w1 waits: w1 still needs its answer, w2 runs without asking.
+        cmds.send(Command::SetMode(Mode::Auto)).unwrap();
+        cmds.send(Command::Approve { id: "w1".into(), decision: Decision::Yes }).unwrap();
+        let rest = [next(&mut ev).await, next(&mut ev).await, next(&mut ev).await];
+        assert!(matches!(&rest[2], Event::ToolStart { id, .. } if &**id == "w2"), "{rest:?}");
     }
 
     #[tokio::test]
@@ -811,7 +850,8 @@ mod tests {
         };
         assert_eq!(next(&mut ev).await, ask);
         cmds.send(Command::Answer { id: "q1".into(), text: "b".into() }).unwrap();
-        let end = Event::ToolEnd { id: "q1".into(), ok: true, preview: "b".into() };
+        let end =
+            Event::ToolEnd { id: "q1".into(), ok: true, preview: "b".into(), output: "b".into() };
         assert_eq!(next(&mut ev).await, end);
         assert_eq!(next(&mut ev).await, Event::Text("ok".into()));
         let _ = bodies.recv().await.unwrap();

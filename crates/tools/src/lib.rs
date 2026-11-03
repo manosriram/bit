@@ -27,7 +27,6 @@ pub struct Ctx {
     pub spill: PathBuf,
 }
 
-#[derive(Debug)]
 pub struct Output {
     pub ok: bool,
     pub content: String,

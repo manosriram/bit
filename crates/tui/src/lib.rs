@@ -21,6 +21,8 @@ const YELLOW: &str = "33";
 const DETAIL_ROWS: usize = 12;
 /// Rows of the model picker shown at once.
 const PICK_ROWS: usize = 10;
+/// Last rows of a command's output shown under its tool line.
+const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
 const COMMANDS: [(&str, &str, &str); 3] = [
     ("/clear", "", "start over; the model forgets this conversation"),
@@ -52,6 +54,19 @@ pub async fn run(
     mode: Mode,
     notices: &[String],
 ) -> io::Result<()> {
+    let mut ui = Ui {
+        provider: provider.into(),
+        model: model.into(),
+        providers: providers.into(),
+        color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+        cols: terminal::size()?.0.into(),
+        auto: mode == Mode::Auto,
+        ..Ui::default()
+    };
+    ui.logo();
+    for n in notices {
+        ui.event(Event::Notice(n.as_str().into()));
+    }
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), ct::EnableBracketedPaste)?;
     // Without the kitty keyboard protocol, terminals send Shift-Enter as plain Enter.
@@ -60,7 +75,7 @@ pub async fn run(
         let flags = ct::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
         execute!(io::stdout(), ct::PushKeyboardEnhancementFlags(flags))?;
     }
-    let r = event_loop(cmds, events, (provider, model), providers, mode, notices).await;
+    let r = event_loop(ui, cmds, events).await;
     if kitty {
         let _ = execute!(io::stdout(), ct::PopKeyboardEnhancementFlags);
     }
@@ -70,12 +85,9 @@ pub async fn run(
 }
 
 async fn event_loop(
+    mut ui: Ui,
     cmds: UnboundedSender<Command>,
     mut events: UnboundedReceiver<Event>,
-    (provider, model): (&str, &str),
-    providers: &[agent::Provider],
-    mode: Mode,
-    notices: &[String],
 ) -> io::Result<()> {
     // Asked before the reader thread starts, which would otherwise swallow the reply.
     let (_, height) = terminal::size()?;
@@ -89,36 +101,6 @@ async fn event_loop(
             }
         }
     });
-    let mut ui = Ui {
-        provider: provider.into(),
-        model: model.into(),
-        providers: providers.into(),
-        picker: None,
-        menu: 0,
-        wipe: false,
-        files: None,
-        color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
-        cols: terminal::size()?.0.into(),
-        input: Input::default(),
-        partial: String::new(),
-        shown: 0,
-        md: Markdown::default(),
-        done: Vec::new(),
-        busy: None,
-        usage: None,
-        cache: (0, None),
-        quit_armed: false,
-        auto: mode == Mode::Auto,
-        tool: None,
-        approval: None,
-        question: None,
-        answering: None,
-        section: None,
-    };
-    ui.logo();
-    for n in notices {
-        ui.event(Event::Notice(n.as_str().into()));
-    }
     let mut term = Term::default();
     term.pin(height, used)?;
     let mut last = Instant::now() - FRAME;
@@ -156,6 +138,7 @@ async fn event_loop(
     term.clear()
 }
 
+#[derive(Default)]
 struct Ui {
     /// The provider requests go to, and its model: empty until the user picks one.
     provider: Box<str>,
@@ -307,58 +290,23 @@ impl Ui {
                     return true;
                 }
                 self.quit_armed = false;
-                if let Some(a) = &mut self.approval {
-                    let decision = match k.code {
-                        KeyCode::Char('y') => Some(Decision::Yes),
-                        KeyCode::Char('n') => Some(Decision::No),
-                        KeyCode::Char('a') => Some(Decision::Always),
-                        code => nav(code, &mut a.at, CHOICES.len())
-                            .map(|pick| if pick { CHOICES[a.at].1 } else { Decision::No }),
-                    };
-                    if let Some(decision) = decision {
-                        let _ = cmds.send(Command::Approve { id: a.id.clone(), decision });
-                        self.approval = None;
-                    }
+                // Works everywhere, mid-turn too: the agent checks the mode before each call.
+                if k.code == KeyCode::BackTab {
+                    self.auto = !self.auto;
+                    let mode = if self.auto { Mode::Auto } else { Mode::Ask };
+                    let _ = cmds.send(Command::SetMode(mode));
+                } else if self.approval.is_some() {
+                    self.approval_key(k.code, cmds);
                 } else if self.question.is_some() {
                     self.question_key(k.code, cmds);
-                } else if let Some(p) = &mut self.picker {
-                    if let KeyCode::Char(c) = k.code {
-                        p.query.push(c);
-                        p.at = 0;
-                    } else if k.code == KeyCode::Backspace && p.query.pop().is_some() {
-                        p.at = 0;
-                    }
-                    let found = search(&self.providers, &p.query);
-                    let pick = match k.code {
-                        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc => {
-                            nav(k.code, &mut p.at, found.len())
-                        }
-                        _ => None,
-                    };
-                    let chosen = found.get(p.at).map(|&(p, m)| (p.into(), m.into()));
-                    let then_submit = p.then_submit;
-                    match (pick, chosen) {
-                        (Some(true), Some((p, m))) => {
-                            self.picker = None;
-                            self.set_model(p, m, cmds);
-                            if then_submit {
-                                self.submit(cmds);
-                            }
-                        }
-                        (Some(false), _) => self.picker = None,
-                        _ => {}
-                    }
+                } else if self.picker.is_some() {
+                    self.picker_key(k.code, cmds);
                 } else if self.in_menu(k.code) {
                     self.menu_key(k.code, cmds);
                 } else {
                     match k.code {
                         KeyCode::Esc if self.busy.is_some() => {
                             let _ = cmds.send(Command::Cancel);
-                        }
-                        KeyCode::BackTab => {
-                            self.auto = !self.auto;
-                            let mode = if self.auto { Mode::Auto } else { Mode::Ask };
-                            let _ = cmds.send(Command::SetMode(mode));
                         }
                         // Shift-Enter needs the kitty protocol; Alt-Enter and Ctrl-J work without it.
                         KeyCode::Enter
@@ -393,6 +341,55 @@ impl Ui {
         true
     }
 
+    /// `y`/`n`/`a`, or moving and `Enter`; `Esc` declines.
+    fn approval_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
+        let Some(a) = &mut self.approval else { return };
+        let decision = match code {
+            KeyCode::Char('y') => Some(Decision::Yes),
+            KeyCode::Char('n') => Some(Decision::No),
+            KeyCode::Char('a') => Some(Decision::Always),
+            code => nav(code, &mut a.at, CHOICES.len())
+                .map(|pick| if pick { CHOICES[a.at].1 } else { Decision::No }),
+        };
+        if let Some(decision) = decision {
+            let _ = cmds.send(Command::Approve { id: a.id.clone(), decision });
+            self.approval = None;
+        }
+    }
+
+    /// Typing narrows the search; `Enter` sets the marked model, `Esc` closes the picker.
+    fn picker_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
+        let Some(p) = &mut self.picker else { return };
+        match code {
+            KeyCode::Char(c) => {
+                p.query.push(c);
+                p.at = 0;
+            }
+            KeyCode::Backspace if p.query.pop().is_some() => p.at = 0,
+            _ => {}
+        }
+        let found = search(&self.providers, &p.query);
+        let pick = match code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc => {
+                nav(code, &mut p.at, found.len())
+            }
+            _ => None,
+        };
+        match (pick, found.get(p.at)) {
+            (Some(true), Some(&(provider, model))) => {
+                let then_submit = p.then_submit;
+                let (provider, model) = (provider.into(), model.into());
+                self.picker = None;
+                self.set_model(provider, model, cmds);
+                if then_submit {
+                    self.submit(cmds);
+                }
+            }
+            (Some(false), _) => self.picker = None,
+            _ => {}
+        }
+    }
+
     /// Picks an option by digit or by moving and `Enter`; `something else` or `Esc` hands the
     /// input back for a typed answer.
     fn question_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
@@ -417,47 +414,50 @@ impl Ui {
     }
 
     fn submit(&mut self, cmds: &UnboundedSender<Command>) {
-        if self.answering.is_some() && !self.input.text.trim().is_empty() {
-            let (id, text) = (self.answering.take().unwrap_or_default(), self.input.take());
-            let _ = cmds.send(Command::Answer { id, text });
+        let typed = self.input.text.trim().to_owned();
+        if typed.is_empty() {
             return;
         }
-        if self.busy.is_some() || self.input.text.trim().is_empty() {
+        if let Some(id) = self.answering.take() {
+            let _ = cmds.send(Command::Answer { id, text: self.input.take() });
             return;
         }
-        if self.input.text.trim() == "/clear" {
-            self.input.take();
-            self.usage = None;
-            let _ = cmds.send(Command::Clear);
-            self.done.clear();
-            (self.section, self.wipe) = (None, true);
+        if self.busy.is_some() {
             return;
         }
-        if let Some(id) = self.input.text.trim().strip_prefix("/model")
-            && (id.is_empty() || id.starts_with(' '))
+        if let Some(id) =
+            typed.strip_prefix("/model").filter(|r| r.is_empty() || r.starts_with(' '))
         {
-            let id = id.trim().to_owned();
             self.input.take();
-            if id.is_empty() {
-                return self.pick(false);
+            return match id.trim() {
+                "" => self.pick(false),
+                id => {
+                    let (p, m) = self.resolve(id);
+                    self.set_model(p, m, cmds)
+                }
+            };
+        }
+        match typed.as_str() {
+            "/clear" => {
+                self.input.take();
+                let _ = cmds.send(Command::Clear);
+                self.done.clear();
+                (self.usage, self.section, self.wipe) = (None, None, true);
             }
-            let (p, m) = self.resolve(&id);
-            return self.set_model(p, m, cmds);
+            _ if self.model.is_empty() => self.pick(true),
+            "/compact" => {
+                self.input.take();
+                let _ = cmds.send(Command::Compact);
+                (self.busy, self.usage, self.cache) = (Some(Instant::now()), None, (0, Some(0)));
+            }
+            _ => {
+                let text = self.input.take();
+                self.user(&text);
+                let _ = cmds.send(Command::Submit(text));
+                self.files = None;
+                (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
+            }
         }
-        if self.model.is_empty() {
-            return self.pick(true);
-        }
-        if self.input.text.trim() == "/compact" {
-            self.input.take();
-            let _ = cmds.send(Command::Compact);
-            (self.busy, self.usage, self.cache) = (Some(Instant::now()), None, (0, Some(0)));
-            return;
-        }
-        let text = self.input.take();
-        self.user(&text);
-        let _ = cmds.send(Command::Submit(text));
-        self.files = None;
-        (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
     }
 
     fn set_model(&mut self, provider: Box<str>, model: Box<str>, cmds: &UnboundedSender<Command>) {
@@ -606,9 +606,12 @@ impl Ui {
                 self.section(true);
                 self.tool = Some((name, summary));
             }
-            Event::ToolEnd { ok, preview, .. } => {
+            Event::ToolEnd { ok, preview, output, .. } => {
                 if let Some((name, summary)) = self.tool.take() {
                     self.tool_line(&name, &summary, ok, &preview);
+                    if &*name == "bash" {
+                        self.tail(&output);
+                    }
                 }
             }
             Event::TurnEnd(r) => {
@@ -665,6 +668,22 @@ impl Ui {
         self.done.push(l.take());
     }
 
+    /// A command's last rows, dim under its tool line. A trailing `[exit N]` is left out:
+    /// the tool line already shows it.
+    fn tail(&mut self, output: &str) {
+        let exit = output.rsplit_once("[exit ").filter(|(_, t)| t.ends_with(']'));
+        let lines: Vec<&str> = exit.map_or(output, |(h, _)| h).trim_end().lines().collect();
+        let skip = lines.len().saturating_sub(TAIL_ROWS);
+        let mut l = Line::new(self.color);
+        if skip > 0 {
+            self.done.push(l.add(DIM, &format!("  | ... {skip} earlier lines")).take());
+        }
+        for s in &lines[skip..] {
+            self.done
+                .push(l.add(DIM, &format!("  | {}", clip(&clean(s), self.width() - 4))).take());
+        }
+    }
+
     fn spinner(&self) -> &'static str {
         ["|", "/", "-", "\\"][self.tick() % 4]
     }
@@ -694,9 +713,8 @@ impl Ui {
         }
     }
 
-    /// The live region: unfinished text, then the input box. Returns the rows and the
-    /// cursor's (row, column).
-    /// Also returns where the box starts, so padding goes between the text and the box.
+    /// The live region: unfinished text, then the input box. Returns the rows, where the box
+    /// starts (padding goes between the text and the box) and the cursor's (row, column).
     fn frame(&self) -> (Vec<String>, usize, (usize, usize)) {
         let w = self.width();
         let mut f = Vec::new();
@@ -715,54 +733,14 @@ impl Ui {
         }
         let split = f.len();
         f.push(String::new());
-        if let Some(q) = &self.question {
-            f.push(self.title("question"));
-            let text = clean(&q.text);
-            for r in wrap(&text, w - 4) {
-                f.push(self.row("1", &text[r]));
-            }
-            f.push(self.row("", ""));
-            let numbered =
-                q.options.iter().enumerate().map(|(i, o)| format!("{}. {}", i + 1, clean(o)));
-            let rows: Vec<String> = numbered.chain(["something else".into()]).collect();
-            let row = self.list(&mut f, rows.iter().map(String::as_str), q.at);
-            f.push(self.status_border(YELLOW));
-            return (f, split, (row, 2));
-        }
-        if let Some(a) = &self.approval {
-            let (f, cursor) = self.approval_box(a, f);
-            return (f, split, cursor);
-        }
-        if let Some(p) = &self.picker {
-            f.push(self.title("pick a model"));
-            let cursor = (f.len(), 10 + str_width(&p.query));
-            f.push(self.row("", &format!("search: {}", clean(&p.query))));
-            let found = search(&self.providers, &p.query);
-            if found.is_empty() {
-                f.push(self.row(DIM, "  no match"));
-            }
-            // A dim header above each provider's group; the mark is on a model row.
-            let (mut rows, mut mark) = (Vec::new(), 0);
-            for (i, &(prov, m)) in found.iter().enumerate() {
-                if i == 0 || found[i - 1].0 != prov {
-                    let x = self.providers.iter().find(|x| x.name == prov);
-                    let key = x.map_or(String::new(), |x| {
-                        format!("{}{}", x.key_env, if x.key.is_err() { " (not set)" } else { "" })
-                    });
-                    rows.push((DIM, format!("  {prov}  {key}")));
-                }
-                if i == p.at {
-                    mark = rows.len();
-                }
-                let (sgr, c) = if i == p.at { ("1", ">") } else { ("", " ") };
-                rows.push((sgr, format!("{c}   {m}")));
-            }
-            let start =
-                mark.saturating_sub(PICK_ROWS / 2).min(rows.len().saturating_sub(PICK_ROWS));
-            for (sgr, r) in rows.iter().skip(start).take(PICK_ROWS) {
-                f.push(self.row(sgr, r));
-            }
-            f.push(self.status_border(YELLOW));
+        // A question, an approval or the picker takes the place of the input box.
+        let boxed = match (&self.question, &self.approval, &self.picker) {
+            (Some(q), ..) => Some(self.question_box(q, &mut f)),
+            (_, Some(a), _) => Some(self.approval_box(a, &mut f)),
+            (.., Some(p)) => Some(self.picker_box(p, &mut f)),
+            _ => None,
+        };
+        if let Some(cursor) = boxed {
             return (f, split, cursor);
         }
 
@@ -812,9 +790,60 @@ impl Ui {
         (f, split, (top + row, col + 2))
     }
 
+    /// The box for the model's question: the question, then the options and `something else`.
+    fn question_box(&self, q: &Question, f: &mut Vec<String>) -> (usize, usize) {
+        let w = self.width();
+        f.push(self.title("question"));
+        let text = clean(&q.text);
+        for r in wrap(&text, w - 4) {
+            f.push(self.row("1", &text[r]));
+        }
+        f.push(self.row("", ""));
+        let numbered =
+            q.options.iter().enumerate().map(|(i, o)| format!("{}. {}", i + 1, clean(o)));
+        let rows: Vec<String> = numbered.chain(["something else".into()]).collect();
+        let row = self.list(f, rows.iter().map(String::as_str), q.at);
+        f.push(self.status_border(YELLOW));
+        (row, 2)
+    }
+
+    /// The model picker: a search row, then the matching models grouped by provider, scrolled
+    /// to keep the mark in view.
+    fn picker_box(&self, p: &Picker, f: &mut Vec<String>) -> (usize, usize) {
+        f.push(self.title("pick a model"));
+        let cursor = (f.len(), 10 + str_width(&p.query));
+        f.push(self.row("", &format!("search: {}", clean(&p.query))));
+        let found = search(&self.providers, &p.query);
+        if found.is_empty() {
+            f.push(self.row(DIM, "  no match"));
+        }
+        // A dim header above each provider's group; the mark is on a model row.
+        let (mut rows, mut mark) = (Vec::new(), 0);
+        for (i, &(prov, m)) in found.iter().enumerate() {
+            if i == 0 || found[i - 1].0 != prov {
+                let x = self.providers.iter().find(|x| x.name == prov);
+                let key = x.map_or(String::new(), |x| {
+                    format!("{}{}", x.key_env, if x.key.is_err() { " (not set)" } else { "" })
+                });
+                rows.push((DIM, format!("  {prov}  {key}")));
+            }
+            if i == p.at {
+                mark = rows.len();
+            }
+            let (sgr, c) = if i == p.at { ("1", ">") } else { ("", " ") };
+            rows.push((sgr, format!("{c}   {m}")));
+        }
+        let start = mark.saturating_sub(PICK_ROWS / 2).min(rows.len().saturating_sub(PICK_ROWS));
+        for (sgr, r) in rows.iter().skip(start).take(PICK_ROWS) {
+            f.push(self.row(sgr, r));
+        }
+        f.push(self.status_border(YELLOW));
+        cursor
+    }
+
     /// The box while a tool waits for approval: the call in the top border, what it would
     /// change inside, and the choices.
-    fn approval_box(&self, a: &Approval, mut f: Vec<String>) -> (Vec<String>, (usize, usize)) {
+    fn approval_box(&self, a: &Approval, f: &mut Vec<String>) -> (usize, usize) {
         let w = self.width();
         let summary = clean(&a.summary);
         let room = w.saturating_sub(str_width(&a.name) + 12);
@@ -832,9 +861,9 @@ impl Ui {
             f.push(self.row(DIM, &format!("... {} more lines", lines.len() - DETAIL_ROWS)));
         }
         f.push(self.row("", ""));
-        let row = self.list(&mut f, CHOICES.iter().map(|c| c.0), a.at);
+        let row = self.list(f, CHOICES.iter().map(|c| c.0), a.at);
         f.push(self.status_border(YELLOW));
-        (f, (row, 2))
+        (row, 2)
     }
 
     /// The yellow box's top border: `+-- ? <title> ---+`.
@@ -880,13 +909,12 @@ impl Ui {
     fn status_border(&self, sgr: &str) -> String {
         let w = self.width();
         let mode = if self.auto { "auto" } else { "ask" };
-        let status = match self.usage.map(|u| u.input) {
-            Some(n) if n >= 1000 => {
-                format!("{mode} | {} | {:.1}k ctx", self.model(), f64::from(n) / 1e3)
-            }
-            Some(n) => format!("{mode} | {} | {n} ctx", self.model()),
-            None => format!("{mode} | {}", self.model()),
+        let ctx = match self.usage.map(|u| u.input) {
+            Some(n) if n >= 1000 => format!(" | {:.1}k ctx", f64::from(n) / 1e3),
+            Some(n) => format!(" | {n} ctx"),
+            None => String::new(),
         };
+        let status = format!("{mode} | {}{ctx}", self.model());
         let mut l = Line::new(self.color);
         l.add(sgr, "+-- ")
             .add("", clip(&status, w - 6))
