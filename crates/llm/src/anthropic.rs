@@ -67,6 +67,9 @@ pub fn body(chat: &str) -> Result<String, serde_json::Error> {
     // One marker after the fixed tools and system prompt, and the automatic one, which moves
     // to the end of the conversation on every request.
     let mut out = json!({"model": c["model"], "max_tokens": MAX_TOKENS, "stream": true, "tools": tools, "messages": out, "cache_control": {"type": "ephemeral"}});
+    if let Some(o) = c.get("output_config") {
+        out["output_config"] = o.clone();
+    }
     if !system.is_empty() {
         out["system"] =
             json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]);
@@ -76,7 +79,7 @@ pub fn body(chat: &str) -> Result<String, serde_json::Error> {
 
 /// A Messages stream event. Blocks arrive one after another, so a delta belongs to the last
 /// block started.
-pub fn data<F: FnMut(&str)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> {
+pub fn data<F: FnMut(crate::Part)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> {
     let e: Event = serde_json::from_slice(data)?;
     match &*e.kind {
         "message_start" => acc.usage = usage(e.message.and_then(|m| m.usage), acc.usage),
@@ -101,7 +104,11 @@ pub fn data<F: FnMut(&str)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> 
                     acc.text(s("text"));
                     append(acc.blocks.last_mut(), "text", s("text"));
                 }
-                Some("thinking_delta") => append(acc.blocks.last_mut(), "thinking", s("thinking")),
+                // Shown, but kept only in its block: Claude's thinking goes back as blocks.
+                Some("thinking_delta") => {
+                    acc.show_thinking(s("thinking"));
+                    append(acc.blocks.last_mut(), "thinking", s("thinking"))
+                }
                 Some("signature_delta") => {
                     append(acc.blocks.last_mut(), "signature", s("signature"))
                 }
@@ -171,6 +178,12 @@ struct WireUsage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passes_the_effort_through() {
+        let b = super::body(r#"{"model":"m","output_config":{"effort":"low"},"messages":[]}"#);
+        assert!(b.unwrap().contains(r#""output_config":{"effort":"low"}"#));
+    }
+
     #[test]
     fn translates_chat_to_messages() {
         let chat = r#"{"model":"m","stream":true,"tools":[{"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}}],"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"},{"role":"assistant","content":null,"reasoning_content":"r","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}},{"id":"c2","type":"function","function":{"name":"read","arguments":""}}]},{"role":"tool","tool_call_id":"c1","content":"out1"},{"role":"tool","tool_call_id":"c2","content":"out2"},{"role":"user","content":"and?"},{"role":"assistant","content":"done","content_blocks":[{"type":"thinking","thinking":"","signature":"s"},{"type":"text","text":"done"}]}]}"#;

@@ -14,6 +14,8 @@ pub struct Config {
     pub last: Option<(String, String)>,
     /// Where the last pick is kept.
     pub remember: PathBuf,
+    /// The last thinking level picked, kept beside it.
+    pub thinking: Option<String>,
     /// `auth.json`: saved API keys and the ChatGPT sign-in.
     pub auth: PathBuf,
     /// Where the session logs go.
@@ -119,7 +121,9 @@ pub fn load() -> Result<Config, String> {
         let known = providers.iter().any(|x| x.name == p) && !m.is_empty();
         known.then(|| (p.to_owned(), m.to_owned()))
     });
+    let thinking = std::fs::read_to_string(base.join("thinking")).ok();
     Ok(Config {
+        thinking: thinking.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
         providers,
         configured: (name, file.model.unwrap_or_default()),
         last,

@@ -29,6 +29,7 @@ pub const SPEC: Spec = Spec {
             ("chatgpt-account-id", account(key)),
         ]
     },
+    thinking: |level| serde_json::json!({ "reasoning": { "effort": level } }),
 };
 
 /// Opens the sign-in page (its URL goes to `show` too, in case no browser opens), waits for

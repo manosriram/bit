@@ -18,6 +18,10 @@ pub enum Command {
         provider: Box<str>,
         model: Box<str>,
     },
+    /// The thinking level to ask for, one of the model's `models::levels`; `None` for the
+    /// provider's default. Kept across model switches, and sent only to models that take it.
+    /// Sent only while idle.
+    SetThinking(Option<Box<str>>),
     /// Drops the history. Sent only while idle.
     Clear,
     /// Summarizes the history now. Runs like a turn and ends with `TurnEnd`.
@@ -44,6 +48,8 @@ pub enum Event {
     /// A user message; sent only when replaying a resumed session.
     User(Box<str>),
     Text(Box<str>),
+    /// The model's reasoning as it streams, for providers that send it.
+    Thinking(Box<str>),
     ToolStart {
         id: Box<str>,
         name: Box<str>,

@@ -37,21 +37,27 @@ pub fn body(chat: &str) -> Result<String, serde_json::Error> {
         })
         .collect();
     let mut out = json!({"model": c["model"], "instructions": instructions, "input": input, "tools": tools, "stream": true, "store": false});
-    if let Some(k) = c.get("prompt_cache_key") {
-        out["prompt_cache_key"] = k.clone();
+    for k in ["prompt_cache_key", "reasoning"] {
+        if let Some(v) = c.get(k) {
+            out[k] = v.clone();
+        }
     }
     Ok(out.to_string())
 }
 
 /// A Responses event. Tool calls are taken whole from `output_item.done` rather than
 /// gathered from deltas, and the stream ends at `response.completed`, not `[DONE]`.
-pub fn data<F: FnMut(&str)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> {
+pub fn data<F: FnMut(crate::Part)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> {
     let e: Event = serde_json::from_slice(data)?;
     let r = e.response;
     match &*e.kind {
         "response.output_text.delta" => {
             acc.text(e.delta.as_deref().unwrap_or(""));
         }
+        "response.reasoning_summary_text.delta" => {
+            acc.show_thinking(e.delta.as_deref().unwrap_or(""));
+        }
+        "response.reasoning_summary_text.done" => acc.show_thinking("\n"),
         "response.output_item.done" => {
             if let Some(i) = e.item.filter(|i| i.kind == "function_call") {
                 let (id, name) = (i.call_id.unwrap_or_default(), i.name.unwrap_or_default());
@@ -101,6 +107,12 @@ struct Response<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passes_the_effort_through() {
+        let b = super::body(r#"{"model":"m","reasoning":{"effort":"low"},"messages":[]}"#);
+        assert!(b.unwrap().contains(r#""reasoning":{"effort":"low"}"#));
+    }
+
     #[test]
     fn translates_chat_to_responses() {
         let chat = r#"{"model":"m","stream":true,"stream_options":{"include_usage":true},"prompt_cache_key":"s1","tools":[{"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}}],"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"},{"role":"assistant","content":null,"reasoning_content":"r","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"out"},{"role":"assistant","content":"done"}]}"#;

@@ -1,6 +1,6 @@
 //! Providers that take an API key: from their variable, else from `auth.json`.
 
-use super::{Auth, Spec};
+use super::{Auth, Spec, reasoning_effort};
 
 pub const DEEPSEEK: Spec = Spec {
     name: "deepseek",
@@ -9,6 +9,7 @@ pub const DEEPSEEK: Spec = Spec {
     auth: Auth::Key("DEEPSEEK_API_KEY"),
     cache_key: false,
     headers: |_, _| Vec::new(),
+    thinking: reasoning_effort,
 };
 
 pub const OPENAI: Spec = Spec {
@@ -18,6 +19,7 @@ pub const OPENAI: Spec = Spec {
     auth: Auth::Key("OPENAI_API_KEY"),
     cache_key: true,
     headers: |_, _| Vec::new(),
+    thinking: reasoning_effort,
 };
 
 /// https://opencode.ai/v2/docs/console/go/; only its Chat Completions models work. The
@@ -29,6 +31,7 @@ pub const OPENCODE_GO: Spec = Spec {
     auth: Auth::Key("OPENCODE_API_KEY"),
     cache_key: false,
     headers: |session, _| vec![("x-opencode-session", session.into())],
+    thinking: reasoning_effort,
 };
 
 /// The Messages API caches by explicit markers, not a key; `anthropic.rs` places them.
@@ -39,6 +42,7 @@ pub const ANTHROPIC: Spec = Spec {
     auth: Auth::Key("ANTHROPIC_API_KEY"),
     cache_key: false,
     headers: |_, _| Vec::new(),
+    thinking: |level| serde_json::json!({ "output_config": { "effort": level } }),
 };
 
 /// One key for most vendors' models, named `vendor/model`.
@@ -49,6 +53,7 @@ pub const OPENROUTER: Spec = Spec {
     auth: Auth::Key("OPENROUTER_API_KEY"),
     cache_key: false,
     headers: |_, _| Vec::new(),
+    thinking: reasoning_effort,
 };
 
 /// Z.ai's pay-as-you-go API for the GLM models.
@@ -59,4 +64,8 @@ pub const ZAI: Spec = Spec {
     auth: Auth::Key("ZAI_API_KEY"),
     cache_key: false,
     headers: |_, _| Vec::new(),
+    thinking: |level| {
+        let kind = if level == "none" { "disabled" } else { "enabled" };
+        serde_json::json!({ "thinking": { "type": kind } })
+    },
 };

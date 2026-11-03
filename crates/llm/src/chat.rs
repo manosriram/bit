@@ -19,7 +19,7 @@ pub fn body(body: String) -> Result<String, serde_json::Error> {
     Ok(c.to_string())
 }
 
-pub fn data<F: FnMut(&str)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> {
+pub fn data<F: FnMut(crate::Part)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> {
     if data == b"[DONE]" {
         acc.done = true;
         return Ok(());
@@ -32,7 +32,8 @@ pub fn data<F: FnMut(&str)>(acc: &mut Acc<F>, data: &[u8]) -> Result<(), Error> 
         if let Some(s) = d.content.as_deref() {
             acc.text(s);
         }
-        acc.reasoning.push_str(d.reasoning_content.as_deref().unwrap_or(""));
+        // DeepSeek, Z.ai and opencode send `reasoning_content`; OpenRouter `reasoning`.
+        acc.thinking(d.reasoning_content.or(d.reasoning).as_deref().unwrap_or(""));
         for t in d.tool_calls.into_iter().flatten() {
             if acc.calls.len() <= t.index {
                 acc.calls.resize(t.index + 1, ToolCall::default());
@@ -77,6 +78,8 @@ struct Delta<'a> {
     content: Option<Cow<'a, str>>,
     #[serde(borrow)]
     reasoning_content: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    reasoning: Option<Cow<'a, str>>,
     #[serde(borrow)]
     tool_calls: Option<Vec<CallDelta<'a>>>,
 }

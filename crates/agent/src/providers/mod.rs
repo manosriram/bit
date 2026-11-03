@@ -17,6 +17,14 @@ pub struct Spec {
     pub cache_key: bool,
     /// Headers besides the user agent, from the session id and the key.
     pub headers: fn(session: &str, key: &str) -> Vec<(&'static str, String)>,
+    /// The request fields that set a thinking level, one of the model's `models::levels`.
+    pub thinking: fn(level: &str) -> serde_json::Value,
+}
+
+/// How Chat Completions providers take a thinking level, and so the default for a provider
+/// from the config.
+pub fn reasoning_effort(level: &str) -> serde_json::Value {
+    serde_json::json!({ "reasoning_effort": level })
 }
 
 pub enum Auth {

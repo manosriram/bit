@@ -50,8 +50,11 @@ pub struct Agent {
     pub session: Session,
     /// Set when the provider's key is missing: each turn ends with this error, unsent.
     pub no_key: Option<String>,
-    /// Where a picked model is written, so the next session starts with it.
+    /// Where a picked model is written, so the next session starts with it. The thinking
+    /// level goes beside it, in `thinking`.
     pub remember: Option<PathBuf>,
+    /// The thinking level the user picked; see `Command::SetThinking`.
+    pub thinking: Option<String>,
     /// `auth.json`, where `/login` saves the ChatGPT tokens.
     pub auth: PathBuf,
     /// No user is present (`bit -p`): a resumed history isn't replayed, a call that needs
@@ -76,6 +79,7 @@ pub async fn run(
     }
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
     // only because `tokio::spawn` needs the future to be `Send`.
+    set_thinking(&agent, &mut cx);
     let auto = AtomicBool::new(agent.mode == Mode::Auto);
     let (replies_tx, mut replies) = unbounded_channel();
     while let Some(cmd) = cmds.recv().await {
@@ -90,6 +94,19 @@ pub async fn run(
             }
             Command::SetModel { provider, model } => {
                 set_model(&mut agent, &mut cx, &provider, &model, &events);
+                set_thinking(&agent, &mut cx);
+                continue;
+            }
+            Command::SetThinking(level) => {
+                agent.thinking = level.map(Into::into);
+                set_thinking(&agent, &mut cx);
+                let path = agent.remember.as_deref().map(|p| p.with_file_name("thinking"));
+                if let Err(e) = remember(path.as_deref(), agent.thinking.as_deref().unwrap_or("")) {
+                    let n = format!(
+                        "error: could not remember the thinking level: {e}. hint: check that the state directory is writable"
+                    );
+                    let _ = events.send(Event::Notice(n.into()));
+                }
                 continue;
             }
             Command::Clear => {
@@ -342,11 +359,14 @@ impl Turn<'_> {
         let mut waits = [1, 3].into_iter();
         loop {
             let mut shown = false;
-            let on_text = |t: &str| {
+            let on_part = |p: llm::Part| {
                 shown = true;
-                self.send(Event::Text(t.into()));
+                self.send(match p {
+                    llm::Part::Text(t) => Event::Text(t.into()),
+                    llm::Part::Thinking(t) => Event::Thinking(t.into()),
+                });
             };
-            match (self.a.client.stream(cx.body(), on_text).await, waits.next()) {
+            match (self.a.client.stream(cx.body(), on_part).await, waits.next()) {
                 (Err(e), Some(wait)) if !shown && e.retryable() => {
                     self.send(Event::Notice(format!("{e}; retrying in {wait}s").into()));
                     tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -389,6 +409,18 @@ fn set_model(
         );
         let _ = events.send(Event::Notice(n.into()));
     }
+}
+
+/// Asks for the picked thinking level if the current model takes it, in the provider's own
+/// fields (a provider from the config gets `reasoning_effort`); else for the default.
+fn set_thinking(agent: &Agent, cx: &mut Context) {
+    let levels = llm::models::levels(&agent.provider, &cx.model);
+    let level = agent.thinking.as_deref().filter(|l| levels.contains(l));
+    let spec = providers::find(&agent.provider);
+    let to = spec.map_or(providers::reasoning_effort as fn(&str) -> _, |s| s.thinking);
+    // bit says `off` where the providers say `none`.
+    let fields = level.map(|l| to(if l == "off" { "none" } else { l }));
+    cx.set_thinking(fields);
 }
 
 fn remember(path: Option<&Path>, pick: &str) -> std::io::Result<()> {
@@ -535,6 +567,7 @@ async fn listen(
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
             Command::Submit(_)
             | Command::SetModel { .. }
+            | Command::SetThinking(_)
             | Command::Clear
             | Command::Compact
             | Command::Login => {}
@@ -586,6 +619,7 @@ mod tests {
             session,
             no_key: None,
             remember: None,
+            thinking: None,
             auth,
             print: false,
         }
@@ -1072,6 +1106,41 @@ mod tests {
             matches!(&saved["openai"], crate::providers::auth::Cred::ApiKey { key } if key == "sk-1")
         );
         assert!(bodies.try_recv().is_err(), "a login sends no model request");
+    }
+
+    #[tokio::test]
+    async fn thinking_goes_only_to_models_that_take_it_and_is_remembered() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "thinking");
+        let state = agent.tools.cwd.join("model");
+        (agent.provider, agent.remember) = ("openai".into(), Some(state.clone()));
+        let replies =
+            vec![sse(&["a"], true), sse(&["b"], true), sse(&["c"], true), sse(&["d"], true)];
+        let (cmds, mut ev, mut bodies) =
+            start(agent, Context::new("gpt-5", None, vec![]), l, replies).await;
+        let model = |m: &str| Command::SetModel { provider: "openai".into(), model: m.into() };
+        let mut turn = async |text: &str| {
+            cmds.send(Command::Submit(text.into())).unwrap();
+            while !matches!(next(&mut ev).await, Event::TurnEnd(_)) {}
+            bodies.recv().await.unwrap()
+        };
+
+        cmds.send(Command::SetThinking(Some("low".into()))).unwrap();
+        assert!(turn("one").await.contains(r#""reasoning_effort":"low""#));
+        assert_eq!(std::fs::read_to_string(state.with_file_name("thinking")).unwrap(), "low");
+        cmds.send(model("not-in-the-table")).unwrap();
+        assert!(!turn("two").await.contains("reasoning_effort"));
+        cmds.send(model("gpt-5")).unwrap();
+        assert!(turn("three").await.contains(r#""reasoning_effort":"low""#));
+    }
+
+    #[test]
+    fn off_is_sent_as_the_providers_none() {
+        let mut a = agent("127.0.0.1:9".parse().unwrap(), "off");
+        (a.provider, a.thinking) = ("chatgpt".into(), Some("off".into()));
+        let mut cx = Context::new("gpt-6-luna", None, vec![]);
+        set_thinking(&a, &mut cx);
+        assert!(cx.body().contains(r#""reasoning":{"effort":"none"}"#));
     }
 
     #[test]

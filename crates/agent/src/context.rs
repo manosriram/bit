@@ -10,6 +10,8 @@ pub struct Context {
     /// The working directory and its AGENTS.md, read once so the prefix stays fixed.
     project: String,
     pub(crate) cache_key: Option<String>,
+    /// Fields that set the thinking level, from the provider's spec; none for its default.
+    thinking: Option<serde_json::Value>,
     /// Input tokens of the last request: how full the window is. 0 until one is sent.
     pub(crate) tokens: u32,
     pub(crate) messages: Vec<Box<RawValue>>,
@@ -22,7 +24,15 @@ impl Context {
     pub fn new(model: &str, cache_key: Option<&str>, messages: Vec<Box<RawValue>>) -> Self {
         let (prefix, cache_key) = (String::new(), cache_key.map(str::to_owned));
         let project = project();
-        let mut cx = Self { prefix, model: String::new(), project, cache_key, tokens: 0, messages };
+        let mut cx = Self {
+            prefix,
+            model: String::new(),
+            project,
+            cache_key,
+            thinking: None,
+            tokens: 0,
+            messages,
+        };
         cx.set_model(model);
         // A crash can cut a turn short; mend it the same way a cancel would.
         // A lone user message is kept: on load it can only be a compaction summary.
@@ -34,6 +44,9 @@ impl Context {
         let mut head = serde_json::json!({"model": model, "stream": true, "stream_options": {"include_usage": true}});
         if let Some(k) = &self.cache_key {
             head["prompt_cache_key"] = k.as_str().into();
+        }
+        for (k, v) in self.thinking.iter().flat_map(|t| t.as_object()).flatten() {
+            head[k] = v.clone();
         }
         let mut prefix = head.to_string();
         prefix.pop();
@@ -48,6 +61,12 @@ impl Context {
         }
         prefix.push_str(msg("system", &prompt).get());
         (self.prefix, self.model) = (prefix, model.into());
+    }
+
+    /// Sets the thinking fields, which are part of the fixed prefix.
+    pub(crate) fn set_thinking(&mut self, fields: Option<serde_json::Value>) {
+        self.thinking = fields;
+        self.set_model(&self.model.clone());
     }
 
     /// The §4 rules for a turn that started at `start` and didn't finish: a user message with

@@ -54,14 +54,20 @@ In `-p` mode nobody can approve, so write, edit and bash are declined unless `--
 or `[bash] allow` permits them.
 
 Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Shift-Tab` toggle
-ask/auto, `Up`/`Down` earlier prompts, `/` commands:
+ask/auto, `Tab` next thinking level, `Up`/`Down` earlier prompts, `/` commands:
 
 ```
 /login             add a provider: paste its API key, or sign in
 /model [id]        pick the model, or set it to id
+/thinking [level]  pick how hard the model thinks, or set it to level
 /compact           summarize the conversation to free up context
 /clear             start over; the model forgets this conversation
 ```
+
+`/thinking` offers the levels the current model takes (glm-5.2 on opencode-go, for one,
+takes only `high` and `max`), `off` where the model can skip thinking, and `default`, with
+the level it means when known (`default (medium)`). The pick shows in the status line, is
+kept for the next session, and goes only to models that take it; the rest use their default.
 
 ## Providers
 

@@ -98,6 +98,7 @@ fn run(args: args::Args) -> Result<(), String> {
             mode,
             session,
             remember: Some(cfg.remember),
+            thinking: cfg.thinking.clone(),
             auth: cfg.auth,
             print,
         };
@@ -107,9 +108,12 @@ fn run(args: args::Args) -> Result<(), String> {
                 notices.iter().for_each(|n| eprintln!("bit: {n}"));
                 print::run(cmd_tx, ev_rx, prompt, &mut std::io::stdout()).await
             }
-            None => tui::run(cmd_tx, ev_rx, (&provider, &model), &cfg.providers, mode, &notices)
-                .await
-                .map_err(|e| format!("error: terminal: {e}")),
+            None => {
+                let at = (provider.as_str(), model.as_str(), cfg.thinking.as_deref());
+                tui::run(cmd_tx, ev_rx, at, &cfg.providers, mode, &notices)
+                    .await
+                    .map_err(|e| format!("error: terminal: {e}"))
+            }
         }
     });
     if dir.join(format!("{id}.jsonl")).exists() {

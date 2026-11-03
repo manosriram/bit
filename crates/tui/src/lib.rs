@@ -24,12 +24,15 @@ const PICK_ROWS: usize = 10;
 /// Last rows of a command's output shown under its tool line.
 const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 4] = [
+const COMMANDS: [(&str, &str, &str); 5] = [
     ("/clear", "", "start over; the model forgets this conversation"),
     ("/compact", "", "summarize the conversation to free up context"),
     ("/login", "", "add a provider: paste its API key, or sign in"),
     ("/model", "[id]", "pick the model, or set it to id"),
+    ("/thinking", "[level]", "pick how hard the model thinks, or set it to level"),
 ];
+/// The id of the `/thinking` picker's question.
+const THINKING: &str = "thinking";
 const CHOICES: [(&str, Decision); 3] = [
     ("[y]es", Decision::Yes),
     ("[n]o", Decision::No),
@@ -50,7 +53,7 @@ const LOGO: [(&str, &str); 7] = [
 pub async fn run(
     cmds: UnboundedSender<Command>,
     events: UnboundedReceiver<Event>,
-    (provider, model): (&str, &str),
+    (provider, model, thinking): (&str, &str, Option<&str>),
     providers: &[agent::Provider],
     mode: Mode,
     notices: &[String],
@@ -58,6 +61,7 @@ pub async fn run(
     let mut ui = Ui {
         provider: provider.into(),
         model: model.into(),
+        thinking: thinking.map(Into::into),
         providers: providers.into(),
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
@@ -144,6 +148,8 @@ struct Ui {
     /// The provider requests go to, and its model: empty until the user picks one.
     provider: Box<str>,
     model: Box<str>,
+    /// The thinking level picked with `/thinking`; used only by models that take it.
+    thinking: Option<Box<str>>,
     /// Every provider, with what the model picker offers for each.
     providers: Vec<agent::Provider>,
     picker: Option<Picker>,
@@ -161,6 +167,9 @@ struct Ui {
     partial: String,
     /// How many rows of `partial` are already in `done`.
     shown: usize,
+    /// The unfinished line of the model's reasoning, drawn grey as plain text; `None` when
+    /// the last output wasn't reasoning.
+    thought: Option<String>,
     md: Markdown,
     /// Rows waiting to be written to scrollback.
     done: Vec<String>,
@@ -330,6 +339,7 @@ impl Ui {
                             self.input.insert("\n");
                         }
                         KeyCode::Enter => self.submit(cmds),
+                        KeyCode::Tab if self.busy.is_none() => self.next_thinking(cmds),
                         KeyCode::Up => self.input.recall(true),
                         KeyCode::Down => self.input.recall(false),
                         _ => {
@@ -416,13 +426,18 @@ impl Ui {
         };
         let Some(pick) = pick else { return };
         let id = q.id.clone();
-        match q.options.get(q.at).filter(|_| pick) {
-            Some(o) => {
-                let _ = cmds.send(Command::Answer { id, text: o.to_string() });
+        let picked = q.options.get(q.at).filter(|_| pick).map(|o| o.to_string());
+        self.question = None;
+        match picked {
+            // The `/thinking` picker is the UI's own, not the agent's; typing `/thinking
+            // <level>` is its `something else`.
+            Some(o) if &*id == THINKING => self.set_thinking(&o, cmds),
+            None if &*id == THINKING => {}
+            Some(text) => {
+                let _ = cmds.send(Command::Answer { id, text });
             }
             None => self.answering = Some(id),
         }
-        self.question = None;
     }
 
     fn submit(&mut self, cmds: &UnboundedSender<Command>) {
@@ -454,6 +469,15 @@ impl Ui {
                     let (p, m) = self.resolve(id);
                     self.set_model(p, m, cmds)
                 }
+            };
+        }
+        if let Some(level) =
+            typed.strip_prefix("/thinking").filter(|r| r.is_empty() || r.starts_with(' '))
+        {
+            self.input.take();
+            return match level.trim() {
+                "" => self.ask_thinking(),
+                level => self.set_thinking(level, cmds),
             };
         }
         match typed.as_str() {
@@ -490,6 +514,89 @@ impl Ui {
         self.event(Event::Notice(format!("model set to {provider}/{model}").into()));
         (self.provider, self.model) = (provider.clone(), model.clone());
         let _ = cmds.send(Command::SetModel { provider, model });
+        if let Some(t) = self.thinking.clone().filter(|_| self.effort().is_none()) {
+            let n = format!("{} has no `{t}` thinking; it uses its default", self.model);
+            self.event(Event::Notice(n.into()));
+        }
+    }
+
+    /// The levels the current model takes.
+    fn levels(&self) -> &'static [&'static str] {
+        agent::models::levels(&self.provider, &self.model)
+    }
+
+    /// The picked thinking level, if the current model takes it.
+    fn effort(&self) -> Option<&str> {
+        self.thinking.as_deref().filter(|t| self.levels().contains(t))
+    }
+
+    /// The `/thinking` picker: `default` and the model's levels, from least thinking.
+    fn ask_thinking(&mut self) {
+        let levels = self.levels();
+        if levels.is_empty() {
+            return self.event(Event::Notice(self.no_levels().into()));
+        }
+        let default = self.default_label();
+        let options: Vec<Box<str>> = [default.as_str()]
+            .iter()
+            .copied()
+            .chain(levels.iter().copied())
+            .map(Into::into)
+            .collect();
+        let at = options.iter().position(|o| Some(&**o) == self.effort()).unwrap_or(0);
+        let text = format!("How hard should {} think?", self.model).into();
+        self.question = Some(Question { id: THINKING.into(), text, options, at });
+    }
+
+    /// `Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
+    /// the status line shows it and stepping through would fill the scrollback.
+    fn next_thinking(&mut self, cmds: &UnboundedSender<Command>) {
+        let levels = self.levels();
+        if levels.is_empty() {
+            return self.event(Event::Notice(self.no_levels().into()));
+        }
+        let at = self.effort().and_then(|e| levels.iter().position(|l| *l == e));
+        self.thinking = levels.get(at.map_or(0, |i| i + 1)).map(|&l| l.into());
+        let _ = cmds.send(Command::SetThinking(self.thinking.clone()));
+    }
+
+    /// `default`, with the level it means when bit knows it: `default (medium)`.
+    fn default_label(&self) -> String {
+        match agent::models::default_level(&self.provider, &self.model) {
+            Some(d) => format!("default ({d})"),
+            None => "default".into(),
+        }
+    }
+
+    fn no_levels(&self) -> String {
+        match self.model.is_empty() {
+            true => "error: no model is set. hint: pick one with /model first".into(),
+            false => format!("error: bit knows no thinking levels for {}", self.model()),
+        }
+    }
+
+    /// Sets the level, or `default` for the provider's own.
+    fn set_thinking(&mut self, level: &str, cmds: &UnboundedSender<Command>) {
+        // The picker's first row reads `default (high)` when the default is known.
+        let level = if level.starts_with("default") { "default" } else { level };
+        let levels = self.levels();
+        if level != "default" && !levels.contains(&level) {
+            let n = match levels {
+                [] => self.no_levels(),
+                l => format!("error: {} takes thinking {}, or default", self.model, l.join(", ")),
+            };
+            return self.event(Event::Notice(n.into()));
+        }
+        self.thinking = (level != "default").then(|| level.into());
+        let _ = cmds.send(Command::SetThinking(self.thinking.clone()));
+        let n = match &self.thinking {
+            Some(l) => format!("thinking set to {l}"),
+            None => match agent::models::default_level(&self.provider, &self.model) {
+                Some(d) => format!("thinking set to the model's default ({d})"),
+                None => "thinking set to the model's default".into(),
+            },
+        };
+        self.event(Event::Notice(n.into()));
     }
 
     /// `/model` takes `provider/model`, or a model id: on the current provider if it lists
@@ -585,6 +692,10 @@ impl Ui {
         match e {
             Event::Text(t) => {
                 if !t.is_empty() {
+                    // A blank row between the reasoning and the answer.
+                    if self.end_thought() {
+                        self.done.push(String::new());
+                    }
                     self.section(false);
                 }
                 for c in t.chars() {
@@ -596,6 +707,29 @@ impl Ui {
                     }
                 }
                 self.flush(false);
+            }
+            Event::Thinking(t) => {
+                // Text before it is finished; reasoning starts its own block.
+                if !self.partial.is_empty() {
+                    self.flush(true);
+                }
+                if self.thought.is_none() {
+                    self.section(false);
+                }
+                let mut line = self.thought.take().unwrap_or_default();
+                for c in t.chars() {
+                    match c {
+                        '\n' => {
+                            let rows = self.thought_rows(&line);
+                            self.done.extend(rows);
+                            line.clear();
+                        }
+                        '\t' => line.push_str("    "),
+                        c if c.is_control() => {}
+                        c => line.push(c),
+                    }
+                }
+                self.thought = Some(line);
             }
             Event::Usage(u) => {
                 self.usage = Some(u);
@@ -680,9 +814,28 @@ impl Ui {
     }
 
     fn end_text(&mut self) {
+        self.end_thought();
         if !self.partial.is_empty() {
             self.flush(true);
         }
+    }
+
+    /// Moves the last line of reasoning to scrollback; whether there was reasoning going.
+    fn end_thought(&mut self) -> bool {
+        let Some(line) = self.thought.take() else { return false };
+        if !line.is_empty() {
+            let rows = self.thought_rows(&line);
+            self.done.extend(rows);
+        }
+        true
+    }
+
+    /// One line of reasoning, grey and indented, wrapped to the width; an empty line is one
+    /// blank row.
+    fn thought_rows(&self, line: &str) -> Vec<String> {
+        let mut l = Line::new(self.color);
+        let rows = wrap(line, self.width() - 4);
+        rows.into_iter().map(|r| l.add(DIM, &format!("  {}", &line[r])).take()).collect()
     }
 
     fn section(&mut self, tool: bool) {
@@ -774,6 +927,9 @@ impl Ui {
         let mut f = Vec::new();
         if !self.partial.is_empty() {
             f.extend(self.md.rows(&self.partial, w, self.color).into_iter().skip(self.shown));
+        }
+        if let Some(t) = self.thought.as_ref().filter(|t| !t.is_empty()) {
+            f.extend(self.thought_rows(t));
         }
         let mut l = Line::new(self.color);
         if let Some((name, summary, _)) = &self.tool {
@@ -956,7 +1112,17 @@ impl Ui {
     fn model(&self) -> String {
         match self.model.is_empty() {
             true => "no model".into(),
-            false => format!("{}/{}", self.provider, self.model),
+            false => {
+                let default = agent::models::default_level(&self.provider, &self.model);
+                // A model with levels always shows one, so it's clear there's one to change.
+                let level = match (self.effort(), default) {
+                    (Some(t), _) => format!(" · {t}"),
+                    (None, Some(d)) => format!(" · {d} (default)"),
+                    (None, None) if !self.levels().is_empty() => " · default".into(),
+                    (None, None) => String::new(),
+                };
+                format!("{}/{}{level}", self.provider, self.model)
+            }
         }
     }
 
@@ -1041,6 +1207,94 @@ mod tests {
         ui.question_key(KeyCode::Esc, &tx);
         assert_eq!(ui.answering.as_deref(), Some("login"));
         assert!(ui.frame().2.is_some(), "typed answers need a cursor");
+    }
+
+    #[test]
+    fn thinking_takes_only_the_models_levels_and_shows_in_the_status() {
+        let mut ui = Ui {
+            cols: 80,
+            provider: "opencode-go".into(),
+            model: "glm-5.2".into(),
+            ..Ui::default()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let notice = |ui: &mut Ui| ui.done.drain(..).next_back().unwrap_or_default();
+
+        ui.input.set("/thinking low");
+        ui.submit(&tx);
+        assert!(notice(&mut ui).contains("glm-5.2 takes thinking high, max, or default"));
+        assert!(rx.try_recv().is_err());
+
+        ui.input.set("/thinking max");
+        ui.submit(&tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::SetThinking(Some(l))) if &*l == "max"));
+        assert!(ui.status_border(DIM).contains("opencode-go/glm-5.2 · max"));
+
+        // The picker marks the current level; `1` is `default`.
+        ui.input.set("/thinking");
+        ui.submit(&tx);
+        let q = ui.question.as_ref().unwrap();
+        assert_eq!((q.options.len(), q.at), (3, 2));
+        ui.question_key(KeyCode::Char('1'), &tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::SetThinking(None))));
+        assert!(ui.question.is_none() && ui.answering.is_none());
+        assert!(ui.status_border(DIM).contains("opencode-go/glm-5.2 · default "));
+
+        // Tab steps through the levels and back to default, without notices.
+        let tab = |ui: &mut Ui| ui.key(ct::Event::Key(KeyCode::Tab.into()), &tx);
+        ui.done.clear();
+        for want in [Some("high"), Some("max"), None, Some("high")] {
+            tab(&mut ui);
+            assert!(matches!(rx.try_recv(), Ok(Command::SetThinking(l)) if l.as_deref() == want));
+        }
+        assert!(ui.done.is_empty());
+        ui.input.set("/thi");
+        tab(&mut ui);
+        assert_eq!(ui.input.text, "/thinking ", "an open menu still completes");
+        assert!(rx.try_recv().is_err());
+        ui.input.set("");
+        ui.busy = Some(Instant::now());
+        tab(&mut ui);
+        assert!(rx.try_recv().is_err(), "nothing changes mid-turn");
+        ui.busy = None;
+
+        // The default shows when bit knows it, and `off` is offered where the model has it.
+        ui.thinking = None;
+        ui.set_model("chatgpt".into(), "gpt-6-luna".into(), &tx);
+        assert!(ui.status_border(DIM).contains("gpt-6-luna · medium (default)"));
+        ui.input.set("/thinking");
+        ui.submit(&tx);
+        let q = ui.question.take().unwrap();
+        assert_eq!(&*q.options[0], "default (medium)");
+        assert_eq!(&*q.options[1], "off");
+        ui.input.set("/thinking off");
+        ui.submit(&tx);
+        assert!(ui.status_border(DIM).contains("gpt-6-luna · off"));
+        while rx.try_recv().is_ok() {}
+
+        // A model without the level runs at its default, and the pick is kept for later.
+        ui.thinking = Some("high".into());
+        ui.set_model("opencode-go".into(), "kimi-k3".into(), &tx);
+        assert!(notice(&mut ui).contains("kimi-k3 has no `high` thinking"));
+        assert!(ui.status_border(DIM).contains("kimi-k3 · default "));
+        ui.set_model("opencode-go".into(), "kimi-k2.7-code".into(), &tx);
+        assert!(!ui.status_border(DIM).contains('·'), "no levels, nothing to show");
+        ui.set_model("opencode-go".into(), "glm-5.3".into(), &tx);
+        assert!(ui.status_border(DIM).contains("glm-5.3 · high"));
+    }
+
+    #[test]
+    fn thinking_is_grey_and_set_apart_from_the_answer() {
+        let mut ui = Ui { cols: 40, color: true, ..Ui::default() };
+        ui.event(Event::Thinking("Need the ".into()));
+        ui.event(Event::Thinking("file.\nThen".into()));
+        assert_eq!(ui.done, ["\x1b[2m  Need the file.\x1b[0m"]);
+        let (frame, ..) = ui.frame();
+        assert!(frame[0].contains("  Then"), "the unfinished line is live");
+        ui.event(Event::Text("Done.\n".into()));
+        assert_eq!(ui.done[1..3], ["\x1b[2m  Then\x1b[0m".to_string(), String::new()]);
+        assert!(ui.done[3].contains("Done.") && !ui.done[3].contains("\x1b[2m"));
+        assert!(ui.thought.is_none());
     }
 
     #[test]

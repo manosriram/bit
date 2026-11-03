@@ -28,6 +28,14 @@ pub enum Api {
     Anthropic,
 }
 
+/// A piece of the reply as it streams in.
+#[derive(Debug, PartialEq)]
+pub enum Part<'a> {
+    Text(&'a str),
+    /// The model's reasoning, for providers that send it; never part of the reply's text.
+    Thinking(&'a str),
+}
+
 pub struct Completion {
     /// The assistant message in wire format, ready to append to the history.
     pub message: Box<RawValue>,
@@ -84,7 +92,7 @@ impl Client {
     pub async fn stream(
         &self,
         body: String,
-        on_text: impl FnMut(&str),
+        on_part: impl FnMut(Part),
     ) -> Result<Completion, Error> {
         let (path, body) = match self.api {
             Api::Chat => ("chat/completions", chat::body(body)?),
@@ -107,7 +115,7 @@ impl Client {
             let status = res.status().as_u16();
             return Err(Error::Status(status, res.text().await.unwrap_or_default().into()));
         }
-        let mut acc = Acc::new(on_text, self.api);
+        let mut acc = Acc::new(on_part, self.api);
         while let Some(chunk) = res.chunk().await? {
             acc.feed(&chunk)?;
         }
@@ -118,7 +126,7 @@ impl Client {
 /// Gathers one streamed reply into a `Completion`.
 struct Acc<F> {
     sse: sse::Sse,
-    on_text: F,
+    on_part: F,
     text: String,
     reasoning: String,
     calls: Vec<ToolCall>,
@@ -129,11 +137,11 @@ struct Acc<F> {
     api: Api,
 }
 
-impl<F: FnMut(&str)> Acc<F> {
-    fn new(on_text: F, api: Api) -> Self {
+impl<F: FnMut(Part)> Acc<F> {
+    fn new(on_part: F, api: Api) -> Self {
         Self {
             sse: sse::Sse::default(),
-            on_text,
+            on_part,
             text: String::new(),
             reasoning: String::new(),
             calls: Vec::new(),
@@ -165,8 +173,21 @@ impl<F: FnMut(&str)> Acc<F> {
 
     /// Model text, shown as it arrives and kept for the message.
     fn text(&mut self, s: &str) {
-        (self.on_text)(s);
+        (self.on_part)(Part::Text(s));
         self.text.push_str(s);
+    }
+
+    /// Reasoning, shown as it arrives and kept for the message's `reasoning_content`.
+    fn thinking(&mut self, s: &str) {
+        self.show_thinking(s);
+        self.reasoning.push_str(s);
+    }
+
+    /// Reasoning that is only shown: a summary, or Claude's, which goes back in its blocks.
+    fn show_thinking(&mut self, s: &str) {
+        if !s.is_empty() {
+            (self.on_part)(Part::Thinking(s));
+        }
     }
 
     fn finish(mut self) -> Result<Completion, Error> {
@@ -290,7 +311,13 @@ mod tests {
 
     fn feed_all<'a>(parts: impl IntoIterator<Item = &'a [u8]>, api: Api) -> Out {
         let mut text = String::new();
-        let mut acc = Acc::new(|s: &str| text.push_str(s), api);
+        let mut acc = Acc::new(
+            |p: Part| match p {
+                Part::Text(s) => text.push_str(s),
+                Part::Thinking(s) => text.push_str(&format!("<{s}>")),
+            },
+            api,
+        );
         for p in parts {
             acc.feed(p).map_err(|e| e.to_string())?;
         }
@@ -336,15 +363,41 @@ mod tests {
     }
 
     #[test]
+    fn thinking_comes_from_either_field_and_summaries_are_only_shown() {
+        // OpenRouter's `reasoning`; `reasoning_content` wins when both come, so it shows once.
+        let chat = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"x\",\"reasoning_content\":\"b\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
+        );
+        let (text, message, _) = run(chat.as_bytes()).unwrap();
+        assert_eq!(text, "<a><b>");
+        assert!(message.contains(r#""reasoning_content":"ab""#));
+
+        // A ChatGPT summary is shown, ends its line, and stays out of the message.
+        let responses = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Plan**\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.done\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let (text, message, _) = run_as(responses.as_bytes(), Api::Responses).unwrap();
+        assert_eq!(text, "<**Plan**><\n>hi");
+        assert_eq!(&*message, r#"{"role":"assistant","content":"hi"}"#);
+    }
+
+    #[test]
     fn tool_call_deltas_by_index() {
         let data = include_bytes!("../testdata/tools.sse");
         let (text, message, _) = run(data).unwrap();
-        assert_eq!(text, "Let me look.");
+        // Thinking streams before the text, marked `<...>` by `feed_all`.
+        assert_eq!(text, "<Need ><the file.>Let me look.");
         assert_eq!(
             &*message,
             r#"{"role":"assistant","content":"Let me look.","reasoning_content":"Need the file.","tool_calls":[{"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}},{"id":"call_b","type":"function","function":{"name":"glob","arguments":"{}"}}]}"#
         );
-        let mut acc = Acc::new(|_: &str| {}, Api::Chat);
+        let mut acc = Acc::new(|_: Part| {}, Api::Chat);
         acc.feed(data).unwrap();
         let calls = acc.finish().unwrap().tool_calls;
         assert_eq!(calls.len(), 2);
