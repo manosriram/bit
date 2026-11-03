@@ -304,7 +304,14 @@ fn replay(cx: &Context, events: &UnboundedSender<Event>) {
         let v: Value = serde_json::from_str(m.get()).unwrap_or_default();
         let text = v["content"].as_str().unwrap_or("");
         match v["role"].as_str() {
-            Some("user") => send(Event::User(text.into())),
+            Some("user") => match text.strip_prefix(SUMMARY) {
+                Some(rest) => {
+                    send(Event::Notice("earlier messages were compacted".into()));
+                    let latest = rest.split_once(LATEST).map(|(_, l)| l);
+                    latest.into_iter().for_each(|l| send(Event::User(l.into())));
+                }
+                None => send(Event::User(text.into())),
+            },
             Some("assistant") => {
                 if !text.is_empty() {
                     send(Event::Text(format!("{text}\n").into()));
@@ -716,6 +723,8 @@ mod tests {
         let log = Session::open(&dir.join("s1.jsonl")).unwrap().messages;
         let want = msg("user", &format!("{SUMMARY}\n\nSUM2{LATEST}two"));
         assert_eq!(log.iter().map(|m| m.get()).collect::<Vec<_>>(), [want.get()]);
+        // Resuming keeps the summary, though it's a lone user message.
+        assert_eq!(Context::new("m", None, log).messages.len(), 1);
     }
 
     #[tokio::test]

@@ -22,7 +22,8 @@ impl Context {
         let mut cx = Self { prefix, model: String::new(), cache_key, tokens: 0, messages };
         cx.set_model(model);
         // A crash can cut a turn short; mend it the same way a cancel would.
-        cx.repair(0, "error: bit stopped before this call finished");
+        // A lone user message is kept: on load it can only be a compaction summary.
+        cx.answer_open("error: bit stopped before this call finished");
         cx
     }
 
@@ -47,6 +48,11 @@ impl Context {
             self.messages.truncate(start);
             return;
         }
+        self.answer_open(why);
+    }
+
+    /// Gives every tool call of the last assistant message that has no result `why` as one.
+    fn answer_open(&mut self, why: &str) {
         let field = |m: &RawValue, k: &str| -> serde_json::Value {
             serde_json::from_str::<serde_json::Value>(m.get())
                 .map_or_else(|_| Default::default(), |v| v[k].clone())

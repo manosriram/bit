@@ -7,6 +7,10 @@
 
 bit is a terminal coding agent with strong focus on tiny core, size, and memory footprint.
 
+<p align="center">
+  <a href="assets/demo.mp4"><img alt="bit fixing a failing test, compacting, and resuming by id" src="assets/demo.gif" width="800"></a>
+</p>
+
 ## Why
 
 - **Small.** About 3k lines in five crates, with hard per-crate line budgets
