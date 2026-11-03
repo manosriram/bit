@@ -20,13 +20,22 @@ bit is a terminal coding agent with strong focus on tiny core, size, and memory 
   every turn, and history is only ever appended, so provider prompt caches keep hitting.
   The session id routes requests to the same cache, even after a resume.
 
-## Build
+## Install
+
+```
+curl -fsSL https://raw.githubusercontent.com/manosriram/bit/main/install.sh | sh
+```
+
+Installs the latest release to `~/.local/bin` (macOS and Linux, arm64 and x86_64), and
+[ripgrep](https://github.com/BurntSushi/ripgrep) if it's missing.
+
+From source:
 
 ```
 cargo build --release      # target/release/bit
 ```
 
-`grep` and `glob` need [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) on `PATH`.
+`grep` and `glob` need ripgrep (`rg`) on `PATH`.
 
 ## Use
 
