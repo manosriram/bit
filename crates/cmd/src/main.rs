@@ -1,5 +1,6 @@
 mod args;
 mod config;
+mod print;
 
 use agent::session::{self, Session};
 use std::process::ExitCode;
@@ -66,6 +67,10 @@ fn run(args: args::Args) -> Result<(), String> {
         notices.push(format!("this session used {}/{}; continuing with {}/{}", u.0, u.1, f.0, f.1));
     }
     let (provider, model) = flag.or(used).or(cfg.last).unwrap_or(cfg.configured);
+    let print = args.print.is_some();
+    if print && model.is_empty() {
+        return Err("error: no model is set. hint: pass --model, or set model in the config".into());
+    }
     let session = session.unwrap_or_else(|| Session::new(&dir, &new_id(), &cwd, &provider, &model));
     let p = cfg.providers.iter().find(|x| x.name == provider).ok_or("error: no provider")?;
     // One id per conversation routes every request, resumed or not, to the cache that saw it.
@@ -77,7 +82,7 @@ fn run(args: args::Args) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(async {
+    let r = rt.block_on(async {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, ev_rx) = unbounded_channel();
         let agent = agent::Agent {
@@ -93,15 +98,27 @@ fn run(args: args::Args) -> Result<(), String> {
             mode,
             session,
             remember: cfg.remember,
+            print,
         };
         tokio::spawn(agent::run(agent, cx, cmd_rx, ev_tx));
-        tui::run(cmd_tx, ev_rx, (&provider, &model), &cfg.providers, mode, &notices).await
-    })
-    .map_err(|e| format!("error: terminal: {e}"))?;
+        match args.print {
+            Some(prompt) => {
+                notices.iter().for_each(|n| eprintln!("bit: {n}"));
+                print::run(cmd_tx, ev_rx, prompt, &mut std::io::stdout()).await
+            }
+            None => tui::run(cmd_tx, ev_rx, (&provider, &model), &cfg.providers, mode, &notices)
+                .await
+                .map_err(|e| format!("error: terminal: {e}")),
+        }
+    });
     if dir.join(format!("{id}.jsonl")).exists() {
-        println!("resume with: bit -r {id}");
+        // In print mode stdout holds only the model's text.
+        match print {
+            true => eprintln!("resume with: bit -r {id}"),
+            false => println!("resume with: bit -r {id}"),
+        }
     }
-    Ok(())
+    r
 }
 
 /// 12 hex digits: short enough to type after `bit -r`, unique enough for one machine.

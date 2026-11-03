@@ -43,9 +43,13 @@ cargo build --release      # target/release/bit
 bit                start a session
 bit -c             continue the last session in this directory
 bit -r <id>        resume a session by id or id prefix
+bit -p "<prompt>"  run one turn and exit: the reply on stdout, exit 1 if it fails
 --model <id>       model to use (default: the last one picked with /model)
 --mode ask|auto    ask before write, edit and bash (default ask), or don't
 ```
+
+In `-p` mode nobody can approve, so write, edit and bash are declined unless `--mode auto`
+or `[bash] allow` permits them.
 
 Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Shift-Tab` toggle
 ask/auto, `Up`/`Down` earlier prompts, `/` commands.

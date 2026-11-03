@@ -50,6 +50,9 @@ pub struct Agent {
     pub no_key: Option<String>,
     /// Where a picked model is written, so the next session starts with it.
     pub remember: Option<PathBuf>,
+    /// No user is present (`bit -p`): a resumed history isn't replayed, a call that needs
+    /// approval is declined without asking, and `ask` gets no answer.
+    pub print: bool,
 }
 
 /// Runs until the command channel closes.
@@ -60,7 +63,9 @@ pub async fn run(
     events: UnboundedSender<Event>,
 ) {
     if !cx.messages.is_empty() {
-        replay(&cx, &events);
+        if !agent.print {
+            replay(&cx, &events);
+        }
         let note =
             format!("resumed {} ({})", agent.session.id(), count(cx.messages.len(), "message"));
         let _ = events.send(Event::Notice(note.into()));
@@ -157,22 +162,23 @@ impl Turn<'_> {
             for call in &c.tool_calls {
                 let (id, name, args) = (&*call.id, &*call.name, &*call.args);
                 let summary = tools::summary(name, args);
-                let allowed = self.a.policy.check(self.auto.load(Relaxed), name, args) || {
-                    self.send(Event::Approval {
-                        id: id.into(),
-                        name: name.into(),
-                        summary: summary.as_str().into(),
-                        detail: tools::detail(name, args).into(),
-                    });
-                    let d = match reply(replies, id).await {
-                        Some(Command::Approve { decision, .. }) => decision,
-                        _ => Decision::No,
+                let allowed = self.a.policy.check(self.auto.load(Relaxed), name, args)
+                    || !self.a.print && {
+                        self.send(Event::Approval {
+                            id: id.into(),
+                            name: name.into(),
+                            summary: summary.as_str().into(),
+                            detail: tools::detail(name, args).into(),
+                        });
+                        let d = match reply(replies, id).await {
+                            Some(Command::Approve { decision, .. }) => decision,
+                            _ => Decision::No,
+                        };
+                        if d == Decision::Always {
+                            self.a.policy.always(name, args);
+                        }
+                        d != Decision::No
                     };
-                    if d == Decision::Always {
-                        self.a.policy.always(name, args);
-                    }
-                    d != Decision::No
-                };
                 self.send(Event::ToolStart {
                     id: id.into(),
                     name: name.into(),
@@ -181,7 +187,10 @@ impl Turn<'_> {
                 let out = match (name, allowed) {
                     ("ask", _) => self.ask(id, args, replies).await,
                     (_, true) => tools::exec(name, args, &self.a.tools).await,
-                    (_, false) => tools::Output { ok: false, content: DECLINED.into() },
+                    (_, false) => {
+                        let why = if self.a.print { NOT_ALLOWED } else { DECLINED };
+                        tools::Output { ok: false, content: why.into() }
+                    }
                 };
                 let (ok, output) = (out.ok, out.content.as_str().into());
                 let preview = preview(name, ok, &out.content).into();
@@ -202,6 +211,9 @@ impl Turn<'_> {
         args: &str,
         replies: &mut UnboundedReceiver<Command>,
     ) -> tools::Output {
+        if self.a.print {
+            return tools::Output { ok: false, content: NO_USER.into() };
+        }
         let a: Value = serde_json::from_str(args).unwrap_or_default();
         let options = a["options"].as_array().into_iter().flatten().filter_map(Value::as_str);
         let question = a["question"].as_str().unwrap_or("").into();
@@ -335,6 +347,9 @@ const SUMMARY: &str = "[The conversation so far was compacted. Summary:]";
 const LATEST: &str = "\n\n[The user's latest message, verbatim:]\n\n";
 
 const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
+const NOT_ALLOWED: &str = "error: bit -p runs without a user, so this call needs --mode auto or a [bash] allow entry. hint: do without it, or tell the user how to allow it";
+const NO_USER: &str =
+    "error: bit -p runs without a user to answer. hint: decide yourself and say what you chose";
 
 /// The few words shown at the end of a tool's gutter line.
 fn preview(name: &str, ok: bool, content: &str) -> String {
@@ -485,6 +500,7 @@ mod tests {
             session,
             no_key: None,
             remember: None,
+            print: false,
         }
     }
 
@@ -857,6 +873,29 @@ mod tests {
         let _ = bodies.recv().await.unwrap();
         let b2 = bodies.recv().await.unwrap();
         assert!(b2.ends_with(r#"{"content":"b","role":"tool","tool_call_id":"q1"}]}"#), "{b2}");
+    }
+
+    #[tokio::test]
+    async fn print_mode_declines_and_answers_without_asking() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "print");
+        agent.print = true;
+        let write = r#"{"path":"f.txt","content":"hi"}"#;
+        let ask = r#"{"question":"Which?","options":["a","b"]}"#;
+        let replies = vec![call("w1", "write", write), call("q1", "ask", ask), sse(&["ok"], true)];
+        let (cmds, mut ev, _bodies) =
+            start(agent, Context::new("m", None, Vec::new()), l, replies).await;
+        cmds.send(Command::Submit("go".into())).unwrap();
+        let mut ends = Vec::new();
+        loop {
+            match next(&mut ev).await {
+                Event::ToolEnd { output, .. } => ends.push(output),
+                Event::Approval { .. } | Event::Ask { .. } => panic!("print mode asked the user"),
+                Event::TurnEnd(r) => break assert_eq!(r, StopReason::Done),
+                _ => {}
+            }
+        }
+        assert_eq!(ends, [NOT_ALLOWED.into(), NO_USER.into()]);
     }
 
     #[tokio::test]

@@ -11,6 +11,8 @@ pub struct Args {
     pub cont: bool,
     /// `-r <id>`: resume a session by id or id prefix.
     pub resume: Option<String>,
+    /// `-p <prompt>`: run one turn without the TUI.
+    pub print: Option<String>,
     pub print_prompt: bool,
     pub version: bool,
 }
@@ -30,6 +32,7 @@ pub fn parse() -> Result<Args, lexopt::Error> {
             }
             Short('c') | Long("continue") => a.cont = true,
             Short('r') | Long("resume") => a.resume = Some(p.value()?.string()?),
+            Short('p') | Long("print") => a.print = Some(p.value()?.string()?),
             Long("print-prompt") => a.print_prompt = true,
             Long("version") => a.version = true,
             _ => return Err(arg.unexpected()),
