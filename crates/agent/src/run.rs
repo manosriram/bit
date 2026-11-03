@@ -197,6 +197,7 @@ impl Turn<'_> {
                     id: id.into(),
                     name: name.into(),
                     summary: summary.into(),
+                    diff: diff(name, args).into(),
                 });
                 let out = match (name, allowed) {
                     ("ask", _) => self.ask(id, args, replies).await,
@@ -406,6 +407,12 @@ fn preview(name: &str, ok: bool, content: &str) -> String {
     }
 }
 
+/// The `-`/`+` lines of an `edit`, for scrollback. Other tools' changes are a whole file or
+/// a command, which the tool line already sums up.
+fn diff(name: &str, args: &str) -> String {
+    if name == "edit" { tools::detail(name, args) } else { String::new() }
+}
+
 /// `1 line`, `2 lines`.
 fn count(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
@@ -452,6 +459,7 @@ fn replay(cx: &Context, events: &UnboundedSender<Event>) {
                     id: id.into(),
                     name: name.as_str().into(),
                     summary: tools::summary(name, args).into(),
+                    diff: diff(name, args).into(),
                 });
                 send(Event::ToolEnd {
                     id: id.into(),
@@ -680,6 +688,7 @@ mod tests {
             id: id.into(),
             name: "write".into(),
             summary: "f.txt".into(),
+            diff: "".into(),
         };
 
         cmd_tx.send(Command::Submit("go".into())).unwrap();

@@ -65,7 +65,12 @@ mod tests {
 
     #[test]
     fn replies_after_a_tool_call_start_a_new_line() {
-        let tool = Event::ToolStart { id: "w1".into(), name: "write".into(), summary: "f".into() };
+        let tool = Event::ToolStart {
+            id: "w1".into(),
+            name: "write".into(),
+            summary: "f".into(),
+            diff: "".into(),
+        };
         let (out, r) = play(vec![
             Event::Text("Let me".into()),
             Event::Text(" look.".into()),

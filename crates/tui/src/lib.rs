@@ -171,8 +171,8 @@ struct Ui {
     cache: (u64, Option<u64>),
     quit_armed: bool,
     auto: bool,
-    /// The running tool's name and summary, shown just above the box.
-    tool: Option<(Box<str>, Box<str>)>,
+    /// The running tool's name and summary, shown just above the box, and its diff.
+    tool: Option<(Box<str>, Box<str>, Box<str>)>,
     approval: Option<Approval>,
     question: Option<Question>,
     /// Set by `something else`: the next `Enter` answers this `ask` call with the input.
@@ -246,6 +246,15 @@ fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
         _ => {}
     }
     None
+}
+
+/// Red for a removed line, green for an added one.
+fn diff_sgr(line: &str) -> &'static str {
+    match line.get(..2) {
+        Some("- ") => "31",
+        Some("+ ") => "32",
+        _ => "",
+    }
 }
 
 /// Control characters could move the cursor and break the layout.
@@ -615,16 +624,18 @@ impl Ui {
                 self.end_text();
                 self.approval = Some(Approval { id, name, summary, detail, at: 0 });
             }
-            Event::ToolStart { name, summary, .. } => {
+            Event::ToolStart { name, summary, diff, .. } => {
                 self.end_text();
                 self.section(true);
-                self.tool = Some((name, summary));
+                self.tool = Some((name, summary, diff));
             }
             Event::ToolEnd { ok, preview, output, .. } => {
-                if let Some((name, summary)) = self.tool.take() {
+                if let Some((name, summary, diff)) = self.tool.take() {
                     self.tool_line(&name, &summary, ok, &preview);
                     if &*name == "bash" {
                         self.tail(&output);
+                    } else if ok {
+                        self.diff(&diff);
                     }
                 }
             }
@@ -698,6 +709,19 @@ impl Ui {
         }
     }
 
+    /// An edit's `-`/`+` lines under its tool line, cut like an approval's.
+    fn diff(&mut self, diff: &str) {
+        let lines: Vec<String> = diff.lines().map(clean).collect();
+        let mut l = Line::new(self.color);
+        for s in lines.iter().take(DETAIL_ROWS) {
+            self.done.push(l.add(diff_sgr(s), &format!("  {}", clip(s, self.width() - 2))).take());
+        }
+        if lines.len() > DETAIL_ROWS {
+            let more = format!("  ... {} more lines", lines.len() - DETAIL_ROWS);
+            self.done.push(l.add(DIM, &more).take());
+        }
+    }
+
     fn spinner(&self) -> &'static str {
         ["|", "/", "-", "\\"][self.tick() % 4]
     }
@@ -736,7 +760,7 @@ impl Ui {
             f.extend(self.md.rows(&self.partial, w, self.color).into_iter().skip(self.shown));
         }
         let mut l = Line::new(self.color);
-        if let Some((name, summary)) = &self.tool {
+        if let Some((name, summary, _)) = &self.tool {
             let room = w.saturating_sub(str_width(name) + 14);
             l.add(YELLOW, self.spinner())
                 .add("", " ")
@@ -869,12 +893,7 @@ impl Ui {
         f.push(self.title(&format!("{} {}", a.name, clip(&summary, room))));
         let lines: Vec<String> = a.detail.lines().map(clean).collect();
         for s in lines.iter().take(DETAIL_ROWS) {
-            let sgr = match s.get(..2) {
-                Some("- ") => "31",
-                Some("+ ") => "32",
-                _ => "",
-            };
-            f.push(self.row(sgr, s));
+            f.push(self.row(diff_sgr(s), s));
         }
         if lines.len() > DETAIL_ROWS {
             f.push(self.row(DIM, &format!("... {} more lines", lines.len() - DETAIL_ROWS)));
@@ -965,6 +984,68 @@ mod tests {
         assert!(ui.busy.is_some() && ui.input.text.is_empty());
         ui.event(Event::SignedIn("chatgpt".into()));
         assert!(ui.providers[0].key.is_ok());
+    }
+
+    #[test]
+    fn login_provider_selection_hides_cursor_until_typing_resumes() {
+        let mut ui = Ui { cols: 80, ..Ui::default() };
+        let (tx, mut rx) = unbounded_channel();
+        assert!(ui.frame().2.is_some(), "the prompt has a typing cursor");
+        ui.event(Event::Ask {
+            id: "login".into(),
+            question: "Sign in to which provider?".into(),
+            options: vec!["openai".into()],
+        });
+        let (frame, _, cursor) = ui.frame();
+        assert!(cursor.is_none(), "no typing cursor over the provider selection");
+        assert!(frame.iter().any(|r| r.contains("> 1. openai")));
+
+        ui.question_key(KeyCode::Down, &tx);
+        let (frame, _, cursor) = ui.frame();
+        assert!(cursor.is_none());
+        assert!(frame.iter().any(|r| r.contains("> something else")));
+
+        ui.question_key(KeyCode::Up, &tx);
+        ui.question_key(KeyCode::Enter, &tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::Answer { id, text })
+            if &*id == "login" && text == "openai"));
+        assert!(ui.frame().2.is_some(), "restore the cursor after selection");
+    }
+
+    #[test]
+    fn a_typed_login_answer_restores_the_cursor() {
+        let mut ui = Ui { cols: 80, ..Ui::default() };
+        let (tx, _) = unbounded_channel();
+        ui.event(Event::Ask {
+            id: "login".into(),
+            question: "Sign in to which provider?".into(),
+            options: vec!["openai".into()],
+        });
+        assert!(ui.frame().2.is_none());
+        ui.question_key(KeyCode::Esc, &tx);
+        assert_eq!(ui.answering.as_deref(), Some("login"));
+        assert!(ui.frame().2.is_some(), "typed answers need a cursor");
+    }
+
+    /// Scrollback after an `edit` with this diff ends `ok` or not.
+    fn edit_rows(diff: &str, ok: bool) -> Vec<String> {
+        let mut ui = Ui { cols: 80, ..Ui::default() };
+        let (id, name) = ("e1".into(), "edit".into());
+        let summary = "a.rs".into();
+        ui.event(Event::ToolStart { id, name, summary, diff: diff.into() });
+        let preview = if ok { "ok" } else { "error: no match" }.into();
+        ui.event(Event::ToolEnd { id: "e1".into(), ok, preview, output: "".into() });
+        ui.done
+    }
+
+    #[test]
+    fn a_finished_edit_shows_its_diff_and_a_failed_one_does_not() {
+        let rows = edit_rows("- old\n+ new\n", true);
+        assert_eq!(rows, ["* edit a.rs  [ok]", "  - old", "  + new"]);
+        assert_eq!(edit_rows("- old\n+ new\n", false).len(), 1);
+        let long: String = (0..20).map(|i| format!("+ {i}\n")).collect();
+        let rows = edit_rows(&long, true);
+        assert_eq!((rows.len(), rows.last().unwrap().as_str()), (14, "  ... 8 more lines"));
     }
 
     #[test]

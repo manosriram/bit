@@ -48,6 +48,8 @@ pub enum Event {
         id: Box<str>,
         name: Box<str>,
         summary: Box<str>,
+        /// What the call changes, shown once it succeeds: `-`/`+` lines for `edit`, else empty.
+        diff: Box<str>,
     },
     Approval {
         id: Box<str>,
