@@ -29,7 +29,8 @@ pub async fn run(
 ) {
     if !cx.messages.is_empty() {
         replay(&cx, &events);
-        let note = format!("resumed {} ({} messages)", agent.session.id(), cx.messages.len());
+        let note =
+            format!("resumed {} ({})", agent.session.id(), count(cx.messages.len(), "message"));
         let _ = events.send(Event::Notice(note.into()));
     }
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
@@ -284,14 +285,22 @@ fn preview(name: &str, ok: bool, content: &str) -> String {
     match (ok, name) {
         (true, "write" | "edit") => "ok".into(),
         (true, "ask") => content.into(),
-        (true, _) => format!("{} lines", content.lines().count()),
+        (true, _) => count(content.lines().count(), "line"),
+        // The gutter adds its own brackets, so `[exit 1]` loses its own.
         (false, _) => lines
             .clone()
             .find(|l| l.starts_with("error:") || l.starts_with("[exit"))
             .or(lines.next_back())
             .unwrap_or("failed")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .into(),
     }
+}
+
+/// `1 line`, `2 lines`.
+fn count(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
 /// Sends a resumed history to the UI as the events it would have seen live.
@@ -750,5 +759,12 @@ mod tests {
         let _ = bodies.recv().await.unwrap();
         let b2 = bodies.recv().await.unwrap();
         assert!(b2.ends_with(r#"{"content":"b","role":"tool","tool_call_id":"q1"}]}"#), "{b2}");
+    }
+
+    #[test]
+    fn previews_count_lines_and_show_the_exit_once() {
+        assert_eq!(preview("bash", false, "boom\n[exit 1]"), "exit 1");
+        assert_eq!(preview("read", true, "one"), "1 line");
+        assert_eq!(preview("read", true, "one\ntwo"), "2 lines");
     }
 }
