@@ -35,7 +35,7 @@ fn run(args: args::Args) -> Result<(), String> {
     }
     let cfg = config::load()?;
     let cwd = std::env::current_dir().map_err(|e| format!("error: current directory: {e}"))?;
-    let dir = config::sessions_dir()?;
+    let dir = cfg.sessions.clone();
     let found = match (&args.resume, args.cont) {
         (Some(id), _) => Some(
             session::find(&dir, id)
@@ -97,7 +97,8 @@ fn run(args: args::Args) -> Result<(), String> {
             policy: agent::Policy::new(cfg.allow),
             mode,
             session,
-            remember: cfg.remember,
+            remember: Some(cfg.remember),
+            auth: cfg.auth,
             print,
         };
         tokio::spawn(agent::run(agent, cx, cmd_rx, ev_tx));

@@ -12,7 +12,11 @@ pub struct Config {
     /// The last pick, as (provider, model), if its provider still exists.
     pub last: Option<(String, String)>,
     /// Where the last pick is kept.
-    pub remember: Option<PathBuf>,
+    pub remember: PathBuf,
+    /// `auth.json`: saved API keys and the ChatGPT sign-in.
+    pub auth: PathBuf,
+    /// Where the session logs go.
+    pub sessions: PathBuf,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
 }
@@ -49,18 +53,22 @@ struct Provider {
     unknown: toml::Table,
 }
 
-/// (name, base_url, api key env var).
+/// (name, base_url, api key env var). `chatgpt` signs in instead, so its "variable" names
+/// the command that does it.
 const BUILTIN: &[(&str, &str, &str)] = &[
     ("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
     ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+    ("chatgpt", "https://chatgpt.com/backend-api/codex", "/login"),
     // https://opencode.ai/v2/docs/console/go/; only its Chat Completions models work.
     ("opencode-go", "https://opencode.ai/inference/go/openai/v1", "OPENCODE_API_KEY"),
 ];
 
 pub fn load() -> Result<Config, String> {
-    let path = dir("XDG_CONFIG_HOME", ".config")
-        .map(|d| d.join("bit/config.toml"))
-        .ok_or("error: cannot find the config directory. hint: set HOME")?;
+    // Everything bit keeps lives here: config, credentials, the last pick, sessions.
+    let home = || std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"));
+    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(home);
+    let base = base.ok_or("error: cannot find the config directory. hint: set HOME")?.join("bit");
+    let (path, auth) = (base.join("config.toml"), base.join("auth.json"));
     let mut file: File = match std::fs::read_to_string(&path) {
         Ok(s) => toml::from_str(&s).map_err(|e| format!("error: {}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
@@ -77,6 +85,7 @@ pub fn load() -> Result<Config, String> {
     }
 
     let at = path.display();
+    let mut saved = agent::login::load(&auth)?;
     let mut providers = Vec::new();
     let names = BUILTIN.iter().map(|b| b.0.to_owned());
     let extra: Vec<String> =
@@ -93,9 +102,10 @@ pub fn load() -> Result<Config, String> {
             conf.map_or((None, None, Vec::new()), |c| (c.base_url, c.api_key_env, c.models));
         let base_url = pick(c_url, builtin.map(|b| b.1), "base_url")?;
         let key_env = pick(c_env, builtin.map(|b| b.2), "api_key_env")?;
-        let key = std::env::var(&key_env).map_err(|_| {
-            format!("error: {key_env} is not set. hint: export it, or set api_key_env for {name} in {at}")
-        });
+        let key = match &*name {
+            "chatgpt" => chatgpt(&auth),
+            _ => api_key(&name, &key_env, std::env::var(&key_env).ok(), saved.remove(&name), &auth),
+        };
         let mut models = c_models;
         let built: Vec<String> =
             agent::models::list(&name).map(String::from).filter(|m| !models.contains(m)).collect();
@@ -111,8 +121,8 @@ pub fn load() -> Result<Config, String> {
             "error: unknown provider `{name}`. hint: add [providers.{name}] to {at}"
         ));
     }
-    let remember = dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("bit/model"));
-    let last = remember.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| {
+    let remember = base.join("model");
+    let last = std::fs::read_to_string(&remember).ok().and_then(|s| {
         let (p, m) = s.trim().split_once('/')?;
         let known = providers.iter().any(|x| x.name == p) && !m.is_empty();
         known.then(|| (p.to_owned(), m.to_owned()))
@@ -122,18 +132,59 @@ pub fn load() -> Result<Config, String> {
         configured: (name, file.model.unwrap_or_default()),
         last,
         remember,
+        auth,
+        sessions: base.join("sessions"),
         allow: file.bash.allow,
     })
 }
 
-pub fn sessions_dir() -> Result<PathBuf, String> {
-    let base = dir("XDG_DATA_HOME", ".local/share")
-        .ok_or("error: cannot find the data directory. hint: set HOME")?;
-    Ok(base.join("bit/sessions"))
+/// The environment first, so a shell can override a saved key; then `auth.json`.
+fn api_key(
+    name: &str,
+    key_env: &str,
+    env: Option<String>,
+    saved: Option<agent::login::Cred>,
+    auth: &std::path::Path,
+) -> Result<String, String> {
+    match (env, saved) {
+        (Some(k), _) | (None, Some(agent::login::Cred::ApiKey { key: k })) => Ok(k),
+        _ => Err(format!(
+            "error: {key_env} is not set. hint: export it, or add {name} to {}",
+            auth.display()
+        )),
+    }
 }
 
-/// `$var`, else `$HOME/<default>`.
-fn dir(var: &str, default: &str) -> Option<PathBuf> {
-    let home = || std::env::var_os("HOME").map(|h| PathBuf::from(h).join(default));
-    std::env::var_os(var).map(PathBuf::from).or_else(home)
+/// The saved sign-in. Its own runtime, since a refresh is a request and the session's
+/// runtime starts later.
+fn chatgpt(auth: &std::path::Path) -> Result<String, String> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    rt.map_err(|e| e.to_string())?.block_on(agent::login::token(auth))
+}
+
+#[cfg(test)]
+mod tests {
+    use agent::login::Cred;
+    use std::path::Path;
+
+    #[test]
+    fn the_environment_wins_over_a_saved_key() {
+        let key = |env: Option<&str>, saved: Option<&str>| {
+            let saved = saved.map(|k| Cred::ApiKey { key: k.into() });
+            super::api_key(
+                "deepseek",
+                "DEEPSEEK_API_KEY",
+                env.map(Into::into),
+                saved,
+                Path::new("a.json"),
+            )
+        };
+        assert_eq!(key(Some("env"), Some("file")), Ok("env".into()));
+        assert_eq!(key(None, Some("file")), Ok("file".into()));
+        assert_eq!(
+            key(None, None),
+            Err("error: DEEPSEEK_API_KEY is not set. hint: export it, or add deepseek to a.json"
+                .into())
+        );
+    }
 }

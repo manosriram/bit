@@ -8,7 +8,10 @@ llm = { path = "../llm" }
 tools = { path = "../tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", features = ["sync", "macros", "time"] }
+tokio = { version = "1", features = ["sync", "macros", "time", "net", "io-util", "process"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+aws-lc-rs = { version = "1", default-features = false }
+base64 = "0.23"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "net", "io-util"] }

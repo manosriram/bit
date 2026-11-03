@@ -13,4 +13,4 @@ About bit, for when the user asks how to use it:
 - Keys: Enter sends, Esc cancels the turn, Ctrl-C twice quits, Shift-Tab toggles ask/auto (auto runs write, edit and bash without asking), Up/Down recall earlier prompts, @ completes file paths.
 - CLI: bit -c continues the last session here, bit -r <id> resumes one, bit -p "<prompt>" runs one turn and exits, --model <id>, --mode ask|auto.
 - Config: ~/.config/bit/config.toml sets model, provider, [providers.<name>] base_url/api_key_env/models for any OpenAI-compatible endpoint, and [bash] allow = [...] for commands that run without asking.
-- Keys come from DEEPSEEK_API_KEY, OPENAI_API_KEY or OPENCODE_API_KEY. Sessions are saved in ~/.local/share/bit/sessions/.
+- Keys come from DEEPSEEK_API_KEY, OPENAI_API_KEY or OPENCODE_API_KEY, else from ~/.config/bit/auth.json ({"deepseek": {"type": "api_key", "key": "..."}}); /login signs in to a ChatGPT plan. Sessions are saved in ~/.config/bit/sessions/.

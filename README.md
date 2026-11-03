@@ -13,8 +13,7 @@ bit is a terminal coding agent with strong focus on tiny core, size, and memory 
 
 ## Why
 
-- **Small.** About 3k lines in five crates, with hard per-crate line budgets
-  enforced in CI. You can read all of it.
+- **Small.** A few thousand lines in five crates. You can read all of it.
 - **Lean.** One binary of about 2.5 MB, running on a single-threaded tokio runtime.
 - **Cheap to run.** The request prefix (model, tools, system prompt) is byte-identical on
   every turn, and history is only ever appended, so provider prompt caches keep hitting.
@@ -64,7 +63,25 @@ provider whose key is set:
 |---|---|
 | `deepseek` | `DEEPSEEK_API_KEY` |
 | `openai` | `OPENAI_API_KEY` |
+| `chatgpt` | `/login` |
 | `opencode-go` | `OPENCODE_API_KEY` |
+
+`chatgpt` uses your ChatGPT subscription (Plus, Pro, ...) instead of an API key: type
+`/login`, pick `openai`, and sign in on the page that opens in your browser. bit saves the
+tokens and refreshes them itself.
+
+Instead of exporting a key, you can save it in `~/.config/bit/auth.json` (keep it private;
+bit writes it owner-only). A key in the environment wins over a saved one:
+
+```json
+{
+  "deepseek": { "type": "api_key", "key": "sk-..." },
+  "opencode-go": { "type": "api_key", "key": "..." }
+}
+```
+
+Everything bit keeps is in `~/.config/bit/` (or `$XDG_CONFIG_HOME/bit/`): `config.toml`,
+`auth.json`, `model` (the last pick) and `sessions/`.
 
 ## Config
 
@@ -93,5 +110,5 @@ and the full text is saved to a file the model can page through.
 
 ## Sessions
 
-Each conversation is a JSONL log in `~/.local/share/bit/sessions/<id>.jsonl`, written
+Each conversation is a JSONL log in `~/.config/bit/sessions/<id>.jsonl`, written
 after every step, so a resumed session sends the same bytes a running one would.

@@ -22,6 +22,8 @@ pub enum Command {
     Clear,
     /// Summarizes the history now. Runs like a turn and ends with `TurnEnd`.
     Compact,
+    /// Asks which provider to sign in to, then signs in. Runs like a turn.
+    Login,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,6 +71,8 @@ pub enum Event {
     /// The tokens of the last reply.
     Usage(Usage),
     Notice(Box<str>),
+    /// The provider now has a key, from `/login`.
+    SignedIn(Box<str>),
     TurnEnd(StopReason),
 }
 

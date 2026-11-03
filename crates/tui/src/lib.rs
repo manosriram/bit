@@ -24,9 +24,10 @@ const PICK_ROWS: usize = 10;
 /// Last rows of a command's output shown under its tool line.
 const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 3] = [
+const COMMANDS: [(&str, &str, &str); 4] = [
     ("/clear", "", "start over; the model forgets this conversation"),
     ("/compact", "", "summarize the conversation to free up context"),
+    ("/login", "", "sign in with a subscription instead of an API key"),
     ("/model", "[id]", "pick the model, or set it to id"),
 ];
 const CHOICES: [(&str, Decision); 3] = [
@@ -446,6 +447,11 @@ impl Ui {
                 self.logo();
                 self.event(Event::Notice("conversation cleared with /clear".into()));
             }
+            "/login" => {
+                self.input.take();
+                let _ = cmds.send(Command::Login);
+                (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
+            }
             _ if self.model.is_empty() => self.pick(true),
             "/compact" => {
                 self.input.take();
@@ -580,6 +586,12 @@ impl Ui {
                     input + u64::from(u.input),
                     cached.zip(u.cached).map(|(a, b)| a + u64::from(b)),
                 );
+            }
+            Event::SignedIn(p) => {
+                self.providers
+                    .iter_mut()
+                    .filter(|x| *x.name == *p)
+                    .for_each(|x| x.key = Ok("".into()));
             }
             Event::User(t) => {
                 self.input.remember(&t);
@@ -929,6 +941,27 @@ impl Ui {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn login_runs_without_a_model_and_signing_in_sets_the_key() {
+        let p = agent::Provider {
+            name: "chatgpt".into(),
+            base_url: String::new(),
+            key_env: "/login".into(),
+            key: Err("error: not signed in".into()),
+            models: vec!["m".into()],
+        };
+        let mut ui = Ui { providers: vec![p], cols: 80, ..Ui::default() };
+        let (tx, mut rx) = unbounded_channel();
+        ui.input.set("/login");
+        ui.submit(&tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::Login)), "no model is set, yet it's sent");
+        assert!(ui.busy.is_some() && ui.input.text.is_empty());
+        ui.event(Event::SignedIn("chatgpt".into()));
+        assert!(ui.providers[0].key.is_ok());
+    }
+
     #[test]
     fn file_names_match_before_paths() {
         let files: Vec<String> =

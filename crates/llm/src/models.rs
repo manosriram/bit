@@ -1,6 +1,14 @@
 /// (provider, id, context window in tokens). OpenCode Go entries are from
-/// `opencode.ai/inference/go/v1/models` (Nov 2026).
+/// `opencode.ai/inference/go/v1/models`, ChatGPT ones from the models Codex lists (Nov 2026).
 const MODELS: &[(&str, &str, u32)] = &[
+    ("chatgpt", "gpt-6.1-sol", 500_000),
+    ("chatgpt", "gpt-6.1-terra", 500_000),
+    ("chatgpt", "gpt-6-sol", 272_000),
+    ("chatgpt", "gpt-6-astra", 272_000),
+    ("chatgpt", "gpt-6-luna", 272_000),
+    ("chatgpt", "gpt-5.6-sol", 272_000),
+    ("chatgpt", "gpt-5.6-terra", 272_000),
+    ("chatgpt", "gpt-5.6-luna", 272_000),
     ("deepseek", "deepseek-chat", 128_000),
     ("deepseek", "deepseek-reasoner", 128_000),
     ("openai", "gpt-5", 400_000),

@@ -1,9 +1,10 @@
+mod chat;
 pub mod models;
+mod responses;
 mod sse;
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use std::borrow::Cow;
 use std::fmt;
 
 pub struct Client {
@@ -11,6 +12,17 @@ pub struct Client {
     base_url: Box<str>,
     api_key: Box<str>,
     headers: Box<[(Box<str>, Box<str>)]>,
+    api: Api,
+}
+
+/// The wire format a provider speaks. Each has an adapter module that translates the request
+/// and parses the stream; the history is always in Chat Completions form.
+#[derive(Clone, Copy)]
+pub enum Api {
+    /// Chat Completions (`chat.rs`): every provider but one.
+    Chat,
+    /// The Responses API (`responses.rs`): ChatGPT subscriptions.
+    Responses,
 }
 
 pub struct Completion {
@@ -43,18 +55,24 @@ pub enum Error {
     Status(u16, Box<str>),
     Api(Box<str>),
     Json(serde_json::Error),
-    /// The stream ended before `[DONE]`.
+    /// The stream ended before its end marker.
     Disconnected,
 }
 
 impl Client {
     /// `headers` are sent with every request, after the auth and content-type headers.
-    pub fn new(base_url: &str, api_key: &str, headers: Vec<(Box<str>, Box<str>)>) -> Self {
+    pub fn new(
+        base_url: &str,
+        api_key: &str,
+        headers: Vec<(Box<str>, Box<str>)>,
+        api: Api,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').into(),
             api_key: api_key.into(),
             headers: headers.into(),
+            api,
         }
     }
 
@@ -65,9 +83,13 @@ impl Client {
         body: String,
         on_text: impl FnMut(&str),
     ) -> Result<Completion, Error> {
+        let (path, body) = match self.api {
+            Api::Chat => ("chat/completions", body),
+            Api::Responses => ("responses", responses::body(&body)?),
+        };
         let mut req = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(format!("{}/{path}", self.base_url))
             .bearer_auth(&*self.api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
         for (k, v) in &self.headers {
@@ -78,7 +100,7 @@ impl Client {
             let status = res.status().as_u16();
             return Err(Error::Status(status, res.text().await.unwrap_or_default().into()));
         }
-        let mut acc = Acc::new(on_text);
+        let mut acc = Acc::new(on_text, self.api);
         while let Some(chunk) = res.chunk().await? {
             acc.feed(&chunk)?;
         }
@@ -95,10 +117,11 @@ struct Acc<F> {
     calls: Vec<ToolCall>,
     usage: Usage,
     done: bool,
+    api: Api,
 }
 
 impl<F: FnMut(&str)> Acc<F> {
-    fn new(on_text: F) -> Self {
+    fn new(on_text: F, api: Api) -> Self {
         Self {
             sse: sse::Sse::default(),
             on_text,
@@ -107,6 +130,7 @@ impl<F: FnMut(&str)> Acc<F> {
             calls: Vec::new(),
             usage: Usage::default(),
             done: false,
+            api,
         }
     }
 
@@ -119,38 +143,19 @@ impl<F: FnMut(&str)> Acc<F> {
     }
 
     fn data(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.done || data == b"[DONE]" {
-            self.done = true;
+        if self.done {
             return Ok(());
         }
-        let c: Chunk = serde_json::from_slice(data)?;
-        if let Some(e) = c.error {
-            return Err(Error::Api(e.get().into()));
+        match self.api {
+            Api::Chat => chat::data(self, data),
+            Api::Responses => responses::data(self, data),
         }
-        for d in c.choices.into_iter().flatten().filter_map(|c| c.delta) {
-            if let Some(s) = d.content.as_deref() {
-                (self.on_text)(s);
-                self.text.push_str(s);
-            }
-            self.reasoning.push_str(d.reasoning_content.as_deref().unwrap_or(""));
-            for t in d.tool_calls.into_iter().flatten() {
-                if self.calls.len() <= t.index {
-                    self.calls.resize(t.index + 1, ToolCall::default());
-                }
-                let call = &mut self.calls[t.index];
-                if let Some(id) = t.id.filter(|id| !id.is_empty()) {
-                    call.id = id.into_owned();
-                }
-                let f = t.function.unwrap_or_default();
-                // Some providers repeat the name in every chunk; it is never split.
-                if let Some(name) = f.name.filter(|_| call.name.is_empty()) {
-                    call.name = name.into_owned();
-                }
-                call.args.push_str(f.arguments.as_deref().unwrap_or(""));
-            }
-        }
-        self.usage = c.usage.unwrap_or(self.usage);
-        Ok(())
+    }
+
+    /// Model text, shown as it arrives and kept for the message.
+    fn text(&mut self, s: &str) {
+        (self.on_text)(s);
+        self.text.push_str(s);
     }
 
     fn finish(mut self) -> Result<Completion, Error> {
@@ -206,59 +211,16 @@ struct WireFn<'a> {
     arguments: &'a str,
 }
 
-// Optional fields are `Option` rather than `#[serde(default)]`: some providers send an explicit
-// `null` (`"tool_calls":null`), which `default` alone rejects.
-#[derive(Deserialize)]
-struct Chunk<'a> {
-    #[serde(borrow)]
-    choices: Option<Vec<Choice<'a>>>,
-    usage: Option<Usage>,
-    #[serde(borrow)]
-    error: Option<&'a RawValue>,
-}
-
-#[derive(Deserialize)]
-struct Choice<'a> {
-    #[serde(borrow)]
-    delta: Option<Delta<'a>>,
-}
-
-#[derive(Deserialize, Default)]
-struct Delta<'a> {
-    // Borrowed unless the text has JSON escapes, so most deltas are not copied.
-    #[serde(borrow)]
-    content: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    reasoning_content: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    tool_calls: Option<Vec<CallDelta<'a>>>,
-}
-
-#[derive(Deserialize)]
-struct CallDelta<'a> {
-    #[serde(default)]
-    index: usize,
-    #[serde(borrow)]
-    id: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    function: Option<FnDelta<'a>>,
-}
-
-#[derive(Deserialize, Default)]
-struct FnDelta<'a> {
-    #[serde(borrow)]
-    name: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    arguments: Option<Cow<'a, str>>,
-}
-
 /// OpenAI reports cached tokens in `prompt_tokens_details.cached_tokens`; DeepSeek reports
-/// them as `prompt_cache_hit_tokens`.
+/// them as `prompt_cache_hit_tokens`. The aliases are the Responses API's names.
 #[derive(Deserialize)]
 struct WireUsage {
+    #[serde(alias = "input_tokens")]
     prompt_tokens: u32,
+    #[serde(alias = "output_tokens")]
     completion_tokens: u32,
     prompt_cache_hit_tokens: Option<u32>,
+    #[serde(alias = "input_tokens_details")]
     prompt_tokens_details: Option<Details>,
 }
 
@@ -312,9 +274,9 @@ mod tests {
 
     type Out = Result<(String, Box<str>, Usage), String>;
 
-    fn feed_all<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Out {
+    fn feed_all<'a>(parts: impl IntoIterator<Item = &'a [u8]>, api: Api) -> Out {
         let mut text = String::new();
-        let mut acc = Acc::new(|s: &str| text.push_str(s));
+        let mut acc = Acc::new(|s: &str| text.push_str(s), api);
         for p in parts {
             acc.feed(p).map_err(|e| e.to_string())?;
         }
@@ -324,11 +286,15 @@ mod tests {
 
     /// Every two-way split, and a byte-at-a-time feed, must match the unsplit result.
     fn run(data: &[u8]) -> Out {
-        let want = feed_all([data]);
+        run_as(data, Api::Chat)
+    }
+
+    fn run_as(data: &[u8], api: Api) -> Out {
+        let want = feed_all([data], api);
         for at in 0..=data.len() {
-            assert_eq!(feed_all([&data[..at], &data[at..]]), want, "split at {at}");
+            assert_eq!(feed_all([&data[..at], &data[at..]], api), want, "split at {at}");
         }
-        assert_eq!(feed_all(data.chunks(1)), want, "byte at a time");
+        assert_eq!(feed_all(data.chunks(1), api), want, "byte at a time");
         want
     }
 
@@ -364,7 +330,7 @@ mod tests {
             &*message,
             r#"{"role":"assistant","content":"Let me look.","reasoning_content":"Need the file.","tool_calls":[{"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}},{"id":"call_b","type":"function","function":{"name":"glob","arguments":"{}"}}]}"#
         );
-        let mut acc = Acc::new(|_: &str| {});
+        let mut acc = Acc::new(|_: &str| {}, Api::Chat);
         acc.feed(data).unwrap();
         let calls = acc.finish().unwrap().tool_calls;
         assert_eq!(calls.len(), 2);
@@ -381,6 +347,23 @@ mod tests {
         );
         let (text, message, _) = run(data.as_bytes()).unwrap();
         assert_eq!((text.as_str(), &*message), ("hi", r#"{"role":"assistant","content":"hi"}"#));
+    }
+
+    #[test]
+    fn responses_text_calls_and_usage() {
+        let data = include_bytes!("../testdata/responses.sse");
+        let (text, message, usage) = run_as(data, Api::Responses).unwrap();
+        assert_eq!(text, "Let me look.");
+        assert_eq!(
+            &*message,
+            r#"{"role":"assistant","content":"Let me look.","tool_calls":[{"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}"#
+        );
+        assert_eq!(usage, Usage { input: 124, cached: Some(64), output: 18 });
+        let cut = &data[..data.len() - 120];
+        assert_eq!(run_as(cut, Api::Responses), Err("stream ended early".into()));
+        let failed =
+            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"x\"}}}\n\n";
+        assert_eq!(run_as(failed, Api::Responses), Err(r#"api: {"code":"x"}"#.into()));
     }
 
     #[test]

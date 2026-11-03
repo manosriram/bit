@@ -1,4 +1,5 @@
 use crate::context::{Context, msg, tool_msg};
+use crate::login;
 use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::session::Session;
@@ -21,19 +22,28 @@ pub struct Provider {
     pub models: Vec<String>,
 }
 
-/// The client for `p`. The session id routes OpenCode's cache to the server that saw it.
+/// The client for `p`. The session id routes OpenCode's and ChatGPT's cache to the server
+/// that saw it. Only `chatgpt` speaks the Responses API.
 pub fn connect(p: &Provider, session: &str) -> llm::Client {
-    let mut headers =
-        vec![("user-agent".into(), concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
-    if p.name == "opencode-go" {
-        headers.push(("x-opencode-session".into(), session.into()));
+    let key = p.key.as_deref().unwrap_or("");
+    let mut headers = vec![("user-agent", concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
+    match &*p.name {
+        "opencode-go" => headers.push(("x-opencode-session", session.into())),
+        "chatgpt" => headers.extend([
+            ("session_id", session.into()),
+            ("originator", "bit".into()),
+            ("chatgpt-account-id", login::account(key)),
+        ]),
+        _ => {}
     }
-    llm::Client::new(&p.base_url, p.key.as_deref().unwrap_or(""), headers)
+    let headers = headers.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+    let api = if p.name == "chatgpt" { llm::Api::Responses } else { llm::Api::Chat };
+    llm::Client::new(&p.base_url, key, headers, api)
 }
 
-/// The `prompt_cache_key` for `provider`: only OpenAI routes its cache by one.
+/// The `prompt_cache_key` for `provider`: OpenAI and ChatGPT route their cache by one.
 pub fn cache_key<'a>(provider: &str, session: &'a str) -> Option<&'a str> {
-    (provider == "openai").then_some(session)
+    matches!(provider, "openai" | "chatgpt").then_some(session)
 }
 
 /// Everything a session needs besides its history and channels.
@@ -50,6 +60,8 @@ pub struct Agent {
     pub no_key: Option<String>,
     /// Where a picked model is written, so the next session starts with it.
     pub remember: Option<PathBuf>,
+    /// `auth.json`, where `/login` saves the ChatGPT tokens.
+    pub auth: PathBuf,
     /// No user is present (`bit -p`): a resumed history isn't replayed, a call that needs
     /// approval is declined without asking, and `ask` gets no answer.
     pub print: bool,
@@ -75,10 +87,11 @@ pub async fn run(
     let auto = AtomicBool::new(agent.mode == Mode::Auto);
     let (replies_tx, mut replies) = unbounded_channel();
     while let Some(cmd) = cmds.recv().await {
-        // `None` is `/compact`: a turn that only compacts.
+        // `None` is `/compact` or `/login`: a turn that sends no message.
+        let login = matches!(cmd, Command::Login);
         let text = match cmd {
             Command::Submit(text) => Some(text),
-            Command::Compact => None,
+            Command::Compact | Command::Login => None,
             Command::SetMode(m) => {
                 auto.store(m == Mode::Auto, Relaxed);
                 continue;
@@ -106,6 +119,7 @@ pub async fn run(
         let work = async {
             match text {
                 Some(_) => turn.run(&mut cx, &mut replies).await,
+                None if login => turn.login(&mut replies).await,
                 None => {
                     turn.compact(&mut cx).await;
                     Ok(())
@@ -202,6 +216,29 @@ impl Turn<'_> {
                 return Ok(());
             }
         }
+    }
+
+    /// `/login`: asks which provider, then signs in. Only `openai` has a sign-in: a ChatGPT
+    /// plan, served as the `chatgpt` provider.
+    async fn login(&mut self, replies: &mut UnboundedReceiver<Command>) -> Result<(), StopReason> {
+        let fail = |e: &str| StopReason::Error(e.into());
+        let (question, options) = ("Sign in to which provider?".into(), vec!["openai".into()]);
+        self.send(Event::Ask { id: "login".into(), question, options });
+        match reply(replies, "login").await {
+            Some(Command::Answer { text, .. }) if text == "openai" => {}
+            _ => return Err(fail("error: bit can sign in only to openai")),
+        }
+        let show = |url: &str| self.send(Event::Notice(format!("{OPEN}{url}").into()));
+        let key = login::sign_in(&self.a.auth, show).await.map_err(|e| fail(&e))?;
+        if let Some(p) = self.a.providers.iter_mut().find(|p| p.name == "chatgpt") {
+            p.key = Ok(key);
+            if self.a.provider == "chatgpt" {
+                (self.a.client, self.a.no_key) = (connect(p, self.a.session.id()), None);
+            }
+        }
+        self.send(Event::SignedIn("chatgpt".into()));
+        self.send(Event::Notice(SIGNED_IN.into()));
+        Ok(())
     }
 
     /// Puts the model's question to the user and waits for the answer.
@@ -348,6 +385,8 @@ const LATEST: &str = "\n\n[The user's latest message, verbatim:]\n\n";
 
 const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
 const NOT_ALLOWED: &str = "error: bit -p runs without a user, so this call needs --mode auto or a [bash] allow entry. hint: do without it, or tell the user how to allow it";
+const OPEN: &str = "sign in in your browser; if it didn't open, visit ";
+const SIGNED_IN: &str = "signed in to openai; its ChatGPT models are under chatgpt in /model";
 const NO_USER: &str =
     "error: bit -p runs without a user to answer. hint: decide yourself and say what you chose";
 
@@ -452,7 +491,11 @@ async fn listen(
                 let _ = replies.send(c);
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
-            Command::Submit(_) | Command::SetModel { .. } | Command::Clear | Command::Compact => {}
+            Command::Submit(_)
+            | Command::SetModel { .. }
+            | Command::Clear
+            | Command::Compact
+            | Command::Login => {}
         }
     }
 }
@@ -490,8 +533,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let session = Session::new(&dir.join("sessions"), "s1", &dir, "p", "m");
+        let auth = dir.join("auth.json");
         Agent {
-            client: llm::Client::new(&format!("http://{addr}"), "k", Vec::new()),
+            client: llm::Client::new(&format!("http://{addr}"), "k", Vec::new(), llm::Api::Chat),
             providers: Vec::new(),
             provider: "p".into(),
             tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir },
@@ -500,6 +544,7 @@ mod tests {
             session,
             no_key: None,
             remember: None,
+            auth,
             print: false,
         }
     }
@@ -909,6 +954,22 @@ mod tests {
         let end = Event::TurnEnd(StopReason::Error("error: K is not set. hint: export it".into()));
         assert_eq!(next(&mut ev).await, end);
         assert!(bodies.try_recv().is_err(), "nothing is sent without a key");
+    }
+
+    #[tokio::test]
+    async fn login_asks_for_the_provider_and_takes_only_openai() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "login");
+        let (cmds, mut ev, mut bodies) =
+            start(agent, Context::new("m", None, vec![]), l, vec![]).await;
+        cmds.send(Command::Login).unwrap();
+        let (id, question, options) =
+            ("login".into(), "Sign in to which provider?".into(), vec!["openai".into()]);
+        assert_eq!(next(&mut ev).await, Event::Ask { id, question, options });
+        cmds.send(Command::Answer { id: "login".into(), text: "gemini".into() }).unwrap();
+        let end = Event::TurnEnd(StopReason::Error("error: bit can sign in only to openai".into()));
+        assert_eq!(next(&mut ev).await, end);
+        assert!(bodies.try_recv().is_err(), "a login sends no model request");
     }
 
     #[test]
