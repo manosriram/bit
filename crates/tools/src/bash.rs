@@ -1,8 +1,7 @@
-use crate::{Ctx, cap, err};
+use crate::{Capped, Ctx, err};
 use serde::Deserialize;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[derive(Deserialize)]
@@ -24,8 +23,8 @@ pub async fn run(a: Args, cx: &Ctx) -> Result<String, String> {
         .spawn()
         .map_err(|e| err(format_args!("cannot start sh: {e}"), "check the working directory"))?;
     let group = Group(child.id().map_or(0, |id| id as i32));
-    let mut pipe = child.stdout.take().expect("stdout is piped");
-    let mut buf = Vec::new();
+    let pipe = child.stdout.take().expect("stdout is piped");
+    let mut out = Capped::new(cx);
     let done = tokio::time::timeout(Duration::from_secs(secs), async {
         let wait = async {
             let status = child.wait().await;
@@ -33,10 +32,10 @@ pub async fn run(a: Args, cx: &Ctx) -> Result<String, String> {
             group.kill();
             status
         };
-        tokio::join!(wait, pipe.read_to_end(&mut buf)).0
+        tokio::join!(wait, out.read(pipe)).0
     })
     .await;
-    let out = cap(String::from_utf8_lossy(&buf).into_owned(), cx);
+    let out = out.finish();
     match done {
         Ok(Ok(s)) if s.success() => Ok(if out.is_empty() { "(no output)".into() } else { out }),
         Ok(Ok(s)) => {

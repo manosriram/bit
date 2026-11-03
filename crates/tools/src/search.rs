@@ -1,6 +1,7 @@
-use crate::{Ctx, cap, err};
+use crate::{Capped, Ctx, err};
 use serde::Deserialize;
 use std::process::Stdio;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[derive(Deserialize)]
@@ -40,7 +41,7 @@ pub async fn glob(a: Glob, cx: &Ctx) -> Result<String, String> {
 /// The project's files for `@` completion, as `rg --files` lists them; empty without `rg`.
 pub fn files(cwd: &std::path::Path) -> Vec<String> {
     let out = std::process::Command::new("rg").arg("--files").current_dir(cwd).output();
-    let out = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let out = out.map(|o| crate::text(o.stdout)).unwrap_or_default();
     out.lines().take(50_000).map(Into::into).collect()
 }
 
@@ -49,24 +50,32 @@ async fn rg(mut args: Vec<&str>, path: Option<&str>, cx: &Ctx) -> Result<String,
     if let Some(p) = path {
         args.extend(["--", p]);
     }
-    let out = Command::new("rg")
+    let mut child = Command::new("rg")
         .args(args)
         .current_dir(&cx.cwd)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await
+        .spawn()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 err("rg is not installed", "install ripgrep, e.g. `brew install ripgrep`")
             }
             _ => err(format_args!("cannot start rg: {e}"), "try again"),
         })?;
-    match out.status.code() {
-        Some(0) => Ok(cap(String::from_utf8_lossy(&out.stdout).into_owned(), cx)),
+    // Both pipes at once, so a full stderr can't stall rg while stdout is read.
+    let (mut out, mut stderr) = (Capped::new(cx), Vec::new());
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut e = child.stderr.take().expect("stderr is piped");
+    let _ = tokio::join!(out.read(stdout), e.read_to_end(&mut stderr));
+    let status =
+        child.wait().await.map_err(|e| err(format_args!("waiting for rg: {e}"), "try again"))?;
+    match status.code() {
+        Some(0) => Ok(out.finish()),
         Some(1) => Ok("no matches".into()),
         _ => Err(err(
-            String::from_utf8_lossy(&out.stderr).trim().trim_start_matches("rg: "),
+            String::from_utf8_lossy(&stderr).trim().trim_start_matches("rg: "),
             "check the pattern and the path",
         )),
     }
