@@ -109,7 +109,7 @@ impl Term {
         done: &[String],
         frame: &[String],
         split: usize,
-        cursor: (usize, usize),
+        cursor: Option<(usize, usize)>,
     ) -> io::Result<()> {
         // Padding keeps the region at least as tall as the rows it replaces, so its last row
         // stays on the terminal's last row. It goes at `split`, so the rows above it (text
@@ -136,12 +136,18 @@ impl Term {
                 out.push_str("\r\n");
             }
         }
-        let row = cursor.0 + if cursor.0 >= split { pad } else { 0 };
+        // With no cursor to show it still parks on the box's first row, which the next
+        // frame's redraw starts from.
+        let at = cursor.unwrap_or((split, 0));
+        let row = at.0 + if at.0 >= split { pad } else { 0 };
         let up = rows.len() - 1 - row;
         if up > 0 {
             let _ = write!(out, "\x1b[{up}A");
         }
-        let _ = write!(out, "\x1b[{}G\x1b[?25h", cursor.1 + 1);
+        let _ = write!(out, "\x1b[{}G", at.1 + 1);
+        if cursor.is_some() {
+            out.push_str("\x1b[?25h");
+        }
         self.row = row;
         self.prev = rows;
         write(&out)

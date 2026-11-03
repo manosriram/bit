@@ -728,8 +728,8 @@ impl Ui {
     }
 
     /// The live region: unfinished text, then the input box. Returns the rows, where the box
-    /// starts (padding goes between the text and the box) and the cursor's (row, column).
-    fn frame(&self) -> (Vec<String>, usize, (usize, usize)) {
+    /// starts (padding goes between the text and the box) and the typing cursor, if any.
+    fn frame(&self) -> (Vec<String>, usize, Option<(usize, usize)>) {
         let w = self.width();
         let mut f = Vec::new();
         if !self.partial.is_empty() {
@@ -755,6 +755,11 @@ impl Ui {
             _ => None,
         };
         if let Some(cursor) = boxed {
+            let cursor = if self.question.is_some() || self.approval.is_some() {
+                None
+            } else {
+                Some(cursor)
+            };
             return (f, split, cursor);
         }
 
@@ -801,7 +806,7 @@ impl Ui {
         }
 
         f.push(self.status_border(DIM));
-        (f, split, (top + row, col + 2))
+        (f, split, Some((top + row, col + 2)))
     }
 
     /// The box for the model's question: the question, then the options and `something else`.
