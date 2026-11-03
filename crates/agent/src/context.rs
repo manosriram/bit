@@ -7,6 +7,8 @@ pub struct Context {
     /// the provider's prompt cache hits on every turn.
     prefix: String,
     pub(crate) model: String,
+    /// The working directory and its AGENTS.md, read once so the prefix stays fixed.
+    project: String,
     pub(crate) cache_key: Option<String>,
     /// Input tokens of the last request: how full the window is. 0 until one is sent.
     pub(crate) tokens: u32,
@@ -19,7 +21,8 @@ impl Context {
     /// history of a resumed session.
     pub fn new(model: &str, cache_key: Option<&str>, messages: Vec<Box<RawValue>>) -> Self {
         let (prefix, cache_key) = (String::new(), cache_key.map(str::to_owned));
-        let mut cx = Self { prefix, model: String::new(), cache_key, tokens: 0, messages };
+        let project = project();
+        let mut cx = Self { prefix, model: String::new(), project, cache_key, tokens: 0, messages };
         cx.set_model(model);
         // A crash can cut a turn short; mend it the same way a cancel would.
         // A lone user message is kept: on load it can only be a compaction summary.
@@ -38,10 +41,11 @@ impl Context {
         prefix.push_str(tools::SCHEMAS);
         prefix.push_str(",\"messages\":[");
         // Models take their name from the history otherwise, and keep the old one after a switch.
-        let prompt = match model {
-            "" => PROMPT.to_owned(),
-            m => format!("{PROMPT}\nYour model id is {m}. If asked which model you are, say {m}."),
-        };
+        let mut prompt = format!("{PROMPT}{}", self.project);
+        if !model.is_empty() {
+            prompt +=
+                &format!("\nYour model id is {model}. If asked which model you are, say {model}.");
+        }
         prefix.push_str(msg("system", &prompt).get());
         (self.prefix, self.model) = (prefix, model.into());
     }
@@ -96,6 +100,19 @@ impl Context {
         let window = llm::models::context(&self.model).unwrap_or(128_000);
         u64::from(self.tokens) * 10 > u64::from(window) * 7
     }
+}
+
+/// The working directory, and the project's instructions if it has an AGENTS.md.
+fn project() -> String {
+    let dir = std::env::current_dir().unwrap_or_default();
+    let mut s = format!("\nThe working directory is {}.\n", dir.display());
+    if let Ok(md) = std::fs::read_to_string(dir.join("AGENTS.md")) {
+        s += &format!(
+            "\nFollow the project's instructions from AGENTS.md:\n<agents_md>\n{}\n</agents_md>\n",
+            md.trim()
+        );
+    }
+    s
 }
 
 pub(crate) fn msg(role: &str, content: &str) -> Box<RawValue> {
