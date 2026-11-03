@@ -7,7 +7,7 @@ pub struct Context {
     /// the provider's prompt cache hits on every turn.
     prefix: String,
     pub(crate) model: String,
-    cache_key: Option<String>,
+    pub(crate) cache_key: Option<String>,
     /// Input tokens of the last request: how full the window is. 0 until one is sent.
     pub(crate) tokens: u32,
     pub(crate) messages: Vec<Box<RawValue>>,
@@ -37,7 +37,12 @@ impl Context {
         prefix.push_str(",\"tools\":");
         prefix.push_str(tools::SCHEMAS);
         prefix.push_str(",\"messages\":[");
-        prefix.push_str(msg("system", PROMPT).get());
+        // Models take their name from the history otherwise, and keep the old one after a switch.
+        let prompt = match model {
+            "" => PROMPT.to_owned(),
+            m => format!("{PROMPT}\nYour model id is {m}. If asked which model you are, say {m}."),
+        };
+        prefix.push_str(msg("system", &prompt).get());
         (self.prefix, self.model) = (prefix, model.into());
     }
 

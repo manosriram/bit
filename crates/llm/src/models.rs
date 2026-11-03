@@ -29,6 +29,11 @@ pub fn context(id: &str) -> Option<u32> {
     MODELS.iter().find(|m| m.1 == id).map(|m| m.2)
 }
 
+/// The built-in provider that serves `id`.
+pub fn provider_of(id: &str) -> Option<&'static str> {
+    MODELS.iter().find(|m| m.1 == id).map(|m| m.0)
+}
+
 /// The built-in model ids for `provider`.
 pub fn list(provider: &str) -> impl Iterator<Item = &'static str> {
     MODELS.iter().filter(move |m| m.0 == provider).map(|m| m.1)

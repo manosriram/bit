@@ -9,9 +9,39 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+/// One provider as `cmd` resolved it.
+#[derive(Clone)]
+pub struct Provider {
+    pub name: String,
+    pub base_url: String,
+    pub key_env: String,
+    /// The key, or the error a turn shows when it's missing.
+    pub key: Result<String, String>,
+    /// What the model picker offers for it.
+    pub models: Vec<String>,
+}
+
+/// The client for `p`. The session id routes OpenCode's cache to the server that saw it.
+pub fn connect(p: &Provider, session: &str) -> llm::Client {
+    let mut headers =
+        vec![("user-agent".into(), concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
+    if p.name == "opencode-go" {
+        headers.push(("x-opencode-session".into(), session.into()));
+    }
+    llm::Client::new(&p.base_url, p.key.as_deref().unwrap_or(""), headers)
+}
+
+/// The `prompt_cache_key` for `provider`: only OpenAI routes its cache by one.
+pub fn cache_key<'a>(provider: &str, session: &'a str) -> Option<&'a str> {
+    (provider == "openai").then_some(session)
+}
+
 /// Everything a session needs besides its history and channels.
 pub struct Agent {
     pub client: llm::Client,
+    /// Every provider, and the one `client` talks to.
+    pub providers: Vec<Provider>,
+    pub provider: String,
     pub tools: tools::Ctx,
     pub policy: Policy,
     pub mode: Mode,
@@ -48,11 +78,20 @@ pub async fn run(
                 auto.store(m == Mode::Auto, Relaxed);
                 continue;
             }
-            Command::SetModel(m) => {
+            Command::SetModel { provider, model: m } => {
+                if *provider != *agent.provider
+                    && let Some(p) = agent.providers.iter().find(|p| *p.name == *provider)
+                {
+                    let id = agent.session.id().to_owned();
+                    (agent.client, agent.no_key) = (connect(p, &id), p.key.clone().err());
+                    cx.cache_key = cache_key(&p.name, &id).map(Into::into);
+                    agent.provider = p.name.clone();
+                }
                 cx.set_model(&m);
-                if let Err(e) = agent.session.set_model(&m) {
+                if let Err(e) = agent.session.set_model(&agent.provider, &m) {
                     let _ = events.send(save_failed(&e));
                 }
+                let m = format!("{}/{m}", agent.provider);
                 if let Err(e) = remember(&agent.remember, &m) {
                     let n = format!(
                         "error: could not remember {m} for next time: {e}. hint: check that the state directory is writable"
@@ -387,7 +426,7 @@ async fn listen(
                 let _ = replies.send(c);
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
-            Command::Submit(_) | Command::SetModel(_) | Command::Clear | Command::Compact => {}
+            Command::Submit(_) | Command::SetModel { .. } | Command::Clear | Command::Compact => {}
         }
     }
 }
@@ -424,9 +463,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bit-agent-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let session = Session::new(&dir.join("sessions"), "s1", &dir, "m");
+        let session = Session::new(&dir.join("sessions"), "s1", &dir, "p", "m");
         Agent {
             client: llm::Client::new(&format!("http://{addr}"), "k", Vec::new()),
+            providers: Vec::new(),
+            provider: "p".into(),
             tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir },
             policy: Policy::new(Vec::new()),
             mode: Mode::Ask,
@@ -687,18 +728,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_model_switches_the_request_model() {
+    async fn set_model_switches_provider_and_model() {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut agent = agent(l.local_addr().unwrap(), "model");
-        let state = agent.tools.cwd.join("state/opencode-go.model");
+        let addr = l.local_addr().unwrap();
+        // The starting provider is unreachable; only the switch makes the request land.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let mut agent = agent(dead, "model");
+        let state = agent.tools.cwd.join("state/model");
         agent.remember = Some(state.clone());
+        agent.providers = vec![Provider {
+            name: "openai".into(),
+            base_url: format!("http://{addr}"),
+            key_env: "K".into(),
+            key: Ok("k".into()),
+            models: Vec::new(),
+        }];
         let cx = Context::new("", None, Vec::new());
         let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
-        cmds.send(Command::SetModel("m2".into())).unwrap();
+        cmds.send(Command::SetModel { provider: "openai".into(), model: "m2".into() }).unwrap();
         cmds.send(Command::Submit("hi".into())).unwrap();
         assert_eq!(next(&mut ev).await, Event::Text("a".into()));
-        assert!(bodies.recv().await.unwrap().starts_with(r#"{"model":"m2","#));
-        assert_eq!(std::fs::read_to_string(state).unwrap(), "m2");
+        let body = bodies.recv().await.unwrap();
+        assert!(body.starts_with(r#"{"model":"m2","prompt_cache_key":"s1","#), "{body}");
+        assert_eq!(std::fs::read_to_string(state).unwrap(), "openai/m2");
     }
 
     #[tokio::test]

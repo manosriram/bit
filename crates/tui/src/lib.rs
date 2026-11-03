@@ -47,8 +47,8 @@ const LOGO: [(&str, &str); 7] = [
 pub async fn run(
     cmds: UnboundedSender<Command>,
     events: UnboundedReceiver<Event>,
-    model: &str,
-    models: &[String],
+    (provider, model): (&str, &str),
+    providers: &[agent::Provider],
     mode: Mode,
     notices: &[String],
 ) -> io::Result<()> {
@@ -60,7 +60,7 @@ pub async fn run(
         let flags = ct::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
         execute!(io::stdout(), ct::PushKeyboardEnhancementFlags(flags))?;
     }
-    let r = event_loop(cmds, events, model, models, mode, notices).await;
+    let r = event_loop(cmds, events, (provider, model), providers, mode, notices).await;
     if kitty {
         let _ = execute!(io::stdout(), ct::PopKeyboardEnhancementFlags);
     }
@@ -72,8 +72,8 @@ pub async fn run(
 async fn event_loop(
     cmds: UnboundedSender<Command>,
     mut events: UnboundedReceiver<Event>,
-    model: &str,
-    models: &[String],
+    (provider, model): (&str, &str),
+    providers: &[agent::Provider],
     mode: Mode,
     notices: &[String],
 ) -> io::Result<()> {
@@ -90,8 +90,9 @@ async fn event_loop(
         }
     });
     let mut ui = Ui {
+        provider: provider.into(),
         model: model.into(),
-        models: models.into(),
+        providers: providers.into(),
         picker: None,
         menu: 0,
         wipe: false,
@@ -156,10 +157,11 @@ async fn event_loop(
 }
 
 struct Ui {
-    /// Empty until the user picks one.
+    /// The provider requests go to, and its model: empty until the user picks one.
+    provider: Box<str>,
     model: Box<str>,
-    /// What the model picker offers.
-    models: Vec<String>,
+    /// Every provider, with what the model picker offers for each.
+    providers: Vec<agent::Provider>,
     picker: Option<Picker>,
     /// The marked row of the slash-command list.
     menu: usize,
@@ -242,10 +244,11 @@ fn file_matches(files: &[String], query: &str) -> Vec<String> {
     found.into_iter().take(8).cloned().collect()
 }
 
-/// The models whose id contains `query`, ignoring case.
-fn search<'m>(models: &'m [String], query: &str) -> Vec<&'m str> {
+/// The (provider, model) pairs whose `provider model` contains `query`, ignoring case.
+fn search<'p>(providers: &'p [agent::Provider], query: &str) -> Vec<(&'p str, &'p str)> {
     let q = query.to_lowercase();
-    models.iter().map(String::as_str).filter(|m| m.to_lowercase().contains(&q)).collect()
+    let all = providers.iter().flat_map(|p| p.models.iter().map(|m| (p.name.as_str(), m.as_str())));
+    all.filter(|(p, m)| format!("{p} {m}").to_lowercase().contains(&q)).collect()
 }
 
 /// `j`/`k` and the arrows move `at` within `len` rows. `Enter` gives `Some(true)`, `Esc`
@@ -285,7 +288,7 @@ impl Ui {
             Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
             _ => dir.display().to_string(),
         };
-        let info = format!("  bit {} | {} | {dir}", env!("CARGO_PKG_VERSION"), self.model());
+        let info = format!("  bit v{} | {} | {dir}", env!("CARGO_PKG_VERSION"), self.model());
         self.done.extend([String::new(), l.add(DIM, clip(&info, self.width())).take()]);
     }
 
@@ -325,19 +328,19 @@ impl Ui {
                     } else if k.code == KeyCode::Backspace && p.query.pop().is_some() {
                         p.at = 0;
                     }
-                    let found = search(&self.models, &p.query);
+                    let found = search(&self.providers, &p.query);
                     let pick = match k.code {
                         KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc => {
                             nav(k.code, &mut p.at, found.len())
                         }
                         _ => None,
                     };
-                    let chosen = found.get(p.at).map(|m| Box::<str>::from(*m));
+                    let chosen = found.get(p.at).map(|&(p, m)| (p.into(), m.into()));
                     let then_submit = p.then_submit;
                     match (pick, chosen) {
-                        (Some(true), Some(m)) => {
+                        (Some(true), Some((p, m))) => {
                             self.picker = None;
-                            self.set_model(m, cmds);
+                            self.set_model(p, m, cmds);
                             if then_submit {
                                 self.submit(cmds);
                             }
@@ -433,9 +436,13 @@ impl Ui {
         if let Some(id) = self.input.text.trim().strip_prefix("/model")
             && (id.is_empty() || id.starts_with(' '))
         {
-            let id: Box<str> = id.trim().into();
+            let id = id.trim().to_owned();
             self.input.take();
-            return if id.is_empty() { self.pick(false) } else { self.set_model(id, cmds) };
+            if id.is_empty() {
+                return self.pick(false);
+            }
+            let (p, m) = self.resolve(&id);
+            return self.set_model(p, m, cmds);
         }
         if self.model.is_empty() {
             return self.pick(true);
@@ -453,10 +460,24 @@ impl Ui {
         (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
     }
 
-    fn set_model(&mut self, model: Box<str>, cmds: &UnboundedSender<Command>) {
-        self.event(Event::Notice(format!("model set to {model}").into()));
-        self.model = model;
-        let _ = cmds.send(Command::SetModel(self.model.clone()));
+    fn set_model(&mut self, provider: Box<str>, model: Box<str>, cmds: &UnboundedSender<Command>) {
+        self.event(Event::Notice(format!("model set to {provider}/{model}").into()));
+        (self.provider, self.model) = (provider.clone(), model.clone());
+        let _ = cmds.send(Command::SetModel { provider, model });
+    }
+
+    /// `/model` takes `provider/model`, or a model id: on the current provider if it lists
+    /// it, else on the first that does, else on the current one anyway.
+    fn resolve(&self, id: &str) -> (Box<str>, Box<str>) {
+        if let Some((p, m)) = id.split_once('/')
+            && self.providers.iter().any(|x| x.name == p)
+        {
+            return (p.into(), m.into());
+        }
+        let lists = |x: &&agent::Provider| x.models.iter().any(|m| m == id);
+        let current = self.providers.iter().filter(|x| *x.name == *self.provider);
+        let p = current.chain(&self.providers).find(lists).map(|x| x.name.as_str());
+        (p.unwrap_or(&self.provider).into(), id.into())
     }
 
     /// Whether `code` goes to the slash-command list: it is showing, and the key moves in
@@ -510,8 +531,8 @@ impl Ui {
     }
 
     fn pick(&mut self, then_submit: bool) {
-        if self.models.is_empty() {
-            let n = "error: bit knows no models for this provider. hint: pass --model, or set model in the config";
+        if self.providers.iter().all(|p| p.models.is_empty()) {
+            let n = "error: bit knows no models. hint: pass --model, or add models to a [providers.<name>] in the config";
             return self.event(Event::Notice(n.into()));
         }
         self.picker = Some(Picker { query: String::new(), at: 0, then_submit });
@@ -716,13 +737,31 @@ impl Ui {
             f.push(self.title("pick a model"));
             let cursor = (f.len(), 10 + str_width(&p.query));
             f.push(self.row("", &format!("search: {}", clean(&p.query))));
-            let found = search(&self.models, &p.query);
+            let found = search(&self.providers, &p.query);
             if found.is_empty() {
                 f.push(self.row(DIM, "  no match"));
             }
+            // A dim header above each provider's group; the mark is on a model row.
+            let (mut rows, mut mark) = (Vec::new(), 0);
+            for (i, &(prov, m)) in found.iter().enumerate() {
+                if i == 0 || found[i - 1].0 != prov {
+                    let x = self.providers.iter().find(|x| x.name == prov);
+                    let key = x.map_or(String::new(), |x| {
+                        format!("{}{}", x.key_env, if x.key.is_err() { " (not set)" } else { "" })
+                    });
+                    rows.push((DIM, format!("  {prov}  {key}")));
+                }
+                if i == p.at {
+                    mark = rows.len();
+                }
+                let (sgr, c) = if i == p.at { ("1", ">") } else { ("", " ") };
+                rows.push((sgr, format!("{c}   {m}")));
+            }
             let start =
-                p.at.saturating_sub(PICK_ROWS / 2).min(found.len().saturating_sub(PICK_ROWS));
-            self.list(&mut f, found.into_iter().skip(start).take(PICK_ROWS), p.at - start);
+                mark.saturating_sub(PICK_ROWS / 2).min(rows.len().saturating_sub(PICK_ROWS));
+            for (sgr, r) in rows.iter().skip(start).take(PICK_ROWS) {
+                f.push(self.row(sgr, r));
+            }
             f.push(self.status_border(YELLOW));
             return (f, split, cursor);
         }
@@ -831,8 +870,11 @@ impl Ui {
         mark
     }
 
-    fn model(&self) -> &str {
-        if self.model.is_empty() { "no model" } else { &self.model }
+    fn model(&self) -> String {
+        match self.model.is_empty() {
+            true => "no model".into(),
+            false => format!("{}/{}", self.provider, self.model),
+        }
     }
 
     fn status_border(&self, sgr: &str) -> String {

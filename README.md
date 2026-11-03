@@ -52,7 +52,9 @@ ask/auto, `Up`/`Down` earlier prompts, `/` commands.
 
 ## Providers
 
-Picked by `provider` in the config, or by the first API key found in the environment:
+`/model` lists the models of every provider and switches to the one you pick; bit
+starts on your last pick. Without one, it starts on `provider` in the config, or the first
+provider whose key is set:
 
 | Provider | Key |
 |---|---|
@@ -67,11 +69,14 @@ Picked by `provider` in the config, or by the first API key found in the environ
 ```toml
 model = "kimi-k3"
 provider = "opencode-go"
-models = ["my-model"]             # extra entries for /model
 
 [providers.local]                 # any OpenAI-compatible endpoint
 base_url = "http://localhost:8080/v1"
 api_key_env = "LOCAL_API_KEY"
+models = ["qwen3-coder"]          # what /model offers for it
+
+[providers.openai]                # extra models for a built-in provider
+models = ["gpt-5.1"]
 
 [bash]
 allow = ["cargo test", "git status"]   # run without asking

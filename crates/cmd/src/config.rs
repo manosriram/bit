@@ -3,22 +3,18 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub struct Config {
-    pub provider: String,
-    /// From `--model`.
-    pub model: Option<String>,
-    /// For a new session without `--model`: the last model picked, else the config's.
-    pub fallback: Option<String>,
-    /// Where the last picked model is kept, per provider.
+    /// Every provider: the built-in ones (with config overrides) then the config's own.
+    /// Those with a key set come first.
+    pub providers: Vec<agent::Provider>,
+    /// From the config's `provider` and `model`, else the first provider with a key.
+    pub configured: (String, Option<String>),
+    /// The last pick, as (provider, model), if its provider still exists.
+    pub last: Option<(String, String)>,
+    /// Where the last pick is kept.
     pub remember: Option<PathBuf>,
-    pub base_url: String,
-    /// The provider's key, or the error a turn shows when it needs one.
-    pub api_key: Result<String, String>,
-    pub headers: Vec<(Box<str>, Box<str>)>,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
-    /// What the model picker offers: config `models`, then the built-in ones.
-    pub models: Vec<String>,
-    /// Shown in the TUI at startup, e.g. a missing API key.
+    /// Shown in the TUI at startup.
     pub notices: Vec<String>,
 }
 
@@ -27,8 +23,6 @@ pub struct Config {
 struct File {
     model: Option<String>,
     provider: Option<String>,
-    #[serde(default)]
-    models: Vec<String>,
     #[serde(default)]
     providers: BTreeMap<String, Provider>,
     #[serde(default)]
@@ -45,10 +39,13 @@ struct Bash {
     unknown: toml::Table,
 }
 
+/// A built-in provider needs neither field; a new one needs both.
 #[derive(Deserialize)]
 struct Provider {
-    base_url: String,
-    api_key_env: String,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    #[serde(default)]
+    models: Vec<String>,
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -68,9 +65,9 @@ fn path() -> Option<PathBuf> {
     Some(base.join("bit/config.toml"))
 }
 
-pub fn load(model: Option<String>) -> Result<Config, String> {
+pub fn load() -> Result<Config, String> {
     let path = path().ok_or("error: cannot find the config directory. hint: set HOME")?;
-    let file: File = match std::fs::read_to_string(&path) {
+    let mut file: File = match std::fs::read_to_string(&path) {
         Ok(s) => toml::from_str(&s).map_err(|e| format!("error: {}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
         Err(e) => return Err(format!("error: {}: {e}", path.display())),
@@ -85,49 +82,53 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         eprintln!("bit: warning: unknown config key `{key}` in {}", path.display());
     }
 
-    let name = file.provider.as_deref().unwrap_or_else(|| {
-        BUILTIN.iter().find(|b| std::env::var_os(b.2).is_some()).map_or("deepseek", |b| b.0)
-    });
-    let builtin = BUILTIN.iter().find(|b| b.0 == name);
-    let (base_url, key_env) = match file.providers.get(name) {
-        Some(p) => (p.base_url.clone(), p.api_key_env.clone()),
-        None => builtin.map(|b| (b.1.to_owned(), b.2.to_owned())).ok_or_else(|| {
-            format!(
-                "error: unknown provider `{name}`. hint: add [providers.{name}] to {}",
-                path.display()
-            )
-        })?,
-    };
-    let api_key = std::env::var(&key_env).map_err(|_| {
-        format!(
-            "error: {key_env} is not set. hint: export it, or set api_key_env for {name} in {}",
-            path.display()
-        )
-    });
-    let mut models = file.models;
-    for m in agent::models::list(name) {
-        if !models.iter().any(|x| x == m) {
-            models.push(m.into());
-        }
+    let at = path.display();
+    let mut providers = Vec::new();
+    let names = BUILTIN.iter().map(|b| b.0.to_owned());
+    let extra: Vec<String> =
+        file.providers.keys().filter(|n| !BUILTIN.iter().any(|b| b.0 == *n)).cloned().collect();
+    for name in names.chain(extra) {
+        let builtin = BUILTIN.iter().find(|b| b.0 == name);
+        let conf = file.providers.remove(&name);
+        let pick = |c: Option<String>, b: Option<&str>, what: &str| {
+            c.or(b.map(Into::into)).ok_or_else(|| {
+                format!("error: [providers.{name}] needs {what}. hint: add it in {at}")
+            })
+        };
+        let (c_url, c_env, c_models) =
+            conf.map_or((None, None, Vec::new()), |c| (c.base_url, c.api_key_env, c.models));
+        let base_url = pick(c_url, builtin.map(|b| b.1), "base_url")?;
+        let key_env = pick(c_env, builtin.map(|b| b.2), "api_key_env")?;
+        let key = std::env::var(&key_env).map_err(|_| {
+            format!("error: {key_env} is not set. hint: export it, or set api_key_env for {name} in {at}")
+        });
+        let mut models = c_models;
+        let built: Vec<String> =
+            agent::models::list(&name).map(String::from).filter(|m| !models.contains(m)).collect();
+        models.extend(built);
+        providers.push(agent::Provider { name, base_url, key_env, key, models });
     }
-    let remember =
-        dir("XDG_STATE_HOME", ".local/state").map(|d| d.join(format!("bit/{name}.model")));
-    let headers = vec![("user-agent".into(), concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
+    providers.sort_by_key(|p| p.key.is_err());
+
+    let detected = providers.iter().find(|p| p.key.is_ok()).map_or("deepseek", |p| &p.name);
+    let name = file.provider.clone().unwrap_or_else(|| detected.into());
+    if !providers.iter().any(|p| p.name == name) {
+        return Err(format!(
+            "error: unknown provider `{name}`. hint: add [providers.{name}] to {at}"
+        ));
+    }
+    let remember = dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("bit/model"));
+    let last = remember.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| {
+        let (p, m) = s.trim().split_once('/')?;
+        let known = providers.iter().any(|x| x.name == p) && !m.is_empty();
+        known.then(|| (p.to_owned(), m.to_owned()))
+    });
     Ok(Config {
-        provider: name.into(),
-        fallback: remember
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|s| s.trim().to_owned())
-            .filter(|m| !m.is_empty())
-            .or(file.model),
+        providers,
+        configured: (name, file.model),
+        last,
         remember,
-        model,
-        base_url,
-        api_key,
-        headers,
         allow: file.bash.allow,
-        models,
         notices: Vec::new(),
     })
 }

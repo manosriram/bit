@@ -15,7 +15,10 @@ pub enum Command {
     Cancel,
     SetMode(Mode),
     /// Sent only while idle.
-    SetModel(Box<str>),
+    SetModel {
+        provider: Box<str>,
+        model: Box<str>,
+    },
     /// Drops the history. Sent only while idle.
     Clear,
     /// Summarizes the history now. Runs like a turn and ends with `TurnEnd`.

@@ -10,6 +10,7 @@ pub struct Session {
     /// The working directory for the header line, held until the first write so an empty
     /// session leaves no file.
     header: Option<PathBuf>,
+    provider: String,
     model: String,
     file: Option<File>,
     /// How many of the context's messages are already in the file.
@@ -27,17 +28,19 @@ struct Record<'a> {
     #[serde(borrow)]
     msg: Option<&'a RawValue>,
     cwd: Option<PathBuf>,
+    provider: Option<String>,
     model: Option<String>,
 }
 
 impl Session {
-    pub fn new(dir: &Path, id: &str, cwd: &Path, model: &str) -> Self {
+    pub fn new(dir: &Path, id: &str, cwd: &Path, provider: &str, model: &str) -> Self {
         let path = dir.join(format!("{id}.jsonl"));
-        Self { path, header: Some(cwd.into()), model: model.into(), file: None, logged: 0 }
+        let (provider, model) = (provider.into(), model.into());
+        Self { path, header: Some(cwd.into()), provider, model, file: None, logged: 0 }
     }
 
     pub fn open(path: &Path) -> io::Result<Loaded> {
-        let (mut messages, mut model) = (Vec::new(), String::new());
+        let (mut messages, mut provider, mut model) = (Vec::new(), String::new(), String::new());
         for line in BufReader::new(File::open(path)?).lines() {
             let line = line?;
             // A crash can tear the last line; everything before it is still good.
@@ -45,16 +48,24 @@ impl Session {
                 continue;
             };
             match (r.t, r.msg) {
-                ("header" | "model", _) => model = r.model.unwrap_or_default(),
+                ("header" | "model", _) => {
+                    (provider, model) =
+                        (r.provider.unwrap_or_default(), r.model.unwrap_or_default())
+                }
                 ("clear", _) => messages.clear(),
                 ("compact", Some(m)) => messages = vec![m.to_owned()],
                 ("msg", Some(m)) => messages.push(m.to_owned()),
                 _ => {}
             }
         }
-        let session =
-            Self { path: path.into(), header: None, model, file: None, logged: messages.len() };
+        let (path, logged) = (path.into(), messages.len());
+        let session = Self { path, header: None, provider, model, file: None, logged };
         Ok(Loaded { session, messages })
+    }
+
+    /// The provider of the last header or `model` record; empty in logs from before providers.
+    pub fn provider(&self) -> &str {
+        &self.provider
     }
 
     /// The model of the last header or `model` record.
@@ -85,12 +96,13 @@ impl Session {
     }
 
     /// Before the first write the header just changes; after it, a `model` record is added.
-    pub(crate) fn set_model(&mut self, model: &str) -> io::Result<()> {
-        self.model = model.into();
+    pub(crate) fn set_model(&mut self, provider: &str, model: &str) -> io::Result<()> {
+        (self.provider, self.model) = (provider.into(), model.into());
         if self.header.is_some() {
             return Ok(());
         }
-        self.write(&format!("{}\n", serde_json::json!({"t": "model", "model": model})))
+        let r = serde_json::json!({"t": "model", "provider": provider, "model": model});
+        self.write(&format!("{r}\n"))
     }
 
     /// Starts the history over; a resume then sees only what comes after.
@@ -110,7 +122,9 @@ impl Session {
 
     fn write(&mut self, lines: &str) -> io::Result<()> {
         let header = self.header.take().map(|cwd| {
-            let h = serde_json::json!({"t": "header", "v": 1, "cwd": cwd, "model": self.model});
+            let (p, m) = (&self.provider, &self.model);
+            let h =
+                serde_json::json!({"t": "header", "v": 1, "cwd": cwd, "provider": p, "model": m});
             format!("{h}\n")
         });
         let out = header.unwrap_or_default() + lines;
@@ -177,9 +191,9 @@ mod tests {
     fn writes_lazily_and_reads_back_exact_bytes() {
         let dir = std::env::temp_dir().join(format!("bit-session-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut s = Session::new(&dir, "abc123", Path::new("/w"), "");
+        let mut s = Session::new(&dir, "abc123", Path::new("/w"), "", "");
         s.append(&[]).unwrap();
-        s.set_model("m1").unwrap();
+        s.set_model("p1", "m1").unwrap();
         assert!(!dir.exists());
         // Odd spacing and key order must survive: the cache depends on the exact bytes.
         let msgs: Vec<Box<RawValue>> =
@@ -191,7 +205,7 @@ mod tests {
         let u = llm::Usage::default();
         s.usage(&u).unwrap();
         s.append(&msgs[1..]).unwrap();
-        s.set_model("m2").unwrap();
+        s.set_model("p2", "m2").unwrap();
         s.usage(&u).unwrap();
         s.sync().unwrap();
         // A torn line and an unknown record type are skipped.
@@ -203,9 +217,10 @@ mod tests {
             .unwrap();
 
         let log = std::fs::read_to_string(dir.join("abc123.jsonl")).unwrap();
-        assert!(log.starts_with(r#"{"cwd":"/w","model":"m1","t":"header","v":1}"#), "{log}");
+        let header = r#"{"cwd":"/w","model":"m1","provider":"p1","t":"header","v":1}"#;
+        assert!(log.starts_with(header), "{log}");
         let l = Session::open(&find(&dir, "abc").unwrap()).unwrap();
-        assert_eq!(l.session.model(), "m2");
+        assert_eq!((l.session.provider(), l.session.model()), ("p2", "m2"));
         assert_eq!(l.session.id(), "abc123");
         assert_eq!(l.session.logged, 2);
         let got: Vec<&str> = l.messages.iter().map(|m| m.get()).collect();
@@ -221,7 +236,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bit-session-clear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let m = |s: &str| RawValue::from_string(s.into()).unwrap();
-        let mut s = Session::new(&dir, "c1", Path::new("/w"), "m");
+        let mut s = Session::new(&dir, "c1", Path::new("/w"), "p", "m");
         s.clear().unwrap();
         s.append(&[m("1")]).unwrap();
         s.clear().unwrap();
