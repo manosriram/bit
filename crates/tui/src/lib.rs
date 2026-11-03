@@ -443,6 +443,8 @@ impl Ui {
                 let _ = cmds.send(Command::Clear);
                 self.done.clear();
                 (self.usage, self.section, self.wipe) = (None, None, true);
+                self.logo();
+                self.event(Event::Notice("conversation cleared with /clear".into()));
             }
             _ if self.model.is_empty() => self.pick(true),
             "/compact" => {
