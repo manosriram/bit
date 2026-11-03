@@ -11,7 +11,8 @@ pub struct Config {
     /// Where the last picked model is kept, per provider.
     pub remember: Option<PathBuf>,
     pub base_url: String,
-    pub api_key: String,
+    /// The provider's key, or the error a turn shows when it needs one.
+    pub api_key: Result<String, String>,
     pub headers: Vec<(Box<str>, Box<str>)>,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
@@ -97,13 +98,11 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
             )
         })?,
     };
-    let mut notices = Vec::new();
-    let api_key = std::env::var(&key_env).unwrap_or_else(|_| {
-        notices.push(format!(
+    let api_key = std::env::var(&key_env).map_err(|_| {
+        format!(
             "error: {key_env} is not set. hint: export it, or set api_key_env for {name} in {}",
             path.display()
-        ));
-        String::new()
+        )
     });
     let mut models = file.models;
     for m in agent::models::list(name) {
@@ -129,7 +128,7 @@ pub fn load(model: Option<String>) -> Result<Config, String> {
         headers,
         allow: file.bash.allow,
         models,
-        notices,
+        notices: Vec::new(),
     })
 }
 

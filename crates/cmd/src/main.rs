@@ -32,10 +32,6 @@ fn run(args: args::Args) -> Result<(), String> {
         return Ok(());
     }
     let mut cfg = config::load(args.model)?;
-    // Checked once here so a missing rg is a notice now, not a confusing tool error later.
-    if std::process::Command::new("rg").arg("--version").output().is_err() {
-        cfg.notices.push("error: rg (ripgrep) is not installed, so grep and glob will fail. hint: install it, e.g. `brew install ripgrep`".into());
-    }
     let cwd = std::env::current_dir().map_err(|e| format!("error: current directory: {e}"))?;
     let dir = config::sessions_dir()?;
     let found = match (&args.resume, args.cont) {
@@ -88,7 +84,12 @@ fn run(args: args::Args) -> Result<(), String> {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, ev_rx) = unbounded_channel();
         let agent = agent::Agent {
-            client: agent::Client::new(&cfg.base_url, &cfg.api_key, cfg.headers),
+            client: agent::Client::new(
+                &cfg.base_url,
+                cfg.api_key.as_deref().unwrap_or(""),
+                cfg.headers,
+            ),
+            no_key: cfg.api_key.err(),
             tools: agent::ToolCtx {
                 cwd,
                 spill: std::env::temp_dir().join(format!("bit-{}", std::process::id())),

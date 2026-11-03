@@ -16,6 +16,8 @@ pub struct Agent {
     pub policy: Policy,
     pub mode: Mode,
     pub session: Session,
+    /// Set when the provider's key is missing: each turn ends with this error, unsent.
+    pub no_key: Option<String>,
     /// Where a picked model is written, so the next session starts with it.
     pub remember: Option<PathBuf>,
 }
@@ -117,6 +119,9 @@ impl Turn<'_> {
         cx: &mut Context,
         replies: &mut UnboundedReceiver<Command>,
     ) -> Result<(), StopReason> {
+        if let Some(e) = &self.a.no_key {
+            return Err(StopReason::Error(e.as_str().into()));
+        }
         loop {
             if cx.full() {
                 self.compact(cx).await;
@@ -426,6 +431,7 @@ mod tests {
             policy: Policy::new(Vec::new()),
             mode: Mode::Ask,
             session,
+            no_key: None,
             remember: None,
         }
     }
@@ -759,6 +765,19 @@ mod tests {
         let _ = bodies.recv().await.unwrap();
         let b2 = bodies.recv().await.unwrap();
         assert!(b2.ends_with(r#"{"content":"b","role":"tool","tool_call_id":"q1"}]}"#), "{b2}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_ends_the_turn_without_a_request() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "nokey");
+        agent.no_key = Some("error: K is not set. hint: export it".into());
+        let cx = Context::new("m", None, Vec::new());
+        let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["x"], true)]).await;
+        cmds.send(Command::Submit("hi".into())).unwrap();
+        let end = Event::TurnEnd(StopReason::Error("error: K is not set. hint: export it".into()));
+        assert_eq!(next(&mut ev).await, end);
+        assert!(bodies.try_recv().is_err(), "nothing is sent without a key");
     }
 
     #[test]
