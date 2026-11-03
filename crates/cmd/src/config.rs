@@ -1,3 +1,4 @@
+use agent::providers::{self, Auth, auth::Cred};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -53,16 +54,6 @@ struct Provider {
     unknown: toml::Table,
 }
 
-/// (name, base_url, api key env var). `chatgpt` signs in instead, so its "variable" names
-/// the command that does it.
-const BUILTIN: &[(&str, &str, &str)] = &[
-    ("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
-    ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
-    ("chatgpt", "https://chatgpt.com/backend-api/codex", "/login"),
-    // https://opencode.ai/v2/docs/console/go/; only its Chat Completions models work.
-    ("opencode-go", "https://opencode.ai/inference/go/openai/v1", "OPENCODE_API_KEY"),
-];
-
 pub fn load() -> Result<Config, String> {
     // Everything bit keeps lives here: config, credentials, the last pick, sessions.
     let home = || std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"));
@@ -85,13 +76,13 @@ pub fn load() -> Result<Config, String> {
     }
 
     let at = path.display();
-    let mut saved = agent::login::load(&auth)?;
+    let mut saved = providers::auth::load(&auth)?;
     let mut providers = Vec::new();
-    let names = BUILTIN.iter().map(|b| b.0.to_owned());
+    let names = providers::ALL.iter().map(|s| s.name.to_owned());
     let extra: Vec<String> =
-        file.providers.keys().filter(|n| !BUILTIN.iter().any(|b| b.0 == *n)).cloned().collect();
+        file.providers.keys().filter(|n| providers::find(n).is_none()).cloned().collect();
     for name in names.chain(extra) {
-        let builtin = BUILTIN.iter().find(|b| b.0 == name);
+        let builtin = providers::find(&name);
         let conf = file.providers.remove(&name);
         let pick = |c: Option<String>, b: Option<&str>, what: &str| {
             c.or(b.map(Into::into)).ok_or_else(|| {
@@ -100,10 +91,10 @@ pub fn load() -> Result<Config, String> {
         };
         let (c_url, c_env, c_models) =
             conf.map_or((None, None, Vec::new()), |c| (c.base_url, c.api_key_env, c.models));
-        let base_url = pick(c_url, builtin.map(|b| b.1), "base_url")?;
-        let key_env = pick(c_env, builtin.map(|b| b.2), "api_key_env")?;
-        let key = match &*name {
-            "chatgpt" => chatgpt(&auth),
+        let base_url = pick(c_url, builtin.map(|s| s.base_url), "base_url")?;
+        let key_env = pick(c_env, builtin.map(|s| s.key_env()), "api_key_env")?;
+        let key = match builtin.map(|s| (s, &s.auth)) {
+            Some((s, Auth::Oauth(_))) => signed_in(s, &auth),
             _ => api_key(&name, &key_env, std::env::var(&key_env).ok(), saved.remove(&name), &auth),
         };
         let mut models = c_models;
@@ -114,7 +105,8 @@ pub fn load() -> Result<Config, String> {
     }
     providers.sort_by_key(|p| p.key.is_err());
 
-    let detected = providers.iter().find(|p| p.key.is_ok()).map_or("deepseek", |p| &p.name);
+    let detected =
+        providers.iter().find(|p| p.key.is_ok()).map_or(providers::ALL[0].name, |p| &p.name);
     let name = file.provider.clone().unwrap_or_else(|| detected.into());
     if !providers.iter().any(|p| p.name == name) {
         return Err(format!(
@@ -143,11 +135,11 @@ fn api_key(
     name: &str,
     key_env: &str,
     env: Option<String>,
-    saved: Option<agent::login::Cred>,
+    saved: Option<Cred>,
     auth: &std::path::Path,
 ) -> Result<String, String> {
     match (env, saved) {
-        (Some(k), _) | (None, Some(agent::login::Cred::ApiKey { key: k })) => Ok(k),
+        (Some(k), _) | (None, Some(Cred::ApiKey { key: k })) => Ok(k),
         _ => Err(format!(
             "error: {key_env} is not set. hint: export it, or add {name} to {}",
             auth.display()
@@ -157,14 +149,14 @@ fn api_key(
 
 /// The saved sign-in. Its own runtime, since a refresh is a request and the session's
 /// runtime starts later.
-fn chatgpt(auth: &std::path::Path) -> Result<String, String> {
+fn signed_in(s: &providers::Spec, auth: &std::path::Path) -> Result<String, String> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
-    rt.map_err(|e| e.to_string())?.block_on(agent::login::token(auth))
+    rt.map_err(|e| e.to_string())?.block_on(providers::token(s, auth))
 }
 
 #[cfg(test)]
 mod tests {
-    use agent::login::Cred;
+    use agent::providers::auth::Cred;
     use std::path::Path;
 
     #[test]

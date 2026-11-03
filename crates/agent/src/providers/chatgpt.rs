@@ -1,12 +1,11 @@
-//! `auth.json`, the saved credentials (one entry per provider), and "Sign in with ChatGPT"
-//! for the `chatgpt` provider: the OAuth flow Codex CLI uses (PKCE, with the browser sent
-//! back to localhost:1455). bit keeps its own tokens, since refresh tokens rotate and
-//! sharing Codex's file would sign one of the two out.
+//! A ChatGPT plan, signed in with the OAuth flow Codex CLI uses (PKCE, with the browser sent
+//! back to localhost:1455), and served over the Responses API. bit keeps its own tokens,
+//! since refresh tokens rotate and sharing Codex's file would sign one of the two out.
 
+use super::auth::{Cred, Tokens, load, save};
+use super::{Auth, Spec};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -17,29 +16,20 @@ const REDIRECT: &str = "http://localhost:1455/auth/callback";
 const EARLY: u64 = 24 * 3600;
 const AGAIN: &str = "hint: run /login";
 
-/// One provider's entry in `auth.json`, by provider name.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Cred {
-    ApiKey { key: String },
-    Oauth(Tokens),
-}
-
-/// A sign-in, as saved and as a token reply: a refresh may leave out the refresh token.
-#[derive(Serialize, Deserialize)]
-pub struct Tokens {
-    access_token: String,
-    refresh_token: Option<String>,
-}
-
-/// The saved credentials; none when the file doesn't exist yet.
-pub fn load(path: &Path) -> Result<BTreeMap<String, Cred>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("error: {}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(format!("error: {}: {e}", path.display())),
-    }
-}
+pub const SPEC: Spec = Spec {
+    name: "chatgpt",
+    base_url: "https://chatgpt.com/backend-api/codex",
+    wire: llm::Api::Responses,
+    auth: Auth::Oauth("openai"),
+    cache_key: true,
+    headers: |session, key| {
+        vec![
+            ("session_id", session.into()),
+            ("originator", "bit".into()),
+            ("chatgpt-account-id", account(key)),
+        ]
+    },
+};
 
 /// Opens the sign-in page (its URL goes to `show` too, in case no browser opens), waits for
 /// the browser to come back, and saves the tokens in `path`. Gives the access token.
@@ -102,7 +92,7 @@ pub async fn sign_in(path: &Path, show: impl FnOnce(&str)) -> Result<String, Str
     ];
     let t = exchange(&grant).await?;
     let (access, mut creds) = (t.access_token.clone(), load(path)?);
-    creds.insert("chatgpt".into(), Cred::Oauth(t));
+    creds.insert(SPEC.name.into(), Cred::Oauth(t));
     save(path, &creds)?;
     Ok(access)
 }
@@ -110,7 +100,7 @@ pub async fn sign_in(path: &Path, show: impl FnOnce(&str)) -> Result<String, Str
 /// The saved access token, refreshed first when it's about to expire.
 pub async fn token(path: &Path) -> Result<String, String> {
     let mut creds = load(path)?;
-    let Some(Cred::Oauth(t)) = creds.get_mut("chatgpt") else {
+    let Some(Cred::Oauth(t)) = creds.get_mut(SPEC.name) else {
         return Err(format!("error: not signed in to ChatGPT. {AGAIN}"));
     };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
@@ -133,7 +123,7 @@ pub async fn token(path: &Path) -> Result<String, String> {
 }
 
 /// The ChatGPT account id from the token's claims, which the backend wants as a header.
-pub(crate) fn account(token: &str) -> String {
+fn account(token: &str) -> String {
     claims(token)["https://api.openai.com/auth"]["chatgpt_account_id"].as_str().unwrap_or("").into()
 }
 
@@ -161,18 +151,6 @@ async fn exchange(fields: &[(&str, &str)]) -> Result<Tokens, String> {
     serde_json::from_str(&body).map_err(|e| fail(&e))
 }
 
-/// Owner-only, since the keys and tokens are as good as a password.
-fn save(path: &Path, creds: &BTreeMap<String, Cred>) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let fail = |e: std::io::Error| format!("error: {}: {e}", path.display());
-    std::fs::create_dir_all(path.parent().unwrap_or(path)).map_err(fail)?;
-    let json = serde_json::to_string_pretty(creds).unwrap_or_default();
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true).mode(0o600);
-    o.open(path).and_then(|mut f| f.write_all(json.as_bytes())).map_err(fail)
-}
-
 /// `application/x-www-form-urlencoded`, which is also a valid query string.
 fn form(fields: &[(&str, &str)]) -> String {
     let safe = |b: &u8| b.is_ascii_alphanumeric() || b"-._~".contains(b);
@@ -185,46 +163,15 @@ fn form(fields: &[(&str, &str)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::auth::dir;
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn dir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("bit-login-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
+    use std::collections::BTreeMap;
 
     /// A token that expires in `secs`, for account `acc-1`. Unsigned: bit never checks.
     fn jwt(secs: u64) -> String {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
         let claims = serde_json::json!({"exp": now.as_secs() + secs, "https://api.openai.com/auth": {"chatgpt_account_id": "acc-1"}});
         format!("h.{}.s", B64.encode(claims.to_string()))
-    }
-
-    #[test]
-    fn auth_json_holds_api_keys_and_sign_ins_and_is_saved_owner_only() {
-        let path = dir("format").join("auth.json");
-        let file = r#"{"deepseek":{"type":"api_key","key":"sk-1"},"chatgpt":{"type":"oauth","access_token":"a","refresh_token":"r"}}"#;
-        let creds: BTreeMap<String, Cred> = serde_json::from_str(file).unwrap();
-        assert!(matches!(&creds["deepseek"], Cred::ApiKey { key } if key == "sk-1"));
-        assert!(matches!(&creds["chatgpt"], Cred::Oauth(t) if t.access_token == "a"));
-        save(&path, &creds).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        let back = serde_json::to_string(&load(&path).unwrap()).unwrap();
-        assert_eq!(
-            back,
-            r#"{"chatgpt":{"type":"oauth","access_token":"a","refresh_token":"r"},"deepseek":{"type":"api_key","key":"sk-1"}}"#
-        );
-    }
-
-    #[test]
-    fn a_missing_file_is_no_credentials_and_a_bad_one_names_itself() {
-        let path = dir("missing").join("auth.json");
-        assert!(load(&path).unwrap().is_empty());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"{"x":{"type":"nope"}}"#).unwrap();
-        let e = load(&path).err().unwrap();
-        assert!(e.contains("auth.json") && e.contains("unknown variant"), "{e}");
     }
 
     #[tokio::test]
@@ -235,7 +182,7 @@ mod tests {
         creds.insert("deepseek".into(), Cred::ApiKey { key: "sk-1".into() });
         assert!(token(&path).await.unwrap_err().contains("not signed in"));
         let t = Tokens { access_token: access.clone(), refresh_token: Some("r".into()) };
-        creds.insert("chatgpt".into(), Cred::Oauth(t));
+        creds.insert(SPEC.name.into(), Cred::Oauth(t));
         save(&path, &creds).unwrap();
         // More than a day left, so no refresh request is made.
         assert_eq!(token(&path).await.unwrap(), access);

@@ -1,7 +1,7 @@
 use crate::context::{Context, msg, tool_msg};
-use crate::login;
 use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
+use crate::providers::{self, Auth};
 use crate::session::Session;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -22,28 +22,20 @@ pub struct Provider {
     pub models: Vec<String>,
 }
 
-/// The client for `p`. The session id routes OpenCode's and ChatGPT's cache to the server
-/// that saw it. Only `chatgpt` speaks the Responses API.
+/// The client for `p`, as its spec says. A provider from the config speaks Chat Completions
+/// with no extra headers.
 pub fn connect(p: &Provider, session: &str) -> llm::Client {
     let key = p.key.as_deref().unwrap_or("");
+    let spec = providers::find(&p.name);
     let mut headers = vec![("user-agent", concat!("bit/", env!("CARGO_PKG_VERSION")).into())];
-    match &*p.name {
-        "opencode-go" => headers.push(("x-opencode-session", session.into())),
-        "chatgpt" => headers.extend([
-            ("session_id", session.into()),
-            ("originator", "bit".into()),
-            ("chatgpt-account-id", login::account(key)),
-        ]),
-        _ => {}
-    }
+    headers.extend(spec.map(|s| (s.headers)(session, key)).unwrap_or_default());
     let headers = headers.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
-    let api = if p.name == "chatgpt" { llm::Api::Responses } else { llm::Api::Chat };
-    llm::Client::new(&p.base_url, key, headers, api)
+    llm::Client::new(&p.base_url, key, headers, spec.map_or(llm::Api::Chat, |s| s.wire))
 }
 
-/// The `prompt_cache_key` for `provider`: OpenAI and ChatGPT route their cache by one.
+/// The `prompt_cache_key` for `provider`, if it routes its cache by one.
 pub fn cache_key<'a>(provider: &str, session: &'a str) -> Option<&'a str> {
-    matches!(provider, "openai" | "chatgpt").then_some(session)
+    providers::find(provider).is_some_and(|s| s.cache_key).then_some(session)
 }
 
 /// Everything a session needs besides its history and channels.
@@ -219,25 +211,31 @@ impl Turn<'_> {
         }
     }
 
-    /// `/login`: asks which provider, then signs in. Only `openai` has a sign-in: a ChatGPT
-    /// plan, served as the `chatgpt` provider.
+    /// `/login`: asks which provider, then signs in to the one that choice stands for.
     async fn login(&mut self, replies: &mut UnboundedReceiver<Command>) -> Result<(), StopReason> {
         let fail = |e: &str| StopReason::Error(e.into());
-        let (question, options) = ("Sign in to which provider?".into(), vec!["openai".into()]);
-        self.send(Event::Ask { id: "login".into(), question, options });
-        match reply(replies, "login").await {
-            Some(Command::Answer { text, .. }) if text == "openai" => {}
-            _ => return Err(fail("error: bit can sign in only to openai")),
-        }
+        let choices: Vec<_> = (providers::ALL.iter())
+            .filter_map(|s| if let Auth::Oauth(c) = s.auth { Some((c, *s)) } else { None })
+            .collect();
+        let options: Vec<Box<str>> = choices.iter().map(|c| c.0.into()).collect();
+        let question = "Sign in to which provider?".into();
+        self.send(Event::Ask { id: "login".into(), question, options: options.clone() });
+        let spec = match reply(replies, "login").await {
+            Some(Command::Answer { text, .. }) => choices.iter().find(|c| c.0 == text),
+            _ => None,
+        };
+        let Some(&(_, spec)) = spec else {
+            return Err(fail(&format!("error: bit can sign in only to {}", options.join(", "))));
+        };
         let show = |url: &str| self.send(Event::Notice(format!("{OPEN}{url}").into()));
-        let key = login::sign_in(&self.a.auth, show).await.map_err(|e| fail(&e))?;
-        if let Some(p) = self.a.providers.iter_mut().find(|p| p.name == "chatgpt") {
+        let key = providers::sign_in(spec, &self.a.auth, show).await.map_err(|e| fail(&e))?;
+        if let Some(p) = self.a.providers.iter_mut().find(|p| p.name == spec.name) {
             p.key = Ok(key);
-            if self.a.provider == "chatgpt" {
+            if self.a.provider == spec.name {
                 (self.a.client, self.a.no_key) = (connect(p, self.a.session.id()), None);
             }
         }
-        self.send(Event::SignedIn("chatgpt".into()));
+        self.send(Event::SignedIn(spec.name.into()));
         self.send(Event::Notice(SIGNED_IN.into()));
         Ok(())
     }

@@ -1,7 +1,7 @@
 mod context;
-pub mod login;
 mod policy;
 pub mod proto;
+pub mod providers;
 mod run;
 pub mod session;
 
