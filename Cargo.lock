@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "llm",
  "serde",
@@ -50,7 +50,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bit"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "agent",
  "lexopt",
@@ -637,7 +637,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "llm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "reqwest",
  "serde",
@@ -1367,7 +1367,7 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tools"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "libc",
  "serde",
@@ -1447,7 +1447,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "agent",
  "crossterm",
