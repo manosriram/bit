@@ -177,8 +177,7 @@ struct Ui {
     question: Option<Question>,
     /// Set by `something else`: the next `Enter` answers this `ask` call with the input.
     answering: Option<Box<str>>,
-    /// The answer is an API key: drawn as dots, never kept in the input history.
-    /// The key prompt while a pasted key is hidden.
+    /// The answer is an API key, with this prompt: drawn as dots, never kept in the history.
     secret: Option<Box<str>>,
     /// Whether the last scrollback rows were tool lines (`true`) or model text (`false`),
     /// so a blank row can separate the two.
@@ -645,7 +644,7 @@ impl Ui {
             Event::ToolEnd { ok, preview, output, .. } => {
                 if let Some((name, summary, diff)) = self.tool.take() {
                     self.tool_line(&name, &summary, ok, &preview);
-                    if &*name == "bash" {
+                    if &*name == "bash" || matches!(&*name, "read" | "grep" | "glob") {
                         self.tail(&output);
                     } else if ok {
                         self.diff(&diff);
@@ -795,13 +794,10 @@ impl Ui {
             (.., Some(p)) => Some(self.picker_box(p, &mut f)),
             _ => None,
         };
+        // A question or an approval is picked from, so it has no typing cursor.
         if let Some(cursor) = boxed {
-            let cursor = if self.question.is_some() || self.approval.is_some() {
-                None
-            } else {
-                Some(cursor)
-            };
-            return (f, split, cursor);
+            let typing = self.question.is_none() && self.approval.is_none();
+            return (f, split, typing.then_some(cursor));
         }
 
         // Command and file suggestions pop up above the box, like a menu from a bottom bar.

@@ -216,49 +216,27 @@ impl Turn<'_> {
     /// edit the file.
     async fn login(&mut self, replies: &mut UnboundedReceiver<Command>) -> Result<(), StopReason> {
         let fail = |e: &str| StopReason::Error(e.into());
-        let kinds: Vec<Box<str>> = vec![SIGN_IN.into(), API_KEY.into()];
-        let question = "Log in with?".into();
-        self.send(Event::Ask { id: "login-kind".into(), question, options: kinds });
-        let oauth = match reply(replies, "login-kind").await {
-            Some(Command::Answer { text, .. }) if text.trim() == SIGN_IN => true,
-            Some(Command::Answer { text, .. }) if text.trim() == API_KEY => false,
+        let options = vec![SIGN_IN.into(), API_KEY.into()];
+        self.send(Event::Ask { id: "login-kind".into(), question: "Log in with?".into(), options });
+        let oauth = match answer(replies, "login-kind").await.unwrap_or_default().trim() {
+            SIGN_IN => true,
+            API_KEY => false,
             _ => return Err(fail(&format!("error: pick {SIGN_IN} or {API_KEY}"))),
         };
-        let is_oauth =
-            |name: &str| providers::find(name).is_some_and(|s| matches!(s.auth, Auth::Oauth));
-        let options: Vec<Box<str>> = self
-            .a
-            .providers
-            .iter()
-            .filter(|p| is_oauth(&p.name) == oauth)
-            .map(|p| {
-                format!("{} {}", p.name, if p.key.is_ok() { CONNECTED } else { NOT_CONNECTED })
-                    .into()
-            })
-            .collect();
+        let is_oauth = |p: &&Provider| {
+            providers::find(&p.name).is_some_and(|s| matches!(s.auth, Auth::Oauth)) == oauth
+        };
+        let kind: Vec<&Provider> = self.a.providers.iter().filter(is_oauth).collect();
+        let status = |p: &Provider| if p.key.is_ok() { CONNECTED } else { NOT_CONNECTED };
+        let options = kind.iter().map(|p| format!("{} {}", p.name, status(p)).into()).collect();
         let question = "Sign in to which provider?".into();
-        self.send(Event::Ask { id: "login".into(), question, options: options.clone() });
-        let p = match reply(replies, "login").await {
-            Some(Command::Answer { text, .. }) => self
-                .a
-                .providers
-                .iter()
-                .find(|p| {
-                    text.split_whitespace().next() == Some(&*p.name) && is_oauth(&p.name) == oauth
-                })
-                .cloned(),
-            _ => None,
+        self.send(Event::Ask { id: "login".into(), question, options });
+        let text = answer(replies, "login").await.unwrap_or_default();
+        let Some(p) = kind.iter().find(|p| text.split_whitespace().next() == Some(&*p.name)) else {
+            let names: Vec<&str> = kind.iter().map(|p| p.name.as_str()).collect();
+            return Err(fail(&format!("error: pick one of {}", names.join(", "))));
         };
-        let Some(p) = p else {
-            return Err(fail(&format!(
-                "error: pick one of {}",
-                options
-                    .iter()
-                    .filter_map(|o| o.split_whitespace().next())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        };
+        let p = (*p).clone();
         let key = match providers::find(&p.name) {
             Some(s) if matches!(s.auth, Auth::Oauth) => {
                 let show = |url: &str| self.send(Event::Notice(format!("{OPEN}{url}").into()));
@@ -267,10 +245,7 @@ impl Turn<'_> {
             _ => {
                 let prompt = format!("enter your {} API key ({}), then Enter", p.name, p.key_env);
                 self.send(Event::Secret { id: "key".into(), prompt: prompt.into() });
-                let key = match reply(replies, "key").await {
-                    Some(Command::Answer { text, .. }) => text.trim().to_owned(),
-                    _ => String::new(),
-                };
+                let key = answer(replies, "key").await.unwrap_or_default().trim().to_owned();
                 if key.is_empty() {
                     return Err(fail("error: no key given. hint: run /login again"));
                 }
@@ -308,10 +283,8 @@ impl Turn<'_> {
             question,
             options: options.map(Into::into).collect(),
         });
-        let content = match reply(replies, id).await {
-            Some(Command::Answer { text, .. }) => text,
-            _ => "error: the user gave no answer".into(),
-        };
+        let content =
+            answer(replies, id).await.unwrap_or_else(|| "error: the user gave no answer".into());
         tools::Output { ok: true, content }
     }
 
@@ -535,6 +508,14 @@ async fn reply(replies: &mut UnboundedReceiver<Command>, id: &str) -> Option<Com
         {
             return Some(c);
         }
+    }
+}
+
+/// The text of the user's `Answer` to `id`; `None` if the UI is gone.
+async fn answer(replies: &mut UnboundedReceiver<Command>, id: &str) -> Option<String> {
+    match reply(replies, id).await? {
+        Command::Answer { text, .. } => Some(text),
+        _ => None,
     }
 }
 
