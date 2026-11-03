@@ -95,7 +95,7 @@ pub fn load() -> Result<Config, String> {
         let key_env = pick(c_env, builtin.map(|s| s.key_env()), "api_key_env")?;
         let key = match builtin.map(|s| (s, &s.auth)) {
             Some((s, Auth::Oauth)) => signed_in(s, &auth),
-            _ => api_key(&name, &key_env, std::env::var(&key_env).ok(), saved.remove(&name), &auth),
+            _ => api_key(&name, &key_env, std::env::var(&key_env).ok(), saved.remove(&name)),
         };
         let mut models = c_models;
         let built: Vec<String> =
@@ -136,13 +136,11 @@ fn api_key(
     key_env: &str,
     env: Option<String>,
     saved: Option<Cred>,
-    auth: &std::path::Path,
 ) -> Result<String, String> {
     match (env, saved) {
         (Some(k), _) | (None, Some(Cred::ApiKey { key: k })) => Ok(k),
         _ => Err(format!(
-            "error: {key_env} is not set. hint: export it, or add {name} to {}",
-            auth.display()
+            "error: {key_env} is not set. hint: run /login to add your {name} key, or export it"
         )),
     }
 }
@@ -157,26 +155,18 @@ fn signed_in(s: &providers::Spec, auth: &std::path::Path) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use agent::providers::auth::Cred;
-    use std::path::Path;
 
     #[test]
     fn the_environment_wins_over_a_saved_key() {
         let key = |env: Option<&str>, saved: Option<&str>| {
             let saved = saved.map(|k| Cred::ApiKey { key: k.into() });
-            super::api_key(
-                "deepseek",
-                "DEEPSEEK_API_KEY",
-                env.map(Into::into),
-                saved,
-                Path::new("a.json"),
-            )
+            super::api_key("deepseek", "DEEPSEEK_API_KEY", env.map(Into::into), saved)
         };
         assert_eq!(key(Some("env"), Some("file")), Ok("env".into()));
         assert_eq!(key(None, Some("file")), Ok("file".into()));
         assert_eq!(
             key(None, None),
-            Err("error: DEEPSEEK_API_KEY is not set. hint: export it, or add deepseek to a.json"
-                .into())
+            Err("error: DEEPSEEK_API_KEY is not set. hint: run /login to add your deepseek key, or export it".into())
         );
     }
 }
