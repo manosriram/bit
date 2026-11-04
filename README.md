@@ -123,3 +123,7 @@ and the full text is saved to a file the model can page through.
 
 Each conversation is a JSONL log in `~/.config/bit/sessions/<id>.jsonl`, written
 after every step, so a resumed session sends the same bytes a running one would.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
