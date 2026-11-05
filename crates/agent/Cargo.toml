@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["sync", "macros", "time", "net", "io-util",
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 aws-lc-rs = { version = "1", default-features = false }
 base64 = "0.23"
+libc = "0.2"
 mlua = { version = "0.12", features = ["lua54", "vendored", "send"] }
 
 [dev-dependencies]

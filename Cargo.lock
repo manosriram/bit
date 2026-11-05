@@ -8,6 +8,7 @@ version = "0.0.2"
 dependencies = [
  "aws-lc-rs",
  "base64",
+ "libc",
  "llm",
  "mlua",
  "reqwest",

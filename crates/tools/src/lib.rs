@@ -24,6 +24,16 @@ pub const SCHEMAS: &str = r#"[
 {"type":"function","function":{"name":"glob","description":"List files matching a glob, e.g. *.rs or src/**/mod.rs. Respects .gitignore.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}}
 ]"#;
 
+/// Sends SIGKILL to a child process group; non-positive IDs are ignored.
+pub fn kill_process_group(id: i32) {
+    if id > 0 {
+        // SAFETY: kill(2) takes plain integers; a negative pid signals the group.
+        unsafe {
+            libc::kill(-id, libc::SIGKILL);
+        }
+    }
+}
+
 pub struct Ctx {
     pub cwd: PathBuf,
     /// Directory for spill files; created on first use.

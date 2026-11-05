@@ -58,12 +58,7 @@ struct Group(i32);
 
 impl Group {
     fn kill(&self) {
-        if self.0 > 0 {
-            // SAFETY: kill(2) takes plain integers; a negative pid signals the group.
-            unsafe {
-                libc::kill(-self.0, libc::SIGKILL);
-            }
-        }
+        crate::kill_process_group(self.0);
     }
 }
 

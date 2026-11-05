@@ -29,7 +29,9 @@
 --   run(cmd [, { timeout = s }])  -> output, exit_code
 --       cmd as a table runs argv directly: run{ "git", "status" }
 --       cmd as a string runs through sh -c: run("git log | head")
---       stderr comes after stdout; the timeout is at most the hook's remaining budget
+--       stderr comes after stdout; combined output is limited to 1 MiB
+--       timeout must be finite and non-negative, at most the hook's remaining budget
+--       the process group is killed on exit, error or timeout
 --   read(path)                    -> text, or nil, err; relative paths start at cwd
 --   ask(question [, options])     -> the human's answer; "" when headless
 --   print(...)                    a note to the human: max 20 lines, no colours; the
@@ -192,7 +194,8 @@ end
 --     number, integer, boolean, array, object. A ? after the type makes it optional.
 --   * Parameters named cwd, mode or headless are filled in by bit, not the model.
 --   * Whatever it returns is the result: a string as is, a table as JSON. error("…")
---     becomes a failed result the model can read.
+--     becomes a failed result the model can read. Cyclic/deep tables (over 64 levels)
+--     and oversized JSON conversions are rejected.
 --   * In ask mode the human approves each call, like bash; auto mode runs it.
 --   * before_<name> and after_<name> work on it like on any built-in tool.
 ---------------------------------------------------------------------------------------

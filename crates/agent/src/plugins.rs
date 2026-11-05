@@ -7,6 +7,8 @@ use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -17,6 +19,8 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 const BEFORE: Duration = Duration::from_secs(2);
 const AFTER: Duration = Duration::from_secs(60);
 const MEMORY: usize = 4 << 20;
+const MAX_OUTPUT: usize = 1 << 20;
+const MAX_JSON_DEPTH: usize = 64;
 /// What every hook may ask for besides its tool's own fields.
 const COMMON: [&str; 3] = ["cwd", "mode", "headless"];
 /// What `---@param` may say.
@@ -485,9 +489,17 @@ fn api(lua: &Lua) -> mlua::Result<()> {
             _ => return Err(mlua::Error::runtime("run: pass a string or a table")),
         };
         let deadline = *c.deadline.lock().unwrap();
-        let limit = opts.and_then(|o| o.get::<Option<f64>>("timeout").ok().flatten());
-        let deadline =
-            limit.map_or(deadline, |s| deadline.min(Instant::now() + Duration::from_secs_f64(s)));
+        let limit = opts.map(|o| o.get::<Option<f64>>("timeout")).transpose()?.flatten();
+        let deadline = match limit {
+            Some(s) if s.is_finite() && s >= 0.0 => {
+                // Clamp before conversion so even enormous finite values cannot overflow.
+                deadline.min(Instant::now() + Duration::from_secs_f64(s.min(AFTER.as_secs_f64())))
+            }
+            Some(_) => {
+                return Err(mlua::Error::runtime("run: timeout must be finite and non-negative"));
+            }
+            None => deadline,
+        };
         let cwd = c.cwd.clone();
         drop(c);
         let (out, code) = run(p.current_dir(cwd), deadline).map_err(mlua::Error::runtime)?;
@@ -533,39 +545,82 @@ fn api(lua: &Lua) -> mlua::Result<()> {
     g.raw_set("print", print)
 }
 
-/// Runs `p` until it exits or `deadline` passes, with stderr after stdout.
-/// shortcut: a timeout kills only the direct child, not its children; use the bash tool's
-/// process-group kill if a plugin's stray grandchild ever matters.
+/// Runs a process group under a deadline, with bounded stdout followed by stderr.
 fn run(p: &mut Command, deadline: Instant) -> Result<(String, i32), String> {
     let mut child = p
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("run: {e}"))?;
-    let out = drain(child.stdout.take().expect("stdout is piped"));
-    let err = drain(child.stderr.take().expect("stderr is piped"));
-    let status = loop {
-        match child.try_wait().map_err(|e| format!("run: {e}"))? {
-            Some(s) => break s,
-            None if Instant::now() > deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+    let group = child.id() as i32;
+    let result = (|| {
+        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+        nonblocking(&stdout)?;
+        nonblocking(&stderr)?;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (mut out_done, mut err_done) = (false, false);
+        let mut status = None;
+        loop {
+            if Instant::now() >= deadline {
                 return Err("run: timed out".into());
             }
-            None => std::thread::sleep(Duration::from_millis(10)),
+            if status.is_none() {
+                status = child.try_wait().map_err(|e| format!("run: {e}"))?;
+                if status.is_some() {
+                    // Background descendants must not outlive a completed command.
+                    tools::kill_process_group(group);
+                }
+            }
+            let mut buf = [0; 8192];
+            for (stream, bytes, done) in [
+                (&mut stdout as &mut dyn Read, &mut out, &mut out_done),
+                (&mut stderr as &mut dyn Read, &mut err, &mut err_done),
+            ] {
+                if *done {
+                    continue;
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) => *done = true,
+                    Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => return Err(format!("run: {e}")),
+                }
+            }
+            if out.len() + err.len() > MAX_OUTPUT {
+                return Err(format!("run: output exceeds {MAX_OUTPUT} bytes"));
+            }
+            if let Some(status) = status.filter(|_| out_done && err_done) {
+                let text =
+                    String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err);
+                return Ok((text, status.code().unwrap_or(-1)));
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-    };
-    let text = out.join().unwrap_or_default() + &err.join().unwrap_or_default();
-    Ok((text, status.code().unwrap_or(-1)))
+    })();
+    tools::kill_process_group(group);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
-fn drain(mut stream: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stream.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    })
+fn nonblocking(stream: &impl AsRawFd) -> Result<(), String> {
+    // SAFETY: these are live pipe descriptors owned by run; fcntl does not retain them.
+    let result = unsafe {
+        let flags = libc::fcntl(stream.as_raw_fd(), libc::F_GETFL);
+        if flags < 0 {
+            flags
+        } else {
+            libc::fcntl(stream.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+        }
+    };
+    if result < 0 { Err(format!("run: {}", std::io::Error::last_os_error())) } else { Ok(()) }
 }
 
 fn to_lua(lua: &Lua, v: &Value) -> mlua::Result<mlua::Value> {
@@ -592,6 +647,21 @@ fn to_lua(lua: &Lua, v: &Value) -> mlua::Result<mlua::Value> {
 }
 
 fn to_json(v: mlua::Value) -> Result<Value, String> {
+    let mut remaining = MAX_OUTPUT;
+    json_value(v, 0, &mut remaining)
+}
+
+fn json_value(v: mlua::Value, depth: usize, remaining: &mut usize) -> Result<Value, String> {
+    if depth > MAX_JSON_DEPTH {
+        return Err("table is cyclic or nested too deeply (limit: 64)".into());
+    }
+    // Charge each node as well as strings, bounding expansion of shared tables.
+    let size = 64
+        + match &v {
+            mlua::Value::String(s) => s.as_bytes().len(),
+            _ => 0,
+        };
+    *remaining = remaining.checked_sub(size).ok_or("table exceeds JSON conversion size limit")?;
     Ok(match v {
         mlua::Value::Nil => Value::Null,
         mlua::Value::Boolean(b) => b.into(),
@@ -602,13 +672,20 @@ fn to_json(v: mlua::Value) -> Result<Value, String> {
         mlua::Value::String(s) => s.to_string_lossy().into(),
         mlua::Value::Table(t) if t.raw_len() > 0 => {
             let items = t.sequence_values::<mlua::Value>().map(|x| x.map_err(|e| first_line(&e)));
-            Value::Array(items.map(|x| x.and_then(to_json)).collect::<Result<_, _>>()?)
+            Value::Array(
+                items
+                    .map(|x| x.and_then(|v| json_value(v, depth + 1, remaining)))
+                    .collect::<Result<_, _>>()?,
+            )
         }
         mlua::Value::Table(t) => {
             let mut m = serde_json::Map::new();
             for pair in t.pairs::<String, mlua::Value>() {
                 let (k, x) = pair.map_err(|e| first_line(&e))?;
-                m.insert(k, to_json(x)?);
+                *remaining = remaining
+                    .checked_sub(k.len())
+                    .ok_or("table exceeds JSON conversion size limit")?;
+                m.insert(k, json_value(x, depth + 1, remaining)?);
             }
             Value::Object(m)
         }
@@ -647,6 +724,104 @@ mod tests {
         let (to, rx) = unbounded_channel();
         let mut a = args.to_owned();
         (p.before(tool, &mut a, &fields("auto", true), &to), a, rx)
+    }
+
+    #[test]
+    fn run_rejects_invalid_timeouts_without_panicking() {
+        let src = "--- Run with a timeout.\nfunction tool_timeout(value) return run('printf ok', { timeout = value }) end";
+        let p = load("invalid-timeouts", &[("a.lua", src)]).unwrap();
+        let (to, _rx) = unbounded_channel();
+        for value in ["-1", "0/0", "math.huge", "-math.huge", "'invalid'"] {
+            // JSON cannot represent NaN or infinity, so construct these in Lua.
+            let lua = &p.files[0].1;
+            lua.load(format!(
+                "function tool_timeout() return run('printf ok', {{ timeout = {value} }}) end"
+            ))
+            .exec()
+            .unwrap();
+            let f = lua.globals().get::<Function>("tool_timeout").unwrap();
+            let err = f.call::<mlua::Value>(()).unwrap_err().to_string();
+            assert!(err.contains("timeout") || err.contains("number"), "{err}");
+        }
+        // The registered function is unchanged and ordinary, zero and huge values do not panic.
+        for (args, ok) in
+            [(r#"{"value":0.5}"#, true), (r#"{"value":1e300}"#, true), (r#"{"value":0}"#, false)]
+        {
+            let out = p.run_tool("timeout", args, &fields("auto", true), &to);
+            assert_eq!(out.ok, ok, "{}", out.content);
+        }
+    }
+
+    #[test]
+    fn json_conversion_rejects_cycles_depth_and_exponential_expansion() {
+        let lua = Lua::new();
+        for src in [
+            "local t = {}; t.self = t; return t",
+            "local a,b = {},{}; a[1]=b; b[1]=a; return a",
+            "local t = {}; for i=1,100 do t={t} end; return t",
+            "local t = {1}; for i=1,30 do t={t,t} end; return t",
+        ] {
+            assert!(to_json(lua.load(src).eval().unwrap()).is_err(), "{src}");
+        }
+        // Sharing a child without a cycle is valid and is copied into JSON.
+        let v = lua.load("local child = {x=1}; return {a=child,b=child}").eval().unwrap();
+        assert_eq!(to_json(v).unwrap(), json!({"a":{"x":1},"b":{"x":1}}));
+        let p = load(
+            "cycle-rewrite",
+            &[("a.lua", "function before_bash() local t={}; t.self=t; return {command=t} end")],
+        )
+        .unwrap();
+        assert!(matches!(before(&p,"bash","{}").0, Before::Block(s) if s.contains("cyclic")));
+    }
+
+    fn shell(command: &str, budget: Duration) -> Result<(String, i32), String> {
+        run(Command::new("sh").arg("-c").arg(command), Instant::now() + budget)
+    }
+
+    fn assert_dead(pid: i32) {
+        for _ in 0..100 {
+            // SAFETY: signal zero only checks whether the given process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("descendant {pid} survived");
+    }
+
+    #[test]
+    fn run_kills_background_descendants_when_the_parent_exits() {
+        let started = Instant::now();
+        let (out, code) = shell("sleep 30 & echo $!", Duration::from_secs(2)).unwrap();
+        assert_eq!(code, 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_dead(out.trim().parse().unwrap());
+    }
+
+    #[test]
+    fn run_timeout_kills_the_process_group() {
+        let path =
+            std::env::temp_dir().join(format!("bit-plugin-timeout-{}.pid", std::process::id()));
+        let cmd = format!("sleep 30 & echo $! > '{}'; wait", path.display());
+        let started = Instant::now();
+        assert_eq!(shell(&cmd, Duration::from_millis(200)).unwrap_err(), "run: timed out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_dead(pid.trim().parse().unwrap());
+    }
+
+    #[test]
+    fn run_bounds_combined_output_and_preserves_stream_order() {
+        assert_eq!(
+            shell("printf out; printf err >&2; exit 3", BEFORE).unwrap(),
+            ("outerr".into(), 3)
+        );
+        let err =
+            shell("head -c 600000 /dev/zero; head -c 600000 /dev/zero >&2", BEFORE).unwrap_err();
+        assert!(err.contains("output exceeds"), "{err}");
+        // A command producing output forever is stopped by the same cap.
+        assert!(shell("yes x", BEFORE).unwrap_err().contains("output exceeds"));
     }
 
     #[test]

@@ -525,6 +525,16 @@ impl Ui {
         agent::models::levels(&self.provider, &self.model)
     }
 
+    /// Validates the picker and Tab entry points, with the same notice when unavailable.
+    fn available_levels(&mut self) -> Option<&'static [&'static str]> {
+        let levels = self.levels();
+        if levels.is_empty() {
+            self.event(Event::Notice(self.no_levels().into()));
+            return None;
+        }
+        Some(levels)
+    }
+
     /// The picked thinking level, if the current model takes it.
     fn effort(&self) -> Option<&str> {
         self.thinking.as_deref().filter(|t| self.levels().contains(t))
@@ -532,10 +542,7 @@ impl Ui {
 
     /// The `/thinking` picker: `default` and the model's levels, from least thinking.
     fn ask_thinking(&mut self) {
-        let levels = self.levels();
-        if levels.is_empty() {
-            return self.event(Event::Notice(self.no_levels().into()));
-        }
+        let Some(levels) = self.available_levels() else { return };
         let default = self.default_label();
         let options: Vec<Box<str>> = [default.as_str()]
             .iter()
@@ -551,10 +558,7 @@ impl Ui {
     /// `Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
     /// the status line shows it and stepping through would fill the scrollback.
     fn next_thinking(&mut self, cmds: &UnboundedSender<Command>) {
-        let levels = self.levels();
-        if levels.is_empty() {
-            return self.event(Event::Notice(self.no_levels().into()));
-        }
+        let Some(levels) = self.available_levels() else { return };
         let at = self.effort().and_then(|e| levels.iter().position(|l| *l == e));
         self.thinking = levels.get(at.map_or(0, |i| i + 1)).map(|&l| l.into());
         let _ = cmds.send(Command::SetThinking(self.thinking.clone()));
@@ -1281,6 +1285,21 @@ mod tests {
         assert!(!ui.status_border(DIM).contains('·'), "no levels, nothing to show");
         ui.set_model("opencode-go".into(), "glm-5.3".into(), &tx);
         assert!(ui.status_border(DIM).contains("glm-5.3 · high"));
+
+        // Picker and Tab reject unavailable levels identically, without sending commands.
+        while rx.try_recv().is_ok() {}
+        for model in ["", "unknown"] {
+            ui.model = model.into();
+            ui.done.clear();
+            ui.ask_thinking();
+            let notice = std::mem::take(&mut ui.done);
+            ui.next_thinking(&tx);
+            assert_eq!(ui.done, notice);
+            let expected = if model.is_empty() { "no model is set" } else { "no thinking levels" };
+            assert!(notice[0].contains(expected));
+            assert!(ui.question.is_none() && rx.try_recv().is_err());
+            assert_eq!(ui.thinking.as_deref(), Some("high"));
+        }
     }
 
     #[test]
