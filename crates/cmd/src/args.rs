@@ -1,5 +1,5 @@
 use lexopt::{
-    Arg::{Long, Short},
+    Arg::{Long, Short, Value},
     ValueExt,
 };
 
@@ -14,6 +14,9 @@ pub struct Args {
     /// `-p <prompt>`: run one turn without the TUI.
     pub print: Option<String>,
     pub print_prompt: bool,
+    pub no_plugins: bool,
+    /// `bit plugins [guide]`.
+    pub sub: Vec<String>,
     pub version: bool,
 }
 
@@ -35,6 +38,8 @@ pub fn parse() -> Result<Args, lexopt::Error> {
             Short('p') | Long("print") => a.print = Some(p.value()?.string()?),
             Long("print-prompt") => a.print_prompt = true,
             Long("version") => a.version = true,
+            Long("no-plugins") => a.no_plugins = true,
+            Value(v) => a.sub.push(v.string()?),
             _ => return Err(arg.unexpected()),
         }
     }

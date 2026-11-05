@@ -61,7 +61,8 @@ pub fn detail(name: &str, args: &str) -> String {
         "edit" => mark("-", s("old")) + &mark("+", s("new")),
         "write" => mark("+", s("content")),
         "bash" => s("command").into(),
-        _ => String::new(),
+        // A plugin's tool: its arguments as they are.
+        _ => args.into(),
     }
 }
 
