@@ -51,7 +51,8 @@ pub type Loaded = Result<Vec<String>, String>;
 #[derive(Debug, PartialEq)]
 pub enum Before {
     Pass,
-    Allow,
+    /// Run without asking; the first file that said so.
+    Allow(String),
     /// The tool result the model gets instead.
     Block(String),
 }
@@ -161,7 +162,8 @@ impl Plugins {
         found.sort_by(|a, b| a.0.cmp(&b.0));
         let (mut hooks, mut tools) = (Vec::new(), Vec::new());
         for (key, f) in found {
-            let params = (1..=f.info().num_params)
+            let info = f.info();
+            let params = (1..=info.num_params)
                 .map(|i| getlocal.call::<String>((f.clone(), i)))
                 .collect::<mlua::Result<Vec<_>>>()
                 .map_err(|e| first_line(&e))?;
@@ -169,8 +171,7 @@ impl Plugins {
                 if self.fields.contains_key(tool) {
                     return Err(format!("{key}: there's already a tool named `{tool}`"));
                 }
-                let line = f.info().line_defined.unwrap_or(0);
-                let schema = schema(tool, &params, &src, line)?;
+                let schema = schema(tool, &params, &src, info.line_defined.unwrap_or(0))?;
                 let own = params.iter().filter(|p| !COMMON.contains(&p.as_str())).cloned();
                 tools.push((tool.to_owned(), own.collect(), schema));
             }
@@ -237,8 +238,8 @@ impl Plugins {
     }
 
     /// Runs the `before_<tool>` hooks in order. A block wins over an allow, which wins over
-    /// no opinion; an error or a timeout blocks. Each allow and rewrite is noted in `acted`,
-    /// for the tool line.
+    /// no opinion; an error or a timeout blocks. Each rewrite is noted in `acted`, for the
+    /// tool line.
     pub fn before(
         &self,
         tool: &str,
@@ -260,10 +261,10 @@ impl Plugins {
             match self.call(h, &v, None, fx, to, BEFORE) {
                 Err(e) => return fail(&e),
                 Ok(mlua::Value::Nil | mlua::Value::Boolean(false)) => {}
-                Ok(mlua::Value::Boolean(true)) => {
-                    verdict = Before::Allow;
-                    acted.push(format!("allowed by {file}"));
+                Ok(mlua::Value::Boolean(true)) if verdict == Before::Pass => {
+                    verdict = Before::Allow(file.clone());
                 }
+                Ok(mlua::Value::Boolean(true)) => {}
                 Ok(mlua::Value::String(s)) => {
                     let why = s.to_string_lossy();
                     return Before::Block(format!("error: blocked by {file}. hint: {why}"));
@@ -513,8 +514,7 @@ fn api(lua: &Lua) -> mlua::Result<()> {
         };
         let cwd = c.cwd.clone();
         drop(c);
-        let (out, code) = run(p.current_dir(cwd), deadline).map_err(mlua::Error::runtime)?;
-        Ok((out, code))
+        run(p.current_dir(cwd), deadline).map_err(mlua::Error::runtime)
     })?;
     let read = lua.create_function(|lua, path: String| {
         let cwd = lua.app_data_ref::<Call>().map(|c| c.cwd.clone()).unwrap_or_default();
@@ -664,7 +664,7 @@ fn to_json(v: mlua::Value) -> Result<Value, String> {
 
 fn json_value(v: mlua::Value, depth: usize, remaining: &mut usize) -> Result<Value, String> {
     if depth > MAX_JSON_DEPTH {
-        return Err("table is cyclic or nested too deeply (limit: 64)".into());
+        return Err(format!("table is cyclic or nested too deeply (limit: {MAX_JSON_DEPTH})"));
     }
     // Charge each node as well as strings, bounding expansion of shared tables.
     let size = 64
@@ -700,7 +700,7 @@ fn json_value(v: mlua::Value, depth: usize, remaining: &mut usize) -> Result<Val
             }
             Value::Object(m)
         }
-        other => return Err(format!("a {} can't be a tool argument", other.type_name())),
+        other => return Err(format!("a {} can't be turned into JSON", other.type_name())),
     })
 }
 
@@ -843,7 +843,8 @@ mod tests {
         let rm = r#"{"command":"rm -rf build"}"#;
         assert!(matches!(before(&p, "bash", rm).0, Before::Block(_)), "headless rm is blocked");
         assert_eq!(before(&p, "bash", r#"{"command":"npm run perform"}"#).0, Before::Pass);
-        assert_eq!(before(&p, "bash", r#"{"command":"git status"}"#).0, Before::Allow);
+        let allow = Before::Allow("example.lua".into());
+        assert_eq!(before(&p, "bash", r#"{"command":"git status"}"#).0, allow);
         let (v, args, _) = before(&p, "bash", r#"{"command":"git log -3"}"#);
         assert_eq!((v, args.as_str()), (Before::Pass, r#"{"command":"git --no-pager log -3"}"#));
         let deploy = r#"{"function":{"description":"Restart a Kubernetes deployment on the homelab cluster.","name":"deploy","parameters":{"properties":{"namespace":{"description":"Defaults to \"default\"","type":"string"},"service":{"description":"Deployment name, e.g. \"api\"","type":"string"}},"required":["service"],"type":"object"}},"type":"function"}"#;

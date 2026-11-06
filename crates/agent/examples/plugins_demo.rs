@@ -66,7 +66,7 @@ fn main() {
                 let (v, a) = before(&p, "bash", &format!("{{\"command\":\"{c}\"}}"));
                 match c {
                     "danger" => assert!(matches!(v, Before::Block(_))),
-                    "safe" => assert_eq!(v, Before::Allow),
+                    "safe" => assert_eq!(v, Before::Allow("guard.lua".into())),
                     "rewrite" => assert!(a.contains("echo rewritten")),
                     _ => assert_eq!(v, Before::Pass),
                 }

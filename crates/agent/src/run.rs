@@ -194,12 +194,14 @@ impl Turn<'_> {
                 let args = args.as_str();
                 let summary = tools::summary(name, args);
                 let auto = self.auto.load(Relaxed);
-                // An allow is worth a tag only when it skipped an approval.
-                if verdict == Before::Allow && self.a.policy.check(auto, name, args) {
-                    acted.retain(|a| !a.starts_with("allowed by"));
-                }
                 let allowed = match &verdict {
-                    Before::Allow => true,
+                    // Worth a tag only when it skipped an approval.
+                    Before::Allow(file) => {
+                        if !self.a.policy.check(auto, name, args) {
+                            acted.push(format!("allowed by {file}"));
+                        }
+                        true
+                    }
                     Before::Block(_) => false,
                     Before::Pass if self.a.policy.check(auto, name, args) => true,
                     Before::Pass if self.a.print => false,

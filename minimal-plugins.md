@@ -67,13 +67,14 @@ pub struct Plugins {
 
 struct Hook { state: usize, f: Function, params: Vec<String> } // params in declared order
 
-pub enum Before { Pass, Allow, Block(String) }  // a rewrite edits `args` in place
+pub enum Before { Pass, Allow(String), Block(String) } // Allow names the file; a rewrite edits `args`
 
 impl Plugins {
     pub fn load(dir: &Path) -> Result<Self, String>;          // any error stops startup
-    pub fn before(&self, tool: &str, args: &mut Value, cx: &Fields) -> Before;
-    pub fn after(&self, tool: &str, args: &Value, out: &mut tools::Output, cx: &Fields);
-    pub fn call(&self, tool: &str, args: &Value, cx: &Fields) -> Option<tools::Output>;
+    // `acted` collects "rewritten by x.lua" and "output replaced by x.lua" for the tool line
+    pub fn before(&self, tool: &str, args: &mut String, cx: &Fields, to: &Sender<Req>, acted: &mut Vec<String>) -> Before;
+    pub fn after(&self, tool: &str, args: &str, out: &mut tools::Output, cx: &Fields, to: &Sender<Req>, acted: &mut Vec<String>);
+    pub fn run_tool(&self, tool: &str, args: &str, cx: &Fields, to: &Sender<Req>) -> tools::Output;
     pub fn schemas(&self) -> &str;
 }
 ```
@@ -153,7 +154,7 @@ match plugins.before(name, &mut args, &fields) {      // first, every mode
 plugins.after(name, &args, &mut out, &fields);
 ```
 
-`exec` tries `plugins.call` first and falls back to `tools::exec`. A rewritten `args` is
+`exec` tries `plugins.run_tool` first and falls back to `tools::exec`. A rewritten `args` is
 what the Approval box shows and what runs; the log keeps the model's own call, so the
 history stays exactly what the model sent. `tools::summary` falls back to the tool name,
 so replays work without the plugin.
