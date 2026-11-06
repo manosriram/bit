@@ -15,12 +15,29 @@ pub struct Input {
 }
 
 impl Input {
-    /// Applies an editing key; other keys are ignored.
+    /// Applies an editing key; other keys are ignored. Word keys come in the forms terminals
+    /// send them: Option-Left is Alt-Left in iTerm2 and kitty but Alt-b in Terminal.app.
     pub fn key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let word = k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
             KeyCode::Char('a') if ctrl => self.cursor = 0,
             KeyCode::Char('e') if ctrl => self.cursor = self.text.len(),
+            KeyCode::Backspace if word => {
+                let start = self.word_start();
+                self.text.replace_range(start..self.cursor, "");
+                self.cursor = start;
+            }
+            KeyCode::Char('w') if ctrl => {
+                let start = self.word_start();
+                self.text.replace_range(start..self.cursor, "");
+                self.cursor = start;
+            }
+            KeyCode::Left if word => self.cursor = self.word_start(),
+            KeyCode::Char('b') if alt => self.cursor = self.word_start(),
+            KeyCode::Right if word => self.cursor = self.word_end(),
+            KeyCode::Char('f') if alt => self.cursor = self.word_end(),
             KeyCode::Char(c) if !ctrl => self.insert(&c.to_string()),
             KeyCode::Backspace => {
                 if let Some(c) = self.text[..self.cursor].chars().next_back() {
@@ -42,6 +59,18 @@ impl Input {
             KeyCode::End => self.cursor = self.text.len(),
             _ => {}
         }
+    }
+
+    /// Where the word before the cursor starts: back over any gap, then over the word.
+    fn word_start(&self) -> usize {
+        let before = self.text[..self.cursor].trim_end_matches(|c| !is_word(c));
+        before.trim_end_matches(is_word).len()
+    }
+
+    /// Where the word after the cursor ends: past any gap, then past the word.
+    fn word_end(&self) -> usize {
+        let after = self.text[self.cursor..].trim_start_matches(|c| !is_word(c));
+        self.text.len() - after.trim_start_matches(is_word).len()
     }
 
     /// Pasted text keeps its newlines; other control characters are dropped.
@@ -154,9 +183,41 @@ impl Input {
     }
 }
 
+/// Words are letters, digits and `_`, so Option-Backspace on `src/main.rs` takes `rs` first,
+/// as macOS text fields do.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 #[cfg(test)]
 mod tests {
     use super::Input;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn option_keys_move_and_delete_by_word() {
+        let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
+        let mut i = Input::default();
+        i.insert("run cargo  test_all");
+        i.key(alt(KeyCode::Left));
+        assert_eq!(i.cursor, 11, "to the start of test_all");
+        i.key(alt(KeyCode::Char('b')));
+        assert_eq!(i.cursor, 4, "Terminal.app's form, past the double space");
+        i.key(alt(KeyCode::Right));
+        assert_eq!(i.cursor, 9);
+        i.key(alt(KeyCode::Char('f')));
+        assert_eq!(i.cursor, 19);
+        i.key(alt(KeyCode::Backspace));
+        assert_eq!((i.text.as_str(), i.cursor), ("run cargo  ", 11));
+        i.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(i.text, "run ");
+        i.insert("src/main.rs");
+        i.key(alt(KeyCode::Backspace));
+        assert_eq!(i.text, "run src/main.");
+        i.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        i.key(alt(KeyCode::Backspace));
+        assert_eq!((i.text.as_str(), i.cursor), ("run src/.", 8), "deletes only before the cursor");
+    }
 
     #[test]
     fn recall_walks_history_and_keeps_the_draft() {

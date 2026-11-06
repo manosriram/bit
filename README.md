@@ -58,7 +58,8 @@ In `-p` mode nobody can approve, so write, edit and bash are declined unless `--
 or `[bash] allow` permits them.
 
 Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Shift-Tab` toggle
-ask/auto, `Tab` next thinking level, `Up`/`Down` earlier prompts, `/` commands:
+ask/auto, `Tab` next thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
+`Option-Backspace` or `Ctrl-W` delete a word, `/` commands:
 
 ```
 /login             add a provider: paste its API key, or sign in
