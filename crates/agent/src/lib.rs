@@ -1,4 +1,5 @@
 mod context;
+pub mod plugins;
 mod policy;
 pub mod proto;
 pub mod providers;
@@ -7,6 +8,7 @@ pub mod session;
 
 pub use context::Context;
 pub use llm::models;
+pub use plugins::Plugins;
 pub use policy::Policy;
 pub use run::{Agent, Provider, cache_key, connect, run};
 pub use tools::{Ctx as ToolCtx, files};

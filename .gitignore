@@ -1,2 +1,4 @@
 /target
 *.txt
+/assets/plugins-demo/
+.DS_Store

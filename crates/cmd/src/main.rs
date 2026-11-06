@@ -3,7 +3,9 @@ mod config;
 mod print;
 
 use agent::session::{self, Session};
+use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 
 fn main() -> ExitCode {
@@ -33,7 +35,26 @@ fn run(args: args::Args) -> Result<(), String> {
         println!("{}", agent::Context::new(model, None, Vec::new()).prefix());
         return Ok(());
     }
+    match args.sub.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => {}
+        ["plugins", "guide"] => {
+            print!("{GUIDE}");
+            return Ok(());
+        }
+        ["plugins"] => return plugins(&config::load()?.plugins),
+        _ => {
+            let s = args.sub.join(" ");
+            return Err(format!(
+                "error: unknown command `{s}`. hint: bit plugins, bit plugins guide"
+            ));
+        }
+    }
     let cfg = config::load()?;
+    let plugins = if args.no_plugins {
+        agent::Plugins::default()
+    } else {
+        agent::Plugins::load(&cfg.plugins).map_err(|e| format!("{e}\n{FIX}"))?
+    };
     let cwd = std::env::current_dir().map_err(|e| format!("error: current directory: {e}"))?;
     let dir = cfg.sessions.clone();
     let found = match (&args.resume, args.cont) {
@@ -75,7 +96,8 @@ fn run(args: args::Args) -> Result<(), String> {
     let p = cfg.providers.iter().find(|x| x.name == provider).ok_or("error: no provider")?;
     // One id per conversation routes every request, resumed or not, to the cache that saw it.
     let id = session.id().to_owned();
-    let cx = agent::Context::new(&model, agent::cache_key(&provider, &id), messages);
+    let mut cx = agent::Context::new(&model, agent::cache_key(&provider, &id), messages);
+    cx.add_tools(plugins.schemas());
     let (client, no_key) = (agent::connect(p, &id), p.key.clone().err());
     let mode = if args.auto { agent::proto::Mode::Auto } else { agent::proto::Mode::Ask };
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -94,13 +116,14 @@ fn run(args: args::Args) -> Result<(), String> {
                 cwd,
                 spill: std::env::temp_dir().join(format!("bit-{}", std::process::id())),
             },
-            policy: agent::Policy::new(cfg.allow),
+            policy: agent::Policy::new(cfg.allow, plugins.tools()),
             mode,
             session,
             remember: Some(cfg.remember),
             thinking: cfg.thinking.clone(),
             auth: cfg.auth,
             print,
+            plugins: Arc::new(plugins),
         };
         tokio::spawn(agent::run(agent, cx, cmd_rx, ev_tx));
         match args.print {
@@ -124,6 +147,29 @@ fn run(args: args::Args) -> Result<(), String> {
         }
     }
     r
+}
+
+/// What `bit plugins guide` prints: how to write a plugin, as one working example.
+const GUIDE: &str = include_str!("../../../docs/plugins/example.lua");
+const FIX: &str = "hint: fix the file (bit plugins checks them all), or run bit --no-plugins";
+
+/// `bit plugins`: each plugin with its hooks, or why it doesn't load.
+fn plugins(dir: &Path) -> Result<(), String> {
+    let files = agent::Plugins::check(dir)?;
+    if files.is_empty() {
+        println!("no plugins in {}", dir.display());
+    }
+    let mut failed = false;
+    for (name, r) in files {
+        match r {
+            Ok(hooks) => println!("✓ {name}: {}", hooks.join(", ")),
+            Err(e) => {
+                failed = true;
+                println!("✗ {name}: {e}");
+            }
+        }
+    }
+    if failed { Err(format!("error: a plugin doesn't load. {FIX}")) } else { Ok(()) }
 }
 
 /// 12 hex digits: short enough to type after `bit -r`, unique enough for one machine.

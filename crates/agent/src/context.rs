@@ -10,6 +10,8 @@ pub struct Context {
     /// The working directory and its AGENTS.md, read once so the prefix stays fixed.
     project: String,
     pub(crate) cache_key: Option<String>,
+    /// The tool schemas: the built-ins, then the plugins' own.
+    tools: String,
     /// Fields that set the thinking level, from the provider's spec; none for its default.
     thinking: Option<serde_json::Value>,
     /// Input tokens of the last request: how full the window is. 0 until one is sent.
@@ -29,6 +31,7 @@ impl Context {
             model: String::new(),
             project,
             cache_key,
+            tools: tools::SCHEMAS.into(),
             thinking: None,
             tokens: 0,
             messages,
@@ -51,7 +54,7 @@ impl Context {
         let mut prefix = head.to_string();
         prefix.pop();
         prefix.push_str(",\"tools\":");
-        prefix.push_str(tools::SCHEMAS);
+        prefix.push_str(&self.tools);
         prefix.push_str(",\"messages\":[");
         // Models take their name from the history otherwise, and keep the old one after a switch.
         let mut prompt = format!("{PROMPT}{}", self.project);
@@ -61,6 +64,17 @@ impl Context {
         }
         prefix.push_str(msg("system", &prompt).get());
         (self.prefix, self.model) = (prefix, model.into());
+    }
+
+    /// Adds the plugins' tools, comma-separated schemas, after the built-ins. Called once,
+    /// before the first request, so the prefix stays fixed for the session.
+    pub fn add_tools(&mut self, schemas: &str) {
+        if schemas.is_empty() {
+            return;
+        }
+        let base = tools::SCHEMAS.trim_end().strip_suffix(']').unwrap_or(tools::SCHEMAS);
+        self.tools = format!("{base},\n{schemas}\n]");
+        self.set_model(&self.model.clone());
     }
 
     /// Sets the thinking fields, which are part of the fixed prefix.

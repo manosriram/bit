@@ -22,6 +22,8 @@ pub struct Config {
     pub sessions: PathBuf,
     /// Bash commands that run without asking.
     pub allow: Vec<String>,
+    /// Where the Lua plugins are.
+    pub plugins: PathBuf,
 }
 
 /// Unknown keys land in `unknown` so they can be warned about instead of failing the load.
@@ -131,6 +133,7 @@ pub fn load() -> Result<Config, String> {
         auth,
         sessions: base.join("sessions"),
         allow: file.bash.allow,
+        plugins: base.join("plugins"),
     })
 }
 

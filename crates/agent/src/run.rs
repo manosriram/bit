@@ -1,4 +1,5 @@
 use crate::context::{Context, msg, tool_msg};
+use crate::plugins::{Before, Fields, Plugins, Req};
 use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::providers::{self, Auth};
@@ -6,6 +7,7 @@ use crate::session::Session;
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -60,6 +62,8 @@ pub struct Agent {
     /// No user is present (`bit -p`): a resumed history isn't replayed, a call that needs
     /// approval is declined without asking, and `ask` gets no answer.
     pub print: bool,
+    /// Lua hooks around tool calls; see minimal-plugins.md.
+    pub plugins: Arc<Plugins>,
 }
 
 /// Runs until the command channel closes.
@@ -183,10 +187,25 @@ impl Turn<'_> {
             cx.messages.push(c.message);
             self.send(Event::Usage(c.usage));
             for call in &c.tool_calls {
-                let (id, name, args) = (&*call.id, &*call.name, &*call.args);
+                let (id, name) = (&*call.id, &*call.name);
+                // Guards run first, in every mode; a rewrite is what gets approved and run.
+                let mut args = call.args.clone();
+                let (verdict, mut acted) = self.before(name, &mut args, replies).await;
+                let args = args.as_str();
                 let summary = tools::summary(name, args);
-                let allowed = self.a.policy.check(self.auto.load(Relaxed), name, args)
-                    || !self.a.print && {
+                let auto = self.auto.load(Relaxed);
+                let allowed = match &verdict {
+                    // Worth a tag only when it skipped an approval.
+                    Before::Allow(file) => {
+                        if !self.a.policy.check(auto, name, args) {
+                            acted.push(format!("allowed by {file}"));
+                        }
+                        true
+                    }
+                    Before::Block(_) => false,
+                    Before::Pass if self.a.policy.check(auto, name, args) => true,
+                    Before::Pass if self.a.print => false,
+                    Before::Pass => {
                         self.send(Event::Approval {
                             id: id.into(),
                             name: name.into(),
@@ -201,23 +220,34 @@ impl Turn<'_> {
                             self.a.policy.always(name, args);
                         }
                         d != Decision::No
-                    };
+                    }
+                };
                 self.send(Event::ToolStart {
                     id: id.into(),
                     name: name.into(),
                     summary: summary.into(),
                     diff: diff(name, args).into(),
                 });
-                let out = match (name, allowed) {
+                let mut out = match (name, allowed) {
+                    _ if let Before::Block(why) = verdict => {
+                        tools::Output { ok: false, content: why }
+                    }
                     ("ask", _) => self.ask(id, args, replies).await,
+                    (_, true) if self.a.plugins.has("tool_", name) => {
+                        let (n, a, fx) = (name.to_owned(), args.to_owned(), self.fields());
+                        self.hooks(replies, move |p, to| p.run_tool(&n, &a, &fx, to)).await
+                    }
                     (_, true) => tools::exec(name, args, &self.a.tools).await,
                     (_, false) => {
                         let why = if self.a.print { NOT_ALLOWED } else { DECLINED };
                         tools::Output { ok: false, content: why.into() }
                     }
                 };
+                out = self.after(name, args, out, &mut acted, replies).await;
                 let (ok, output) = (out.ok, out.content.as_str().into());
-                let preview = preview(name, ok, &out.content).into();
+                // What a plugin silently changed goes on the tool line, after the preview.
+                let preview = std::iter::once(preview(name, ok, &out.content)).chain(acted);
+                let preview = preview.collect::<Vec<_>>().join(" · ").into();
                 self.send(Event::ToolEnd { id: id.into(), ok, preview, output });
                 cx.messages.push(tool_msg(id, &out.content));
             }
@@ -303,6 +333,88 @@ impl Turn<'_> {
         let content =
             answer(replies, id).await.unwrap_or_else(|| "error: the user gave no answer".into());
         tools::Output { ok: true, content }
+    }
+
+    fn fields(&self) -> Fields {
+        let mode = if self.auto.load(Relaxed) { "auto" } else { "ask" };
+        Fields { cwd: self.a.tools.cwd.clone(), mode, headless: self.a.print }
+    }
+
+    async fn before(
+        &self,
+        name: &str,
+        args: &mut String,
+        replies: &mut UnboundedReceiver<Command>,
+    ) -> (Before, Vec<String>) {
+        if !self.a.plugins.has("before_", name) {
+            return (Before::Pass, Vec::new());
+        }
+        let (n, mut a, fx) = (name.to_owned(), std::mem::take(args), self.fields());
+        let (v, a, acted) = self
+            .hooks(replies, move |p, to| {
+                let mut acted = Vec::new();
+                (p.before(&n, &mut a, &fx, to, &mut acted), a, acted)
+            })
+            .await;
+        *args = a;
+        (v, acted)
+    }
+
+    async fn after(
+        &self,
+        name: &str,
+        args: &str,
+        mut out: tools::Output,
+        acted: &mut Vec<String>,
+        replies: &mut UnboundedReceiver<Command>,
+    ) -> tools::Output {
+        if !self.a.plugins.has("after_", name) {
+            return out;
+        }
+        let (n, a, fx) = (name.to_owned(), args.to_owned(), self.fields());
+        let (out, more) = self
+            .hooks(replies, move |p, to| {
+                let mut acted = Vec::new();
+                p.after(&n, &a, &mut out, &fx, to, &mut acted);
+                (out, acted)
+            })
+            .await;
+        acted.extend(more);
+        out
+    }
+
+    /// Runs `job` on a blocking thread, since a hook may run for seconds, and meanwhile puts
+    /// its notices and questions to the user.
+    async fn hooks<T: Send + 'static>(
+        &self,
+        replies: &mut UnboundedReceiver<Command>,
+        job: impl FnOnce(&Plugins, &UnboundedSender<Req>) -> T + Send + 'static,
+    ) -> T {
+        let (to, mut reqs) = unbounded_channel();
+        let p = self.a.plugins.clone();
+        let mut h = tokio::task::spawn_blocking(move || job(&p, &to));
+        let r = loop {
+            tokio::select! {
+                r = &mut h => break r,
+                Some(req) = reqs.recv() => self.plugin_req(req, replies).await,
+            }
+        };
+        while let Ok(req) = reqs.try_recv() {
+            self.plugin_req(req, replies).await;
+        }
+        // mlua turns Lua errors into values, so only a bug in bit panics here.
+        r.expect("a plugin hook panicked")
+    }
+
+    async fn plugin_req(&self, req: Req, replies: &mut UnboundedReceiver<Command>) {
+        match req {
+            Req::Print(s) => self.send(Event::Notice(s.into())),
+            Req::Ask { question, options, reply } => {
+                let options = options.into_iter().map(Into::into).collect();
+                self.send(Event::Ask { id: PLUGIN_ASK.into(), question: question.into(), options });
+                let _ = reply.send(answer(replies, PLUGIN_ASK).await.unwrap_or_default());
+            }
+        }
     }
 
     /// Writes the messages the log doesn't have yet. Each call ends a whole step, so the log
@@ -439,6 +551,7 @@ const LATEST: &str = "\n\n[The user's latest message, verbatim:]\n\n";
 
 const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
 const NOT_ALLOWED: &str = "error: bit -p runs without a user, so this call needs --mode auto or a [bash] allow entry. hint: do without it, or tell the user how to allow it";
+const PLUGIN_ASK: &str = "plugin-ask";
 const OPEN: &str = "sign in in your browser; if it didn't open, visit ";
 /// The two answers to `/login`'s first question.
 const SIGN_IN: &str = "subscription";
@@ -614,7 +727,7 @@ mod tests {
             providers: Vec::new(),
             provider: "p".into(),
             tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir },
-            policy: Policy::new(Vec::new()),
+            policy: Policy::new(Vec::new(), Vec::new()),
             mode: Mode::Ask,
             session,
             no_key: None,
@@ -622,6 +735,7 @@ mod tests {
             thinking: None,
             auth,
             print: false,
+            plugins: Default::default(),
         }
     }
 
@@ -736,6 +850,86 @@ mod tests {
         let reply = r#"{"role":"assistant","content":"Hello"}"#;
         let next = r#"{"content":"three","role":"user"}"#;
         assert_eq!(b3, format!("{},{reply},{next}]}}", unclosed(&b1)));
+    }
+
+    #[tokio::test]
+    async fn plugins_guard_bash_and_ask_the_user() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "plugins");
+        let dir = agent.tools.cwd.join("plugins");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "function before_bash(command) \
+            if command:find('rm') and ask('Run ' .. command .. '?', { 'yes', 'no' }) ~= 'yes' then \
+              return 'the user said no' end \
+            if command == 'echo hi' then return true end end";
+        std::fs::write(dir.join("guard.lua"), src).unwrap();
+        agent.plugins = Arc::new(Plugins::load(&dir).unwrap());
+        let replies = vec![
+            call("b1", "bash", r#"{"command":"rm x"}"#),
+            call("b2", "bash", r#"{"command":"echo hi"}"#),
+            sse(&["done"], true),
+        ];
+        let cx = Context::new("m", None, Vec::new());
+        let (cmd_tx, mut ev, mut bodies) = start(agent, cx, l, replies).await;
+
+        cmd_tx.send(Command::Submit("go".into())).unwrap();
+        let ask = Event::Ask {
+            id: PLUGIN_ASK.into(),
+            question: "Run rm x?".into(),
+            options: vec!["yes".into(), "no".into()],
+        };
+        assert_eq!(next(&mut ev).await, ask);
+        cmd_tx.send(Command::Answer { id: PLUGIN_ASK.into(), text: "no".into() }).unwrap();
+        assert!(matches!(next(&mut ev).await, Event::ToolStart { .. }));
+        let blocked = "error: blocked by guard.lua. hint: the user said no";
+        let Event::ToolEnd { ok: false, output, .. } = next(&mut ev).await else { panic!() };
+        assert_eq!(&*output, blocked);
+        // `true` runs it in ask mode without an approval, and the tool line says who did.
+        assert!(matches!(next(&mut ev).await, Event::ToolStart { .. }));
+        let Event::ToolEnd { ok: true, output, preview, .. } = next(&mut ev).await else {
+            panic!()
+        };
+        assert_eq!(&*output, "hi\n");
+        assert_eq!(&*preview, "1 line · allowed by guard.lua");
+        assert_eq!(next(&mut ev).await, Event::Text("done".into()));
+
+        let _ = bodies.recv().await.unwrap();
+        let b2 = bodies.recv().await.unwrap();
+        assert!(b2.contains(blocked), "the model reads why: {b2}");
+    }
+
+    #[tokio::test]
+    async fn plugin_tools_join_the_prefix_and_ask_like_bash() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "plugin-tools");
+        let dir = agent.tools.cwd.join("plugins");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src =
+            "--- Shout.\n---@param text string\nfunction tool_shout(text) return text:upper() end";
+        std::fs::write(dir.join("shout.lua"), src).unwrap();
+        let plugins = Plugins::load(&dir).unwrap();
+        agent.policy = Policy::new(Vec::new(), plugins.tools());
+        let mut cx = Context::new("m", None, Vec::new());
+        cx.add_tools(plugins.schemas());
+        agent.plugins = Arc::new(plugins);
+        let args = r#"{"text":"hi"}"#;
+        let replies = vec![call("s1", "shout", args), sse(&["done"], true)];
+        let (cmd_tx, mut ev, mut bodies) = start(agent, cx, l, replies).await;
+
+        cmd_tx.send(Command::Submit("go".into())).unwrap();
+        let Event::Approval { id, detail, .. } = next(&mut ev).await else { panic!() };
+        assert_eq!(&*detail, args, "the approval shows the arguments");
+        cmd_tx.send(Command::Approve { id, decision: Decision::Yes }).unwrap();
+        assert!(matches!(next(&mut ev).await, Event::ToolStart { .. }));
+        let Event::ToolEnd { ok: true, output, .. } = next(&mut ev).await else { panic!() };
+        assert_eq!(&*output, "HI");
+
+        let (b1, b2) = (bodies.recv().await.unwrap(), bodies.recv().await.unwrap());
+        let schema = r#"{"function":{"description":"Shout.","name":"shout","parameters":{"properties":{"text":{"type":"string"}},"required":["text"],"type":"object"}},"type":"function"}"#;
+        let tools_end = b1.find(r#""messages":"#).unwrap();
+        assert!(b1[..tools_end].ends_with(&format!(",\n{schema}\n],")), "{b1}");
+        assert!(b2.starts_with(&b1[..tools_end]), "the prefix holds across requests");
+        assert!(b2.contains(r#""content":"HI""#));
     }
 
     #[tokio::test]

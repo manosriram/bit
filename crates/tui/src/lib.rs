@@ -16,7 +16,6 @@ use tokio::time::{Instant, sleep_until};
 const FRAME: Duration = Duration::from_millis(33);
 const SPIN: Duration = Duration::from_millis(100);
 const DIM: &str = "2";
-const YELLOW: &str = "33";
 /// Approval bodies longer than this are cut; the model's call is still shown in full later.
 const DETAIL_ROWS: usize = 12;
 /// Rows of the model picker shown at once.
@@ -38,16 +37,26 @@ const CHOICES: [(&str, Decision); 3] = [
     ("[n]o", Decision::No),
     ("[a]lways for this session", Decision::Always),
 ];
-/// Each pixel is `██`, so strokes line up exactly.
-const LOGO: [(&str, &str); 7] = [
-    ("1", "  ██        ██    ██"),
-    ("1", "  ██              ██"),
-    ("1", "  ██████    ██  ██████"),
-    ("1", "  ██    ██  ██    ██"),
-    ("1", "  ██    ██  ██    ██"),
-    ("1", "  ██████    ██      ████"),
-    (DIM, "  01100010 01101001 01110100"),
+/// The amber logo of `assets/logo-horizontal-*.svg`, one char per pixel: `p` the flag's
+/// pole, `f` the flag, `t` the lettering. Two rows share a terminal row as half blocks,
+/// which keeps the pixels square.
+const LOGO: [&str; 10] = [
+    " pfff         ",
+    "ppfff         ",
+    "p fff         ",
+    "p             ",
+    "p  t    t  t  ",
+    "p  t       t  ",
+    "p  ttt  t ttt ",
+    "p  t  t t  t  ",
+    "p  t  t t  t  ",
+    "p  ttt  t   tt",
 ];
+/// The accent, for the logo's flag, the spinner, approvals and warnings: the brand amber,
+/// #F2B544, as the nearest xterm-256 colour, so terminals without true colour show it too.
+const AMBER: &str = "38;5;215";
+/// The logo's pole.
+const GREY: &str = "90";
 
 /// Runs the terminal UI until the user quits or the agent goes away.
 pub async fn run(
@@ -260,6 +269,16 @@ fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
 }
 
 /// Red for a removed line, green for an added one.
+/// The colour of one logo pixel; `None` for the background.
+fn fg(pixel: char) -> Option<&'static str> {
+    match pixel {
+        'p' => Some(GREY),
+        'f' => Some(AMBER),
+        't' => Some("39"),
+        _ => None,
+    }
+}
+
 fn diff_sgr(line: &str) -> &'static str {
     match line.get(..2) {
         Some("- ") => "31",
@@ -283,9 +302,21 @@ impl Ui {
             return;
         }
         let mut l = Line::new(self.color);
-        for (sgr, row) in LOGO {
-            self.done.push(l.add(sgr, row).take());
+        for pair in LOGO.chunks(2) {
+            l.add("", "  ");
+            for (top, bottom) in pair[0].chars().zip(pair[1].chars()) {
+                // shortcut: no cell stacks two colours, so a full block takes the top's.
+                let (sgr, c) = match (fg(top), fg(bottom)) {
+                    (None, None) => ("", " "),
+                    (Some(t), Some(_)) => (t, "█"),
+                    (Some(t), None) => (t, "▀"),
+                    (None, Some(b)) => (b, "▄"),
+                };
+                l.add(sgr, c);
+            }
+            self.done.push(l.take().trim_end().to_owned());
         }
+        self.done.push(l.add(DIM, "  01100010 01101001 01110100").take());
         let dir = std::env::current_dir().unwrap_or_default();
         let home = std::env::var_os("HOME").unwrap_or_default();
         let dir = match dir.strip_prefix(&home) {
@@ -525,6 +556,16 @@ impl Ui {
         agent::models::levels(&self.provider, &self.model)
     }
 
+    /// Validates the picker and Tab entry points, with the same notice when unavailable.
+    fn available_levels(&mut self) -> Option<&'static [&'static str]> {
+        let levels = self.levels();
+        if levels.is_empty() {
+            self.event(Event::Notice(self.no_levels().into()));
+            return None;
+        }
+        Some(levels)
+    }
+
     /// The picked thinking level, if the current model takes it.
     fn effort(&self) -> Option<&str> {
         self.thinking.as_deref().filter(|t| self.levels().contains(t))
@@ -532,10 +573,7 @@ impl Ui {
 
     /// The `/thinking` picker: `default` and the model's levels, from least thinking.
     fn ask_thinking(&mut self) {
-        let levels = self.levels();
-        if levels.is_empty() {
-            return self.event(Event::Notice(self.no_levels().into()));
-        }
+        let Some(levels) = self.available_levels() else { return };
         let default = self.default_label();
         let options: Vec<Box<str>> = [default.as_str()]
             .iter()
@@ -551,10 +589,7 @@ impl Ui {
     /// `Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
     /// the status line shows it and stepping through would fill the scrollback.
     fn next_thinking(&mut self, cmds: &UnboundedSender<Command>) {
-        let levels = self.levels();
-        if levels.is_empty() {
-            return self.event(Event::Notice(self.no_levels().into()));
-        }
+        let Some(levels) = self.available_levels() else { return };
         let at = self.effort().and_then(|e| levels.iter().position(|l| *l == e));
         self.thinking = levels.get(at.map_or(0, |i| i + 1)).map(|&l| l.into());
         let _ = cmds.send(Command::SetThinking(self.thinking.clone()));
@@ -753,7 +788,7 @@ impl Ui {
                 self.end_text();
                 let mut l = Line::new(self.color);
                 if n.starts_with("error:") {
-                    l.add(YELLOW, "!").add("", &format!(" {}", clean(&n)));
+                    l.add(AMBER, "!").add("", &format!(" {}", clean(&n)));
                 } else {
                     l.add(DIM, &format!("  {}", clean(&n)));
                 }
@@ -805,7 +840,7 @@ impl Ui {
                         };
                         l.add(DIM, &format!("  ({secs:.1}s{cached})"))
                     }
-                    StopReason::Cancelled => l.add(YELLOW, "!").add("", " cancelled"),
+                    StopReason::Cancelled => l.add(AMBER, "!").add("", " cancelled"),
                     StopReason::Error(e) => l.add("31", "!").add("", &format!(" {}", clean(&e))),
                 };
                 self.done.push(l.take());
@@ -934,7 +969,7 @@ impl Ui {
         let mut l = Line::new(self.color);
         if let Some((name, summary, _)) = &self.tool {
             let room = w.saturating_sub(str_width(name) + 14);
-            l.add(YELLOW, self.spinner())
+            l.add(AMBER, self.spinner())
                 .add("", " ")
                 .add("1", name)
                 .add("", &format!(" {}", clip(&clean(summary), room)))
@@ -967,7 +1002,7 @@ impl Ui {
             let e = t.elapsed();
             l.add(DIM, "-- ")
                 // No animation over a key prompt: nothing is running while it's typed.
-                .add(YELLOW, &if self.secret.is_some() { String::new() } else { self.bits() })
+                .add(AMBER, &if self.secret.is_some() { String::new() } else { self.bits() })
                 .add(
                     "",
                     &match (&self.answering, &self.secret) {
@@ -981,7 +1016,7 @@ impl Ui {
             l.fill(DIM, '-', w - right.len()).add(DIM, right);
         } else {
             if self.quit_armed {
-                l.add(DIM, "-- ").add(YELLOW, "ctrl-c again to quit").add(DIM, " ");
+                l.add(DIM, "-- ").add(AMBER, "ctrl-c again to quit").add(DIM, " ");
             }
             l.fill(DIM, '-', w - 1).add(DIM, "+");
         }
@@ -1018,7 +1053,7 @@ impl Ui {
             q.options.iter().enumerate().map(|(i, o)| format!("{}. {}", i + 1, clean(o)));
         let rows: Vec<String> = numbered.chain(["something else".into()]).collect();
         let row = self.list(f, rows.iter().map(String::as_str), q.at);
-        f.push(self.status_border(YELLOW));
+        f.push(self.status_border(AMBER));
         (row, 2)
     }
 
@@ -1052,7 +1087,7 @@ impl Ui {
         for (sgr, r) in rows.iter().skip(start).take(PICK_ROWS) {
             f.push(self.row(sgr, r));
         }
-        f.push(self.status_border(YELLOW));
+        f.push(self.status_border(AMBER));
         cursor
     }
 
@@ -1072,7 +1107,7 @@ impl Ui {
         }
         f.push(self.row("", ""));
         let row = self.list(f, CHOICES.iter().map(|c| c.0), a.at);
-        f.push(self.status_border(YELLOW));
+        f.push(self.status_border(AMBER));
         (row, 2)
     }
 
@@ -1080,15 +1115,18 @@ impl Ui {
     fn title(&self, title: &str) -> String {
         let w = self.width();
         let mut l = Line::new(self.color);
-        l.add(YELLOW, "+-- ").add("33;1", "? ").add("1", clip(title, w - 8)).add("", " ");
-        l.fill(YELLOW, '-', w - 1).add(YELLOW, "+").take()
+        l.add(AMBER, "+-- ")
+            .add(&format!("{AMBER};1"), "? ")
+            .add("1", clip(title, w - 8))
+            .add("", " ");
+        l.fill(AMBER, '-', w - 1).add(AMBER, "+").take()
     }
 
     /// One row inside the yellow box.
     fn row(&self, sgr: &str, s: &str) -> String {
         let w = self.width();
         let mut l = Line::new(self.color);
-        l.add(YELLOW, "| ").add(sgr, clip(s, w - 4)).fill("", ' ', w - 2).add(YELLOW, " |").take()
+        l.add(AMBER, "| ").add(sgr, clip(s, w - 4)).fill("", ' ', w - 2).add(AMBER, " |").take()
     }
 
     /// Rows of a list with `>` on the marked one; returns the frame row of the mark.
@@ -1281,6 +1319,21 @@ mod tests {
         assert!(!ui.status_border(DIM).contains('·'), "no levels, nothing to show");
         ui.set_model("opencode-go".into(), "glm-5.3".into(), &tx);
         assert!(ui.status_border(DIM).contains("glm-5.3 · high"));
+
+        // Picker and Tab reject unavailable levels identically, without sending commands.
+        while rx.try_recv().is_ok() {}
+        for model in ["", "unknown"] {
+            ui.model = model.into();
+            ui.done.clear();
+            ui.ask_thinking();
+            let notice = std::mem::take(&mut ui.done);
+            ui.next_thinking(&tx);
+            assert_eq!(ui.done, notice);
+            let expected = if model.is_empty() { "no model is set" } else { "no thinking levels" };
+            assert!(notice[0].contains(expected));
+            assert!(ui.question.is_none() && rx.try_recv().is_err());
+            assert_eq!(ui.thinking.as_deref(), Some("high"));
+        }
     }
 
     #[test]

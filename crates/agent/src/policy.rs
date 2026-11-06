@@ -6,15 +6,17 @@ const META: &[char] = &[';', '&', '|', '<', '>', '$', '`', '(', ')', '\n'];
 pub struct Policy {
     allow: Vec<String>,
     tools: Vec<String>,
+    /// The plugins' tools, which ask like `bash` does.
+    custom: Vec<String>,
 }
 
 impl Policy {
-    pub fn new(allow: Vec<String>) -> Self {
-        Self { allow, tools: Vec::new() }
+    pub fn new(allow: Vec<String>, custom: Vec<String>) -> Self {
+        Self { allow, tools: Vec::new(), custom }
     }
 
     pub fn check(&self, auto: bool, tool: &str, args: &str) -> bool {
-        auto || !tools::mutates(tool)
+        auto || !tools::mutates(tool) && !self.custom.iter().any(|t| t == tool)
             || self.tools.iter().any(|t| t == tool)
             || (tool == "bash" && self.allow.iter().any(|a| matches(a, &command(args))))
     }
@@ -52,7 +54,7 @@ mod tests {
 
     #[test]
     fn allowlist_extends_only_with_plain_arguments() {
-        let p = Policy::new(vec!["cargo test".into()]);
+        let p = Policy::new(vec!["cargo test".into()], vec!["deploy".into()]);
         let ok = |c: &str| p.check(false, "bash", &bash(c));
         assert!(ok("cargo test"));
         assert!(ok("cargo test -p llm"));
@@ -64,11 +66,13 @@ mod tests {
         assert!(p.check(false, "read", "{}"));
         assert!(!p.check(false, "edit", "{}"));
         assert!(p.check(true, "edit", "{}"));
+        assert!(!p.check(false, "deploy", "{}"));
+        assert!(p.check(true, "deploy", "{}"));
     }
 
     #[test]
     fn always_is_per_command_for_bash_and_per_tool_otherwise() {
-        let mut p = Policy::new(Vec::new());
+        let mut p = Policy::new(Vec::new(), Vec::new());
         p.always("bash", &bash("ls"));
         p.always("edit", "{}");
         assert!(p.check(false, "bash", &bash("ls")));
