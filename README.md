@@ -8,7 +8,7 @@
 bit is a terminal coding agent with strong focus on tiny core, size, and memory footprint.
 
 <p align="center">
-  <a href="assets/demo.mp4"><img alt="bit fixing a failing test, compacting, and resuming by id" src="assets/demo.gif" width="800"></a>
+  <a href="assets/demo.mp4"><img alt="bit fixing a failing test, compacting, then writing a plugin from one sentence that asks before rm and blocks a delete" src="assets/demo.gif" width="800"></a>
 </p>
 
 ## Why
