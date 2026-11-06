@@ -1,0 +1,15 @@
+{
+  "amber": "#F2B544",
+  "themes": {
+    "light": {
+      "pole": "#747B85",
+      "text": "#61656C",
+      "background": "#FAFAF7"
+    },
+    "dark": {
+      "pole": "#9CA3AF",
+      "text": "#D8DEE8",
+      "background": "#11151B"
+    }
+  }
+}
