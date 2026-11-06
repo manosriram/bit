@@ -190,15 +190,18 @@ impl Turn<'_> {
                 let (id, name) = (&*call.id, &*call.name);
                 // Guards run first, in every mode; a rewrite is what gets approved and run.
                 let mut args = call.args.clone();
-                let verdict = self.before(name, &mut args, replies).await;
+                let (verdict, mut acted) = self.before(name, &mut args, replies).await;
                 let args = args.as_str();
                 let summary = tools::summary(name, args);
+                let auto = self.auto.load(Relaxed);
+                // An allow is worth a tag only when it skipped an approval.
+                if verdict == Before::Allow && self.a.policy.check(auto, name, args) {
+                    acted.retain(|a| !a.starts_with("allowed by"));
+                }
                 let allowed = match &verdict {
                     Before::Allow => true,
                     Before::Block(_) => false,
-                    Before::Pass if self.a.policy.check(self.auto.load(Relaxed), name, args) => {
-                        true
-                    }
+                    Before::Pass if self.a.policy.check(auto, name, args) => true,
                     Before::Pass if self.a.print => false,
                     Before::Pass => {
                         self.send(Event::Approval {
@@ -238,9 +241,11 @@ impl Turn<'_> {
                         tools::Output { ok: false, content: why.into() }
                     }
                 };
-                out = self.after(name, args, out, replies).await;
+                out = self.after(name, args, out, &mut acted, replies).await;
                 let (ok, output) = (out.ok, out.content.as_str().into());
-                let preview = preview(name, ok, &out.content).into();
+                // What a plugin silently changed goes on the tool line, after the preview.
+                let preview = std::iter::once(preview(name, ok, &out.content)).chain(acted);
+                let preview = preview.collect::<Vec<_>>().join(" · ").into();
                 self.send(Event::ToolEnd { id: id.into(), ok, preview, output });
                 cx.messages.push(tool_msg(id, &out.content));
             }
@@ -338,14 +343,19 @@ impl Turn<'_> {
         name: &str,
         args: &mut String,
         replies: &mut UnboundedReceiver<Command>,
-    ) -> Before {
+    ) -> (Before, Vec<String>) {
         if !self.a.plugins.has("before_", name) {
-            return Before::Pass;
+            return (Before::Pass, Vec::new());
         }
         let (n, mut a, fx) = (name.to_owned(), std::mem::take(args), self.fields());
-        let (v, a) = self.hooks(replies, move |p, to| (p.before(&n, &mut a, &fx, to), a)).await;
+        let (v, a, acted) = self
+            .hooks(replies, move |p, to| {
+                let mut acted = Vec::new();
+                (p.before(&n, &mut a, &fx, to, &mut acted), a, acted)
+            })
+            .await;
         *args = a;
-        v
+        (v, acted)
     }
 
     async fn after(
@@ -353,17 +363,22 @@ impl Turn<'_> {
         name: &str,
         args: &str,
         mut out: tools::Output,
+        acted: &mut Vec<String>,
         replies: &mut UnboundedReceiver<Command>,
     ) -> tools::Output {
         if !self.a.plugins.has("after_", name) {
             return out;
         }
         let (n, a, fx) = (name.to_owned(), args.to_owned(), self.fields());
-        self.hooks(replies, move |p, to| {
-            p.after(&n, &a, &mut out, &fx, to);
-            out
-        })
-        .await
+        let (out, more) = self
+            .hooks(replies, move |p, to| {
+                let mut acted = Vec::new();
+                p.after(&n, &a, &mut out, &fx, to, &mut acted);
+                (out, acted)
+            })
+            .await;
+        acted.extend(more);
+        out
     }
 
     /// Runs `job` on a blocking thread, since a hook may run for seconds, and meanwhile puts
@@ -867,10 +882,13 @@ mod tests {
         let blocked = "error: blocked by guard.lua. hint: the user said no";
         let Event::ToolEnd { ok: false, output, .. } = next(&mut ev).await else { panic!() };
         assert_eq!(&*output, blocked);
-        // `true` runs it in ask mode without an approval.
+        // `true` runs it in ask mode without an approval, and the tool line says who did.
         assert!(matches!(next(&mut ev).await, Event::ToolStart { .. }));
-        let Event::ToolEnd { ok: true, output, .. } = next(&mut ev).await else { panic!() };
+        let Event::ToolEnd { ok: true, output, preview, .. } = next(&mut ev).await else {
+            panic!()
+        };
         assert_eq!(&*output, "hi\n");
+        assert_eq!(&*preview, "1 line · allowed by guard.lua");
         assert_eq!(next(&mut ev).await, Event::Text("done".into()));
 
         let _ = bodies.recv().await.unwrap();

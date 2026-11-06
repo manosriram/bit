@@ -163,6 +163,8 @@ end
   arguments (a table). `after_<tool>` can add to the output (a string) or replace it
   (`{ output = ... }`). `tool_<name>` adds a tool, which asks for approval in ask mode like
   `bash`. Hooks work on plugin tools too.
+- **You see what they change:** when a plugin skips your approval, rewrites a call or
+  replaces its output, the tool line says so: `[1 line · allowed by guard.lua]`.
 - **API:** `run(cmd)`, `read(path)`, `ask(question, options)` and `print(...)`.
 - **Safe by default:** a typo in a name or parameter stops startup and lists the valid
   ones. An error or a timeout (2 s) in a `before_` hook blocks the call. Each plugin gets

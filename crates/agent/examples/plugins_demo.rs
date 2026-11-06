@@ -20,7 +20,7 @@ fn fields(headless: bool) -> Fields {
 fn before(p: &Plugins, tool: &str, args: &str) -> (Before, String) {
     let (tx, _rx) = unbounded_channel();
     let mut args = args.to_owned();
-    let result = p.before(tool, &mut args, &fields(true), &tx);
+    let result = p.before(tool, &mut args, &fields(true), &tx, &mut Vec::new());
     println!("  {tool} {args}\n  => {result:?}");
     (result, args)
 }
@@ -33,7 +33,7 @@ fn tool(p: &Plugins, name: &str, args: &str) -> tools::Output {
 fn after(p: &Plugins, content: &str) -> (tools::Output, Vec<String>) {
     let (tx, mut rx) = unbounded_channel();
     let mut out = tools::Output { ok: true, content: content.into() };
-    p.after("bash", "{}", &mut out, &fields(true), &tx);
+    p.after("bash", "{}", &mut out, &fields(true), &tx, &mut Vec::new());
     println!("  model sees: {:?} (ok={})", out.content, out.ok);
     let mut notices = vec![];
     while let Ok(Req::Print(s)) = rx.try_recv() {
@@ -139,7 +139,7 @@ fn main() {
                 let q = p.clone();
                 let (tx, mut rx) = unbounded_channel();
                 let worker = std::thread::spawn(move || {
-                    q.before("bash", &mut "{}".into(), &fields(false), &tx)
+                    q.before("bash", &mut "{}".into(), &fields(false), &tx, &mut Vec::new())
                 });
                 if let Some(Req::Ask { question, options, reply }) = rx.blocking_recv() {
                     println!("\n  UI request: {question} {options:?}\n  demo response: {answer}");

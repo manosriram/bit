@@ -237,13 +237,15 @@ impl Plugins {
     }
 
     /// Runs the `before_<tool>` hooks in order. A block wins over an allow, which wins over
-    /// no opinion; an error or a timeout blocks.
+    /// no opinion; an error or a timeout blocks. Each allow and rewrite is noted in `acted`,
+    /// for the tool line.
     pub fn before(
         &self,
         tool: &str,
         args: &mut String,
         fx: &Fields,
         to: &UnboundedSender<Req>,
+        acted: &mut Vec<String>,
     ) -> Before {
         let Some(hooks) = self.routes.get(&format!("before_{tool}")) else { return Before::Pass };
         let mut v: Value = serde_json::from_str(args).unwrap_or_default();
@@ -258,13 +260,19 @@ impl Plugins {
             match self.call(h, &v, None, fx, to, BEFORE) {
                 Err(e) => return fail(&e),
                 Ok(mlua::Value::Nil | mlua::Value::Boolean(false)) => {}
-                Ok(mlua::Value::Boolean(true)) => verdict = Before::Allow,
+                Ok(mlua::Value::Boolean(true)) => {
+                    verdict = Before::Allow;
+                    acted.push(format!("allowed by {file}"));
+                }
                 Ok(mlua::Value::String(s)) => {
                     let why = s.to_string_lossy();
                     return Before::Block(format!("error: blocked by {file}. hint: {why}"));
                 }
                 Ok(mlua::Value::Table(t)) => match self.rewrite(tool, &mut v, t) {
-                    Ok(()) => changed = true,
+                    Ok(()) => {
+                        changed = true;
+                        acted.push(format!("rewritten by {file}"));
+                    }
                     Err(e) => return fail(&e),
                 },
                 Ok(r) => return fail(&format!("before_{tool} returned a {}", r.type_name())),
@@ -291,7 +299,8 @@ impl Plugins {
     }
 
     /// Runs the `after_<tool>` hooks in order. A string is appended to the output; a table's
-    /// `output` replaces it. A failing hook leaves the output alone and says so on screen.
+    /// `output` replaces it, which is noted in `acted`. A failing hook leaves the output alone
+    /// and says so on screen.
     pub fn after(
         &self,
         tool: &str,
@@ -299,6 +308,7 @@ impl Plugins {
         out: &mut tools::Output,
         fx: &Fields,
         to: &UnboundedSender<Req>,
+        acted: &mut Vec<String>,
     ) {
         let Some(hooks) = self.routes.get(&format!("after_{tool}")) else { return };
         let v: Value = serde_json::from_str(args).unwrap_or_default();
@@ -311,6 +321,7 @@ impl Plugins {
                 Ok(mlua::Value::Table(t)) => {
                     if let Ok(Some(s)) = t.get::<Option<String>>("output") {
                         out.content = s;
+                        acted.push(format!("output replaced by {file}"));
                     }
                 }
                 Ok(_) => {}
@@ -723,7 +734,7 @@ mod tests {
     fn before(p: &Plugins, tool: &str, args: &str) -> (Before, String, UnboundedReceiver<Req>) {
         let (to, rx) = unbounded_channel();
         let mut a = args.to_owned();
-        (p.before(tool, &mut a, &fields("auto", true), &to), a, rx)
+        (p.before(tool, &mut a, &fields("auto", true), &to, &mut Vec::new()), a, rx)
     }
 
     #[test]
@@ -942,6 +953,10 @@ mod tests {
         let (v, args, _) = before(&p, "bash", r#"{"command":"ls"}"#);
         assert_eq!((v, args.as_str()), (Before::Pass, r#"{"command":"ls","timeout":5}"#));
         assert!(matches!(before(&p, "read", "{}").0, Before::Block(w) if w.contains("`nope`")));
+        let (to, _rx) = unbounded_channel();
+        let (mut args, mut acted) = (r#"{"command":"ls"}"#.to_owned(), Vec::new());
+        p.before("bash", &mut args, &fields("ask", false), &to, &mut acted);
+        assert_eq!(acted, ["rewritten by a.lua"]);
     }
 
     #[test]
@@ -960,7 +975,9 @@ mod tests {
         .unwrap();
         let (to, mut rx) = unbounded_channel();
         let mut out = tools::Output { ok: true, content: "done".into() };
-        p.after("bash", r#"{"command":"ls"}"#, &mut out, &fields("ask", false), &to);
+        let mut acted = Vec::new();
+        p.after("bash", r#"{"command":"ls"}"#, &mut out, &fields("ask", false), &to, &mut acted);
+        assert_eq!(acted, ["output replaced by a.lua"], "an append isn't noted; a replace is");
         assert_eq!(out.content, "DONE\n[b.lua] ls true");
         let Ok(Req::Print(s)) = rx.try_recv() else { panic!() };
         assert_eq!(s, "[c.lua] hi\t1");
@@ -986,7 +1003,7 @@ mod tests {
         let (to, mut rx) = unbounded_channel();
         let q = p.clone();
         let h = std::thread::spawn(move || {
-            q.before("bash", &mut "{}".into(), &fields("ask", false), &to)
+            q.before("bash", &mut "{}".into(), &fields("ask", false), &to, &mut Vec::new())
         });
         let Some(Req::Ask { question, options, reply }) = rx.blocking_recv() else { panic!() };
         assert_eq!((question.as_str(), options.len()), ("ok?", 2));
