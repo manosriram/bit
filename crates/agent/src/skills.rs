@@ -11,12 +11,6 @@ pub struct Skill {
     pub path: PathBuf,
 }
 
-impl Skill {
-    fn new(name: String, description: String, path: PathBuf) -> Self {
-        Self { name, description, path }
-    }
-}
-
 /// Every skill under `dir`, sorted by name so the prompt section is stable.
 pub fn list(dir: &Path) -> Vec<Skill> {
     let mut out = Vec::new();
@@ -29,7 +23,7 @@ pub fn list(dir: &Path) -> Vec<Skill> {
         let md = path.join("SKILL.md");
         let Ok(text) = fs::read_to_string(&md) else { continue };
         let Some((name, description)) = frontmatter(&text) else { continue };
-        out.push(Skill::new(name, description, md));
+        out.push(Skill { name, description, path: md });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -46,13 +40,6 @@ pub fn section(skills: &[Skill]) -> String {
         s += &format!("- {} — {} ({})\n", k.name, k.description, k.path.display());
     }
     s
-}
-
-/// Parses a simple `name` / `description` frontmatter. SKILL.md is expected to start with
-/// `---`, contain `name:` and `description:` lines, and end with `---`; if it doesn't, the
-/// folder name and first non-empty line are used as a fallback.
-pub fn parse(text: &str) -> Option<(String, String)> {
-    frontmatter(text)
 }
 
 /// Installs a skill from a git repo into `dir`. Returns a message to show the user, or an
@@ -92,7 +79,7 @@ pub fn add(dir: &Path, repo: &str) -> Result<String, String> {
 fn install_single(dir: &Path, tmp: &Path, url: &str, name: &str) -> Result<String, String> {
     let md = tmp.join("SKILL.md");
     let text = fs::read_to_string(&md).map_err(|e| format!("{}: {e}", md.display()))?;
-    let (n, description) = parse(&text)
+    let (n, description) = frontmatter(&text)
         .ok_or_else(|| format!("{} is missing a name/description frontmatter", md.display()))?;
     let path = dir.join(name);
     if path.exists() {
@@ -123,7 +110,7 @@ fn install_multi(dir: &Path, tmp: &Path, url: &str) -> Result<String, String> {
             continue;
         }
         let text = fs::read_to_string(&md).map_err(|e| format!("{}: {e}", md.display()))?;
-        let (name, description) = parse(&text)
+        let (name, description) = frontmatter(&text)
             .ok_or_else(|| format!("{} is missing a name/description frontmatter", md.display()))?;
         let target = dir.join(&name);
         if target.exists() {
@@ -166,23 +153,50 @@ fn skill_name(url: &str) -> String {
     base.strip_suffix(".git").unwrap_or(base).into()
 }
 
+/// Parses a simple `name` / `description` frontmatter. SKILL.md is expected to start with
+/// `---`, contain `name:` and `description:` lines, and end with `---`. Only the `>` folded
+/// scalar form is supported for multiline descriptions; that is all the built-in skills use.
 fn frontmatter(text: &str) -> Option<(String, String)> {
     let mut lines = text.lines();
     if lines.next()? != "---" {
         return None;
     }
     let (mut name, mut description) = (None, None);
+    let mut folded = String::new();
+    let mut in_fold = false;
+
     for line in lines {
         if line == "---" {
             break;
         }
-        let (k, v) = line.split_once(':')?;
-        let v = v.trim();
+        if in_fold && (line.starts_with(' ') || line.starts_with('\t') || line.is_empty()) {
+            if !folded.is_empty() && !line.is_empty() {
+                folded.push(' ');
+            }
+            folded.push_str(line.trim_start());
+            continue;
+        }
+        if in_fold {
+            description = Some(folded.trim().to_owned());
+            folded.clear();
+            in_fold = false;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
         match k.trim() {
-            "name" => name = Some(v.to_owned()),
-            "description" => description = Some(v.to_owned()),
+            "name" => name = Some(v.trim().to_owned()),
+            "description" => {
+                let v = v.trim();
+                if v == ">" || v == ">-" {
+                    in_fold = true;
+                } else {
+                    description = Some(v.to_owned());
+                }
+            }
             _ => {}
         }
+    }
+    if in_fold {
+        description = Some(folded.trim().to_owned());
     }
     Some((name?, description.unwrap_or_default()))
 }
@@ -203,6 +217,17 @@ mod tests {
     #[test]
     fn missing_frontmatter_is_none() {
         assert!(frontmatter("no frontmatter").is_none());
+    }
+
+    #[test]
+    fn parses_folded_multiline_description() {
+        let md = "---\nname: ponytail\ndescription: >\n  Lazy senior dev mode: the smallest change\n  that fully solves the task.\nargument-hint: \"[lite|full|ultra|off]\"\nlicense: MIT\n---\n# Ponytail\n";
+        let (name, desc) = frontmatter(md).unwrap();
+        assert_eq!(name, "ponytail");
+        assert!(desc.contains("Lazy senior dev mode"));
+        assert!(desc.contains("fully solves the task"));
+        assert!(!desc.contains("argument-hint"));
+        assert!(!desc.contains("license"));
     }
 
     #[test]
