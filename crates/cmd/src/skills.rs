@@ -66,6 +66,16 @@ fn update_one(dir: &Path, name: &str) -> Result<(), String> {
 
 fn git_pull(path: &Path) -> Result<(), String> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+    if path.join(".git").is_dir() {
+        return pull_git(path, name);
+    }
+    if path.join(".source").is_file() {
+        return pull_source(path, name);
+    }
+    Err(format!("error: `{name}` is not a git repo and has no .source file; cannot update"))
+}
+
+fn pull_git(path: &Path, name: &str) -> Result<(), String> {
     let out = Command::new("git")
         .arg("pull")
         .current_dir(path)
@@ -77,4 +87,66 @@ fn git_pull(path: &Path) -> Result<(), String> {
     } else {
         Err(format!("error: git pull failed for {name}: {}", String::from_utf8_lossy(&out.stderr)))
     }
+}
+
+fn pull_source(path: &Path, name: &str) -> Result<(), String> {
+    let source = std::fs::read_to_string(path.join(".source"))
+        .map_err(|e| format!("error: could not read .source for {name}: {e}"))?;
+    let mut lines = source.lines();
+    let url = lines.next().ok_or_else(|| format!("error: .source for {name} has no url"))?;
+    let subpath = lines.next().unwrap_or("");
+    if url.is_empty() {
+        return Err(format!("error: .source for {name} has no url"));
+    }
+
+    let tmp = path.parent().unwrap_or(Path::new(".")).join(format!(".tmp-update-{name}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let out = Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            url,
+            tmp.to_str().unwrap_or(&format!(".tmp-update-{name}")),
+        ])
+        .output()
+        .map_err(|e| format!("error: git clone failed for {name}: {e}. {FIX}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "error: git clone failed for {name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    let src = tmp.join(subpath);
+    if !src.is_dir() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("error: source path `{}` not found for {name}", src.display()));
+    }
+
+    for e in std::fs::read_dir(path).map_err(|e| format!("error: {}: {e}", path.display()))? {
+        let e = e.map_err(|e| format!("error: {}: {e}", path.display()))?;
+        let p = e.path();
+        if p.file_name().is_some_and(|n| n == ".source") {
+            continue;
+        }
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).map_err(|e| format!("error: {}: {e}", p.display()))?;
+        } else {
+            std::fs::remove_file(&p).map_err(|e| format!("error: {}: {e}", p.display()))?;
+        }
+    }
+
+    for e in std::fs::read_dir(&src).map_err(|e| format!("error: {}: {e}", src.display()))? {
+        let e = e.map_err(|e| format!("error: {}: {e}", src.display()))?;
+        let from = e.path();
+        let to = path.join(from.file_name().unwrap_or_default());
+        std::fs::rename(&from, &to)
+            .map_err(|e| format!("error: {} -> {}: {e}", from.display(), to.display()))?;
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!("updated {name}");
+    Ok(())
 }

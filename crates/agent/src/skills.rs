@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// A skill is knowledge for the model: a folder with a `SKILL.md` file. Only the name and
@@ -19,14 +20,14 @@ impl Skill {
 /// Every skill under `dir`, sorted by name so the prompt section is stable.
 pub fn list(dir: &Path) -> Vec<Skill> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let Ok(entries) = fs::read_dir(dir) else { return out };
     for e in entries.flatten() {
         let path = e.path();
         if !path.is_dir() {
             continue;
         }
         let md = path.join("SKILL.md");
-        let Ok(text) = std::fs::read_to_string(&md) else { continue };
+        let Ok(text) = fs::read_to_string(&md) else { continue };
         let Some((name, description)) = frontmatter(&text) else { continue };
         out.push(Skill::new(name, description, md));
     }
@@ -57,34 +58,97 @@ pub fn parse(text: &str) -> Option<(String, String)> {
 /// Installs a skill from a git repo into `dir`. Returns a message to show the user, or an
 /// error string. This is synchronous so it can run inside `spawn_blocking` in the agent or
 /// directly in the CLI.
+///
+/// Two repo layouts are accepted:
+/// - A single skill: `SKILL.md` at the repo root.
+/// - A multi-skill repo: a `skills/` directory where each subdirectory has its own
+///   `SKILL.md`. Each sub-skill is installed separately under `dir` and gets a `.source`
+///   file so updates can find their origin later.
 pub fn add(dir: &Path, repo: &str) -> Result<String, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let url = normalize_repo(repo);
     let name = skill_name(&url);
-    let path = dir.join(&name);
+    let tmp = dir.join(format!(".tmp-{name}"));
+    let _ = fs::remove_dir_all(&tmp);
+    let out = std::process::Command::new("git")
+        .args(["clone", "--depth", "1", &url, tmp.to_str().unwrap_or(&name)])
+        .output()
+        .map_err(|e| format!("git clone failed: {e}. hint: install git"))?;
+    if !out.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("git clone failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let result = if tmp.join("SKILL.md").is_file() {
+        install_single(dir, &tmp, &url, &name)
+    } else if tmp.join("skills").is_dir() {
+        install_multi(dir, &tmp, &url)
+    } else {
+        Err("no SKILL.md at root and no skills/ directory found. hint: the repo should contain a SKILL.md or a skills/ folder with sub-skills".into())
+    };
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+fn install_single(dir: &Path, tmp: &Path, url: &str, name: &str) -> Result<String, String> {
+    let md = tmp.join("SKILL.md");
+    let text = fs::read_to_string(&md).map_err(|e| format!("{}: {e}", md.display()))?;
+    let (n, description) = parse(&text)
+        .ok_or_else(|| format!("{} is missing a name/description frontmatter", md.display()))?;
+    let path = dir.join(name);
     if path.exists() {
         return Err(format!(
             "skill `{name}` already exists. hint: bit skills update {name} or /skills update {name}"
         ));
     }
-    let out = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", &url, path.to_str().unwrap_or(&name)])
-        .output()
-        .map_err(|e| format!("git clone failed: {e}. hint: install git"))?;
-    if !out.status.success() {
-        let _ = std::fs::remove_dir_all(&path);
-        return Err(format!("git clone failed: {}", String::from_utf8_lossy(&out.stderr)));
-    }
-    let md = path.join("SKILL.md");
-    let text = std::fs::read_to_string(&md)
-        .map_err(|e| format!("{}: {e}. hint: a skill needs a SKILL.md", md.display()))?;
-    let (n, description) = parse(&text)
-        .ok_or_else(|| format!("{} is missing a name/description frontmatter", md.display()))?;
+    fs::rename(tmp, &path).map_err(|e| format!("could not move skill into place: {e}"))?;
+    write_source(&path, url, "")?;
     let mut msg = format!("added {name}: {description}");
     if n != name {
         msg += &format!(". warning: folder is `{name}` but frontmatter names it `{n}`");
     }
     Ok(msg)
+}
+
+fn install_multi(dir: &Path, tmp: &Path, url: &str) -> Result<String, String> {
+    let skills_dir = tmp.join("skills");
+    let mut skills = Vec::new();
+    for e in fs::read_dir(&skills_dir).map_err(|e| format!("skills/: {e}"))? {
+        let e = e.map_err(|e| format!("skills/: {e}"))?;
+        let src = e.path();
+        if !src.is_dir() {
+            continue;
+        }
+        let md = src.join("SKILL.md");
+        if !md.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&md).map_err(|e| format!("{}: {e}", md.display()))?;
+        let (name, description) = parse(&text)
+            .ok_or_else(|| format!("{} is missing a name/description frontmatter", md.display()))?;
+        let target = dir.join(&name);
+        if target.exists() {
+            return Err(format!(
+                "skill `{name}` already exists. hint: bit skills update {name} or /skills update {name}"
+            ));
+        }
+        skills.push((name, description, src, target));
+    }
+    if skills.is_empty() {
+        return Err("skills/ directory contains no sub-skills with SKILL.md".into());
+    }
+    let count = skills.len();
+    let mut lines = Vec::new();
+    for (name, description, src, target) in skills {
+        fs::rename(&src, &target).map_err(|e| format!("could not move skill `{name}`: {e}"))?;
+        write_source(&target, url, &format!("skills/{name}"))?;
+        lines.push(format!("  {name} — {description}"));
+    }
+    Ok(format!("added {count} skills:\n{}", lines.join("\n")))
+}
+
+fn write_source(path: &Path, url: &str, subpath: &str) -> Result<(), String> {
+    let text = format!("{url}\n{subpath}\n");
+    fs::write(path.join(".source"), text).map_err(|e| format!("could not write .source: {e}"))
 }
 
 fn normalize_repo(repo: &str) -> String {
