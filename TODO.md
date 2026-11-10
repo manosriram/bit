@@ -19,8 +19,11 @@
 	- In chat, `/skills` shows the same list — name, description, a count footer — as a
 	  purely local render like `/clear`: one row in the TUI's COMMANDS table, one match
 	  arm, no request, nothing in the session log. The model already has the list in its
-	  prompt, so the command is for the human. Read-only: installing stays at the shell,
-	  where the description review happens.
+	  prompt, so the command is for the human.
+	- `/skills add <repo>` also works from chat: it runs `git clone` in a blocking task,
+	  validates the SKILL.md, reloads skills into the current session's prefix, and shows
+	  the description. The same trust moment as the CLI: the description is printed before
+	  the skill is used.
 	- Code: `agent/skills.rs`, `cmd/skills.rs`, `agent/context.rs`, `tui/lib.rs`,
 	  `prompt.md`, `README.md`, `ARCHITECTURE.md` §15.
 

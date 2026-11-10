@@ -30,7 +30,7 @@ const COMMANDS: [(&str, &str, &str); 7] = [
     ("/login", "", "add a provider: paste its API key, or sign in"),
     ("/model", "[id]", "pick the model, or set it to id"),
     ("/sessions", "", "list sessions and resume another one"),
-    ("/skills", "", "show installed skills"),
+    ("/skills", "[add <repo>]", "show installed skills or add one"),
     ("/thinking", "[level]", "pick how hard the model thinks, or set it to level"),
 ];
 /// The id of the `/thinking` picker's question.
@@ -550,6 +550,21 @@ impl Ui {
                 level => self.set_thinking(level, cmds),
             };
         }
+        if let Some(rest) =
+            typed.strip_prefix("/skills").filter(|r| r.is_empty() || r.starts_with(' '))
+        {
+            self.input.take();
+            return match rest.trim() {
+                "" => self.show_skills(),
+                arg => match arg.split_once(' ') {
+                    Some(("add", repo)) if !repo.trim().is_empty() => {
+                        let _ = cmds.send(Command::SkillAdd { repo: repo.trim().into() });
+                    }
+                    _ => self
+                        .event(Event::Notice("usage: /skills or /skills add <owner/repo>".into())),
+                },
+            };
+        }
         match typed.as_str() {
             "/clear" => {
                 self.input.take();
@@ -567,10 +582,6 @@ impl Ui {
             "/sessions" => {
                 self.input.take();
                 self.list_sessions();
-            }
-            "/skills" => {
-                self.input.take();
-                self.show_skills();
             }
             _ if self.model.is_empty() => self.pick(true),
             "/compact" => {

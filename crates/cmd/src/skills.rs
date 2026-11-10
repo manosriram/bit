@@ -32,34 +32,8 @@ fn list_skills(dir: &Path) -> Result<(), String> {
 }
 
 fn add(dir: &Path, repo: &str) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("error: {}: {e}", dir.display()))?;
-    let url = normalize_repo(repo);
-    let name = skill_name(&url);
-    let path = dir.join(&name);
-    if path.exists() {
-        return Err(format!(
-            "error: skill `{name}` already exists. hint: bit skills update {name}"
-        ));
-    }
-    let out = Command::new("git")
-        .args(["clone", "--depth", "1", &url, path.to_str().unwrap_or(&name)])
-        .output()
-        .map_err(|e| format!("error: git clone failed: {e}. {FIX}"))?;
-    if !out.status.success() {
-        let _ = std::fs::remove_dir_all(&path);
-        return Err(format!("error: git clone failed: {}", String::from_utf8_lossy(&out.stderr)));
-    }
-    let md = path.join("SKILL.md");
-    let text = std::fs::read_to_string(&md)
-        .map_err(|e| format!("error: {}: {e}. hint: a skill needs a SKILL.md", md.display()))?;
-    let (n, description) = agent::skills::parse(&text).ok_or_else(|| {
-        format!("error: {} is missing a name/description frontmatter", md.display())
-    })?;
-    if n != name {
-        // The directory name is the handle; allow the frontmatter name to differ, but warn.
-        eprintln!("bit: warning: skill folder is `{name}` but frontmatter names it `{n}`");
-    }
-    println!("added {name}: {description}");
+    let msg = agent::skills::add(dir, repo).map_err(|e| format!("error: {e}"))?;
+    println!("{msg}");
     Ok(())
 }
 
@@ -102,31 +76,5 @@ fn git_pull(path: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("error: git pull failed for {name}: {}", String::from_utf8_lossy(&out.stderr)))
-    }
-}
-
-fn normalize_repo(repo: &str) -> String {
-    if repo.contains("://") || repo.starts_with("git@") {
-        repo.into()
-    } else if repo.contains('/') {
-        format!("https://github.com/{repo}.git")
-    } else {
-        format!("https://github.com/{repo}/{repo}.git")
-    }
-}
-
-fn skill_name(url: &str) -> String {
-    let base = url.rsplit('/').next().unwrap_or(url);
-    base.strip_suffix(".git").unwrap_or(base).into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_short_repo() {
-        assert_eq!(normalize_repo("owner/repo"), "https://github.com/owner/repo.git");
-        assert_eq!(skill_name("https://github.com/owner/repo.git"), "repo");
     }
 }

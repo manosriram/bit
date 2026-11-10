@@ -54,6 +54,54 @@ pub fn parse(text: &str) -> Option<(String, String)> {
     frontmatter(text)
 }
 
+/// Installs a skill from a git repo into `dir`. Returns a message to show the user, or an
+/// error string. This is synchronous so it can run inside `spawn_blocking` in the agent or
+/// directly in the CLI.
+pub fn add(dir: &Path, repo: &str) -> Result<String, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let url = normalize_repo(repo);
+    let name = skill_name(&url);
+    let path = dir.join(&name);
+    if path.exists() {
+        return Err(format!(
+            "skill `{name}` already exists. hint: bit skills update {name} or /skills update {name}"
+        ));
+    }
+    let out = std::process::Command::new("git")
+        .args(["clone", "--depth", "1", &url, path.to_str().unwrap_or(&name)])
+        .output()
+        .map_err(|e| format!("git clone failed: {e}. hint: install git"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&path);
+        return Err(format!("git clone failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let md = path.join("SKILL.md");
+    let text = std::fs::read_to_string(&md)
+        .map_err(|e| format!("{}: {e}. hint: a skill needs a SKILL.md", md.display()))?;
+    let (n, description) = parse(&text)
+        .ok_or_else(|| format!("{} is missing a name/description frontmatter", md.display()))?;
+    let mut msg = format!("added {name}: {description}");
+    if n != name {
+        msg += &format!(". warning: folder is `{name}` but frontmatter names it `{n}`");
+    }
+    Ok(msg)
+}
+
+fn normalize_repo(repo: &str) -> String {
+    if repo.contains("://") || repo.starts_with("git@") {
+        repo.into()
+    } else if repo.contains('/') {
+        format!("https://github.com/{repo}.git")
+    } else {
+        format!("https://github.com/{repo}/{repo}.git")
+    }
+}
+
+fn skill_name(url: &str) -> String {
+    let base = url.rsplit('/').next().unwrap_or(url);
+    base.strip_suffix(".git").unwrap_or(base).into()
+}
+
 fn frontmatter(text: &str) -> Option<(String, String)> {
     let mut lines = text.lines();
     if lines.next()? != "---" {
@@ -99,5 +147,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(list(&dir).is_empty());
+    }
+
+    #[test]
+    fn normalizes_short_repo() {
+        assert_eq!(normalize_repo("owner/repo"), "https://github.com/owner/repo.git");
+        assert_eq!(skill_name("https://github.com/owner/repo.git"), "repo");
     }
 }

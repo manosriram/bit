@@ -59,6 +59,8 @@ pub struct Agent {
     pub thinking: Option<String>,
     /// `auth.json`, where `/login` saves the ChatGPT tokens.
     pub auth: PathBuf,
+    /// Where skills live, so `/skills add` can reload them into the current session.
+    pub skills_dir: PathBuf,
     /// No user is present (`bit -p`): a resumed history isn't replayed, a call that needs
     /// approval is declined without asking, and `ask` gets no answer.
     pub print: bool,
@@ -124,6 +126,26 @@ pub async fn run(
             Command::Resume(prefix) => {
                 if let Err(e) = resume(&mut agent, &mut cx, &prefix, &events) {
                     let _ = events.send(Event::Notice(format!("error: {e}").into()));
+                }
+                continue;
+            }
+            Command::SkillAdd { repo } => {
+                let dir = agent.skills_dir.clone();
+                let tx = events.clone();
+                let _ = tx.send(Event::Notice(format!("installing skill from {repo}...").into()));
+                match tokio::task::spawn_blocking(move || crate::skills::add(&dir, &repo)).await {
+                    Ok(Ok(msg)) => {
+                        cx.add_skills(crate::skills::list(&agent.skills_dir));
+                        let _ = tx.send(Event::Notice(msg.into()));
+                    }
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Event::Notice(format!("error: {e}").into()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Event::Notice(
+                            format!("error: skill install panicked: {e}").into(),
+                        ));
+                    }
                 }
                 continue;
             }
@@ -734,6 +756,7 @@ async fn listen(
             | Command::SetThinking(_)
             | Command::Clear
             | Command::Resume(_)
+            | Command::SkillAdd { .. }
             | Command::Compact
             | Command::Login => {}
         }
@@ -778,7 +801,7 @@ mod tests {
             client: llm::Client::new(&format!("http://{addr}"), "k", Vec::new(), llm::Api::Chat),
             providers: Vec::new(),
             provider: "p".into(),
-            tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir },
+            tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir.clone() },
             policy: Policy::new(Vec::new(), Vec::new()),
             mode: Mode::Ask,
             session,
@@ -786,6 +809,7 @@ mod tests {
             remember: None,
             thinking: None,
             auth,
+            skills_dir: dir.join("skills"),
             print: false,
             plugins: Default::default(),
         }

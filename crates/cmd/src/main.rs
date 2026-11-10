@@ -129,6 +129,7 @@ fn run(args: args::Args) -> Result<(), String> {
             remember: Some(cfg.remember),
             thinking: cfg.thinking.clone(),
             auth: cfg.auth,
+            skills_dir: cfg.skills.clone(),
             print,
             plugins: Arc::new(plugins),
         };

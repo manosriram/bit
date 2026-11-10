@@ -70,7 +70,7 @@ ask/auto, `Tab` next thinking level, `Up`/`Down` earlier prompts, `Option-Left`/
 /model [id]        pick the model, or set it to id
 /thinking [level]  pick how hard the model thinks, or set it to level
 /sessions          list sessions and resume another one
-/skills            show installed skills
+/skills [add <repo>]  show installed skills or add one
 /compact           summarize the conversation to free up context
 /clear             start over; the model forgets this conversation
 ```
