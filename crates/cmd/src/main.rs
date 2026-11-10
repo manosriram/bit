@@ -1,6 +1,7 @@
 mod args;
 mod config;
 mod print;
+mod skills;
 
 use agent::session::{self, Session};
 use std::path::Path;
@@ -32,7 +33,10 @@ fn main() -> ExitCode {
 fn run(args: args::Args) -> Result<(), String> {
     if args.print_prompt {
         let model = args.model.as_deref().unwrap_or("");
-        println!("{}", agent::Context::new(model, None, Vec::new()).prefix());
+        let cfg = config::load()?;
+        let mut cx = agent::Context::new(model, None, Vec::new());
+        cx.add_skills(agent::skills::list(&cfg.skills));
+        println!("{}", cx.prefix());
         return Ok(());
     }
     match args.sub.iter().map(String::as_str).collect::<Vec<_>>()[..] {
@@ -42,10 +46,11 @@ fn run(args: args::Args) -> Result<(), String> {
             return Ok(());
         }
         ["plugins"] => return plugins(&config::load()?.plugins),
+        ["skills", ..] => return skills::run(&args.sub[1..], &config::load()?.skills),
         _ => {
             let s = args.sub.join(" ");
             return Err(format!(
-                "error: unknown command `{s}`. hint: bit plugins, bit plugins guide"
+                "error: unknown command `{s}`. hint: bit plugins, bit plugins guide, bit skills"
             ));
         }
     }
@@ -55,6 +60,7 @@ fn run(args: args::Args) -> Result<(), String> {
     } else {
         agent::Plugins::load(&cfg.plugins).map_err(|e| format!("{e}\n{FIX}"))?
     };
+    let skills = if args.no_plugins { Vec::new() } else { agent::skills::list(&cfg.skills) };
     let cwd = std::env::current_dir().map_err(|e| format!("error: current directory: {e}"))?;
     let dir = cfg.sessions.clone();
     let found = match (&args.resume, args.cont) {
@@ -98,6 +104,7 @@ fn run(args: args::Args) -> Result<(), String> {
     let id = session.id().to_owned();
     let mut cx = agent::Context::new(&model, agent::cache_key(&provider, &id), messages);
     cx.add_tools(plugins.schemas());
+    cx.add_skills(skills.clone());
     let (client, no_key) = (agent::connect(p, &id), p.key.clone().err());
     let mode = if args.auto { agent::proto::Mode::Auto } else { agent::proto::Mode::Ask };
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -113,7 +120,7 @@ fn run(args: args::Args) -> Result<(), String> {
             provider: provider.clone(),
             no_key,
             tools: agent::ToolCtx {
-                cwd,
+                cwd: cwd.clone(),
                 spill: std::env::temp_dir().join(format!("bit-{}", std::process::id())),
             },
             policy: agent::Policy::new(cfg.allow, plugins.tools()),
@@ -133,9 +140,22 @@ fn run(args: args::Args) -> Result<(), String> {
             }
             None => {
                 let at = (provider.as_str(), model.as_str(), cfg.thinking.as_deref());
-                tui::run(cmd_tx, ev_rx, at, &cfg.providers, mode, &notices)
-                    .await
-                    .map_err(|e| format!("error: terminal: {e}"))
+                tui::run(
+                    cmd_tx,
+                    ev_rx,
+                    at,
+                    &cfg.providers,
+                    mode,
+                    &notices,
+                    (
+                        cfg.skills.clone(),
+                        cfg.sessions.clone(),
+                        cwd.clone(),
+                        id.clone().into_boxed_str(),
+                    ),
+                )
+                .await
+                .map_err(|e| format!("error: terminal: {e}"))
             }
         }
     });

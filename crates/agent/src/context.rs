@@ -1,3 +1,4 @@
+use crate::skills::Skill;
 use serde_json::value::RawValue;
 
 const PROMPT: &str = include_str!("prompt.md");
@@ -9,6 +10,8 @@ pub struct Context {
     pub(crate) model: String,
     /// The working directory and its AGENTS.md, read once so the prefix stays fixed.
     project: String,
+    /// Installed skills, read once at startup so the prefix stays fixed.
+    skills: Vec<Skill>,
     pub(crate) cache_key: Option<String>,
     /// The tool schemas: the built-ins, then the plugins' own.
     tools: String,
@@ -30,6 +33,7 @@ impl Context {
             prefix,
             model: String::new(),
             project,
+            skills: Vec::new(),
             cache_key,
             tools: tools::SCHEMAS.into(),
             thinking: None,
@@ -41,6 +45,16 @@ impl Context {
         // A lone user message is kept: on load it can only be a compaction summary.
         cx.answer_open("error: bit stopped before this call finished");
         cx
+    }
+
+    /// Adds installed skills to the prompt. Called once, before the first request, so the
+    /// prefix stays fixed for the session.
+    pub fn add_skills(&mut self, skills: Vec<Skill>) {
+        if skills.is_empty() {
+            return;
+        }
+        self.skills = skills;
+        self.set_model(&self.model.clone());
     }
 
     pub(crate) fn set_model(&mut self, model: &str) {
@@ -57,7 +71,8 @@ impl Context {
         prefix.push_str(&self.tools);
         prefix.push_str(",\"messages\":[");
         // Models take their name from the history otherwise, and keep the old one after a switch.
-        let mut prompt = format!("{PROMPT}{}", self.project);
+        let mut prompt =
+            format!("{PROMPT}{}{}", self.project, crate::skills::section(&self.skills));
         if !model.is_empty() {
             prompt +=
                 &format!("\nYour model id is {model}. If asked which model you are, say {model}.");

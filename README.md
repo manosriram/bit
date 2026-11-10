@@ -52,6 +52,10 @@ bit -p "<prompt>"  run one turn and exit: the reply on stdout, exit 1 if it fail
 --no-plugins       start without plugins
 bit plugins        check that every plugin loads, and list its hooks and tools
 bit plugins guide  print the plugin guide
+bit skills         list installed skills
+bit skills add <repo>    install a skill from a git repo
+bit skills remove <name> remove a skill
+bit skills update [<name>] pull the latest skill(s)
 ```
 
 In `-p` mode nobody can approve, so write, edit and bash are declined unless `--mode auto`
@@ -65,6 +69,8 @@ ask/auto, `Tab` next thinking level, `Up`/`Down` earlier prompts, `Option-Left`/
 /login             add a provider: paste its API key, or sign in
 /model [id]        pick the model, or set it to id
 /thinking [level]  pick how hard the model thinks, or set it to level
+/sessions          list sessions and resume another one
+/skills            show installed skills
 /compact           summarize the conversation to free up context
 /clear             start over; the model forgets this conversation
 ```
@@ -97,7 +103,7 @@ the key's variable, which wins over a saved key. More in
 [docs/providers.md](docs/providers.md).
 
 Everything bit keeps is in `~/.config/bit/` (or `$XDG_CONFIG_HOME/bit/`): `config.toml`,
-`auth.json`, `model` (the last pick), `sessions/` and `plugins/`.
+`auth.json`, `model` (the last pick), `sessions/`, `plugins/` and `skills/`.
 
 ## Config
 

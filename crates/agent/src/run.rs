@@ -3,7 +3,7 @@ use crate::plugins::{Before, Fields, Plugins, Req};
 use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::providers::{self, Auth};
-use crate::session::Session;
+use crate::session::{self, Session};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::path::{Path, PathBuf};
@@ -118,6 +118,12 @@ pub async fn run(
                 cx.tokens = 0;
                 if let Err(e) = agent.session.clear() {
                     let _ = events.send(save_failed(&e));
+                }
+                continue;
+            }
+            Command::Resume(prefix) => {
+                if let Err(e) = resume(&mut agent, &mut cx, &prefix, &events) {
+                    let _ = events.send(Event::Notice(format!("error: {e}").into()));
                 }
                 continue;
             }
@@ -589,6 +595,51 @@ fn count(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+/// Loads a different session mid-run. The current session is already on disk, so we swap to
+/// the picked file and continue from there.
+fn resume(
+    agent: &mut Agent,
+    cx: &mut Context,
+    prefix: &str,
+    events: &UnboundedSender<Event>,
+) -> std::io::Result<()> {
+    let dir = agent.session.path().parent().unwrap_or(Path::new("."));
+    let path = session::find(dir, prefix).map_err(std::io::Error::other)?;
+    let loaded = Session::open(&path)?;
+    let (prov, model) = (loaded.session.provider().to_owned(), loaded.session.model().to_owned());
+    let known =
+        !prov.is_empty() && !model.is_empty() && agent.providers.iter().any(|p| p.name == prov);
+    let id = loaded.session.id().to_owned();
+    agent.session = loaded.session;
+    cx.messages = loaded.messages;
+    cx.tokens = 0;
+    let current_model = cx.model.clone();
+    let (provider, model) = if known {
+        agent.provider = prov.clone();
+        (prov.as_str(), model.as_str())
+    } else {
+        (agent.provider.as_str(), current_model.as_str())
+    };
+    let p =
+        agent.providers.iter().find(|p| p.name == provider).ok_or_else(|| {
+            std::io::Error::other(format!("provider `{provider}` is not configured"))
+        })?;
+    agent.client = connect(p, &id);
+    cx.cache_key = cache_key(provider, &id).map(Into::into);
+    cx.set_model(model);
+    set_thinking(agent, cx);
+    if !agent.print {
+        replay(cx, events);
+    }
+    let note = format!("resumed {} ({})", id, count(cx.messages.len(), "message"));
+    let _ = events.send(Event::Notice(note.into()));
+    if !known && !(prov.is_empty() && model.is_empty()) {
+        let n = format!("session used {prov}/{model}; continuing with {provider}/{model}");
+        let _ = events.send(Event::Notice(n.into()));
+    }
+    Ok(())
+}
+
 /// Sends a resumed history to the UI as the events it would have seen live.
 fn replay(cx: &Context, events: &UnboundedSender<Event>) {
     let send = |e| {
@@ -682,6 +733,7 @@ async fn listen(
             | Command::SetModel { .. }
             | Command::SetThinking(_)
             | Command::Clear
+            | Command::Resume(_)
             | Command::Compact
             | Command::Login => {}
         }

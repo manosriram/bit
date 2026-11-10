@@ -24,6 +24,8 @@ pub enum Command {
     SetThinking(Option<Box<str>>),
     /// Drops the history. Sent only while idle.
     Clear,
+    /// Loads a different session by id prefix. Sent only while idle.
+    Resume(Box<str>),
     /// Summarizes the history now. Runs like a turn and ends with `TurnEnd`.
     Compact,
     /// Asks which provider to sign in to, then signs in. Runs like a turn.

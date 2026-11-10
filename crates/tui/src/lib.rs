@@ -9,7 +9,8 @@ use input::Input;
 use markdown::Markdown;
 use render::{Line, Term, clip, str_width, wrap};
 use std::io;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Instant, sleep_until};
 
@@ -23,15 +24,19 @@ const PICK_ROWS: usize = 10;
 /// Last rows of a command's output shown under its tool line.
 const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 5] = [
+const COMMANDS: [(&str, &str, &str); 7] = [
     ("/clear", "", "start over; the model forgets this conversation"),
     ("/compact", "", "summarize the conversation to free up context"),
     ("/login", "", "add a provider: paste its API key, or sign in"),
     ("/model", "[id]", "pick the model, or set it to id"),
+    ("/sessions", "", "list sessions and resume another one"),
+    ("/skills", "", "show installed skills"),
     ("/thinking", "[level]", "pick how hard the model thinks, or set it to level"),
 ];
 /// The id of the `/thinking` picker's question.
 const THINKING: &str = "thinking";
+/// The id of the `/sessions` picker's question.
+const SESSIONS: &str = "sessions";
 const CHOICES: [(&str, Decision); 3] = [
     ("[y]es", Decision::Yes),
     ("[n]o", Decision::No),
@@ -66,12 +71,17 @@ pub async fn run(
     providers: &[agent::Provider],
     mode: Mode,
     notices: &[String],
+    (skills_dir, sessions, cwd, session): (PathBuf, PathBuf, PathBuf, Box<str>),
 ) -> io::Result<()> {
     let mut ui = Ui {
         provider: provider.into(),
         model: model.into(),
         thinking: thinking.map(Into::into),
         providers: providers.into(),
+        skills_dir,
+        sessions,
+        cwd,
+        session,
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
         auto: mode == Mode::Auto,
@@ -161,6 +171,14 @@ struct Ui {
     thinking: Option<Box<str>>,
     /// Every provider, with what the model picker offers for each.
     providers: Vec<agent::Provider>,
+    /// Where the skills live, scanned when `/skills` is typed.
+    skills_dir: PathBuf,
+    /// Where the session logs live, for `/sessions`.
+    sessions: PathBuf,
+    /// The working directory, to show on sessions from other directories.
+    cwd: PathBuf,
+    /// The current session id, to mark in the `/sessions` list.
+    session: Box<str>,
     picker: Option<Picker>,
     /// The marked row of the slash-command list.
     menu: usize,
@@ -290,6 +308,22 @@ fn diff_sgr(line: &str) -> &'static str {
 /// Control characters could move the cursor and break the layout.
 fn clean(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// A human-readable relative time like "2h" or "3d".
+fn ago(t: SystemTime) -> String {
+    let d = SystemTime::now().duration_since(t).unwrap_or_default();
+    if d < Duration::from_secs(60) {
+        "now".into()
+    } else if d < Duration::from_secs(3600) {
+        format!("{}m", d.as_secs() / 60)
+    } else if d < Duration::from_secs(86400) {
+        format!("{}h", d.as_secs() / 3600)
+    } else if d < Duration::from_secs(604800) {
+        format!("{}d", d.as_secs() / 86400)
+    } else {
+        format!("{}w", d.as_secs() / 604800)
+    }
 }
 
 impl Ui {
@@ -464,6 +498,11 @@ impl Ui {
             // <level>` is its `something else`.
             Some(o) if &*id == THINKING => self.set_thinking(&o, cmds),
             None if &*id == THINKING => {}
+            Some(o) if &*id == SESSIONS => {
+                let prefix = o.split_whitespace().next().unwrap_or(&o);
+                let _ = cmds.send(Command::Resume(prefix.into()));
+            }
+            None if &*id == SESSIONS => {}
             Some(text) => {
                 let _ = cmds.send(Command::Answer { id, text });
             }
@@ -525,6 +564,14 @@ impl Ui {
                 let _ = cmds.send(Command::Login);
                 (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
             }
+            "/sessions" => {
+                self.input.take();
+                self.list_sessions();
+            }
+            "/skills" => {
+                self.input.take();
+                self.show_skills();
+            }
             _ if self.model.is_empty() => self.pick(true),
             "/compact" => {
                 self.input.take();
@@ -584,6 +631,57 @@ impl Ui {
         let at = options.iter().position(|o| Some(&**o) == self.effort()).unwrap_or(0);
         let text = format!("How hard should {} think?", self.model).into();
         self.question = Some(Question { id: THINKING.into(), text, options, at });
+    }
+
+    /// `/skills`: list installed skills for the human. The model already has them in its prompt.
+    fn show_skills(&mut self) {
+        let skills = agent::skills::list(&self.skills_dir);
+        if skills.is_empty() {
+            self.event(Event::Notice(
+                "no skills installed. hint: bit skills add <owner/repo>".into(),
+            ));
+            return;
+        }
+        let lines: Vec<String> =
+            skills.iter().map(|k| format!("  {} — {}", k.name, k.description)).collect();
+        for line in lines {
+            self.event(Event::Notice(line.into()));
+        }
+        let n = format!(
+            "{} skill{}; the model reads a skill's SKILL.md only when a task matches",
+            skills.len(),
+            if skills.len() == 1 { "" } else { "s" }
+        );
+        self.event(Event::Notice(n.into()));
+    }
+
+    /// `/sessions`: list sessions and open a picker. The model is not involved.
+    fn list_sessions(&mut self) {
+        let Ok(entries) = agent::session::list(&self.sessions) else {
+            self.event(Event::Notice("error: could not list sessions".into()));
+            return;
+        };
+        if entries.is_empty() {
+            self.event(Event::Notice("no sessions — start one with bit".into()));
+            return;
+        }
+        let mut options = Vec::new();
+        for e in entries {
+            let id = &e.id[..e.id.len().min(8)];
+            let preview = if e.preview.is_empty() { "(no preview)".into() } else { e.preview };
+            let cwd =
+                if e.cwd == self.cwd { "".to_string() } else { format!("  {}", e.cwd.display()) };
+            let current = if e.id == *self.session { "  ← current" } else { "" };
+            let line =
+                format!("{}  {:<50} {}{}{}", id, clip(&preview, 50), ago(e.modified), cwd, current);
+            options.push(line.into_boxed_str());
+        }
+        self.question = Some(Question {
+            id: SESSIONS.into(),
+            text: "Pick a session to resume".into(),
+            options,
+            at: 0,
+        });
     }
 
     /// `Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
