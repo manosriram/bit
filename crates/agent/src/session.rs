@@ -77,6 +77,10 @@ impl Session {
         self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn append(&mut self, messages: &[Box<RawValue>]) -> io::Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -166,6 +170,58 @@ pub fn latest(dir: &Path, cwd: &Path) -> io::Result<Option<PathBuf>> {
         }
     }
     Ok(found.map(|(_, p)| p))
+}
+
+/// A session on disk, as `/sessions` lists it.
+pub struct Entry {
+    pub id: String,
+    pub cwd: PathBuf,
+    pub provider: String,
+    pub model: String,
+    /// First user message, truncated for the list.
+    pub preview: String,
+    pub modified: std::time::SystemTime,
+}
+
+/// Every session under `dir`, newest first. Reads each file's header and first user message.
+pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
+    #[derive(Deserialize)]
+    struct Msg<'a> {
+        role: &'a str,
+        content: &'a str,
+    }
+
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let path = e.path();
+        if !path.extension().is_some_and(|e| e == "jsonl") {
+            continue;
+        }
+        let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        let mut lines = BufReader::new(File::open(&path)?).lines();
+        let Some(line) = lines.next().transpose()? else { continue };
+        let Some(r) = serde_json::from_str::<Record>(&line).ok().filter(|r| r.t == "header") else {
+            continue;
+        };
+        let cwd = r.cwd.unwrap_or_default();
+        let (provider, model) = (r.provider.unwrap_or_default(), r.model.unwrap_or_default());
+        let mut preview = String::new();
+        for line in lines {
+            let line = line?;
+            if let Ok(m) = serde_json::from_str::<Msg>(&line)
+                && m.role == "user"
+            {
+                preview = m.content.chars().take(60).collect();
+                break;
+            }
+        }
+        let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").into();
+        out.push(Entry { id, cwd, provider, model, preview, modified });
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.modified));
+    Ok(out)
 }
 
 /// The one session whose id starts with `prefix`.

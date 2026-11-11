@@ -3,7 +3,7 @@ use crate::plugins::{Before, Fields, Plugins, Req};
 use crate::policy::Policy;
 use crate::proto::{Command, Decision, Event, Mode, StopReason};
 use crate::providers::{self, Auth};
-use crate::session::Session;
+use crate::session::{self, Session};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,8 @@ pub struct Agent {
     pub thinking: Option<String>,
     /// `auth.json`, where `/login` saves the ChatGPT tokens.
     pub auth: PathBuf,
+    /// Where skills live, so `/skills add` can reload them into the current session.
+    pub skills_dir: PathBuf,
     /// No user is present (`bit -p`): a resumed history isn't replayed, a call that needs
     /// approval is declined without asking, and `ask` gets no answer.
     pub print: bool,
@@ -74,12 +76,7 @@ pub async fn run(
     events: UnboundedSender<Event>,
 ) {
     if !cx.messages.is_empty() {
-        if !agent.print {
-            replay(&cx, &events);
-        }
-        let note =
-            format!("resumed {} ({})", agent.session.id(), count(cx.messages.len(), "message"));
-        let _ = events.send(Event::Notice(note.into()));
+        resumed(&agent, &cx, &events);
     }
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
     // only because `tokio::spawn` needs the future to be `Send`.
@@ -121,12 +118,39 @@ pub async fn run(
                 }
                 continue;
             }
+            Command::Resume(prefix) => {
+                if let Err(e) = resume(&mut agent, &mut cx, &prefix, &events) {
+                    let _ = events.send(Event::Notice(format!("error: {e}").into()));
+                }
+                continue;
+            }
+            Command::SkillAdd { repo } => {
+                let dir = agent.skills_dir.clone();
+                let n = format!("installing skill from {repo}...");
+                let _ = events.send(Event::Notice(n.into()));
+                let n = match tokio::task::spawn_blocking(move || crate::skills::add(&dir, &repo))
+                    .await
+                {
+                    Ok(Ok(msg)) => {
+                        cx.add_skills(crate::skills::list(&agent.skills_dir));
+                        msg
+                    }
+                    Ok(Err(e)) => format!("error: {e}"),
+                    Err(e) => format!("error: skill install panicked: {e}"),
+                };
+                let _ = events.send(Event::Notice(n.into()));
+                continue;
+            }
             Command::Approve { .. } | Command::Answer { .. } | Command::Cancel => continue,
         };
         while replies.try_recv().is_ok() {}
         let len = cx.messages.len();
         if let Some(text) = &text {
-            cx.messages.push(msg("user", text));
+            let (text, skill) = crate::skills::invoke(&agent.skills_dir, text);
+            if let Some(name) = skill {
+                let _ = events.send(Event::Notice(format!("using skill {name}").into()));
+            }
+            cx.messages.push(msg("user", &text));
         }
         let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
         let work = async {
@@ -153,7 +177,7 @@ pub async fn run(
         }
         turn.save(&cx);
         if let Err(e) = turn.a.session.sync() {
-            turn.save_failed(&e);
+            turn.send(save_failed(&e));
         }
         // A send fails only once the UI is gone, and then the command channel closes too.
         let _ = events.send(Event::TurnEnd(reason));
@@ -182,7 +206,7 @@ impl Turn<'_> {
             let c = self.request(cx).await.map_err(|e| StopReason::Error(e.to_string().into()))?;
             cx.tokens = c.usage.input;
             if let Err(e) = self.a.session.usage(&c.usage) {
-                self.save_failed(&e);
+                self.send(save_failed(&e));
             }
             cx.messages.push(c.message);
             self.send(Event::Usage(c.usage));
@@ -421,7 +445,7 @@ impl Turn<'_> {
     /// never holds a tool call without its result.
     fn save(&mut self, cx: &Context) {
         if let Err(e) = self.a.session.append(&cx.messages[self.a.session.logged..]) {
-            self.save_failed(&e);
+            self.send(save_failed(&e));
         }
     }
 
@@ -450,20 +474,16 @@ impl Turn<'_> {
             }
         };
         if let Err(e) = self.a.session.usage(&c.usage) {
-            self.save_failed(&e);
+            self.send(save_failed(&e));
         }
         let summary = msg("user", &format!("{SUMMARY}\n\n{}{LATEST}{latest}", text(&c.message)));
         if let Err(e) = self.a.session.compact(&summary) {
-            self.save_failed(&e);
+            self.send(save_failed(&e));
         }
         let n = cx.messages.len();
         (cx.messages, cx.tokens) = (vec![summary], 0);
         let k = f64::from(c.usage.input) / 1e3;
         self.send(Event::Notice(format!("compacted {n} messages ({k:.1}k tokens)").into()));
-    }
-
-    fn save_failed(&self, e: &std::io::Error) {
-        self.send(save_failed(e));
     }
 
     /// One model request, retried after 1s and 3s while nothing from it has reached the screen.
@@ -589,6 +609,56 @@ fn count(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+/// Loads a different session mid-run. The current session is already on disk, so we swap to
+/// the picked file and continue from there.
+fn resume(
+    agent: &mut Agent,
+    cx: &mut Context,
+    prefix: &str,
+    events: &UnboundedSender<Event>,
+) -> std::io::Result<()> {
+    let dir = agent.session.path().parent().unwrap_or(Path::new("."));
+    let path = session::find(dir, prefix).map_err(std::io::Error::other)?;
+    let loaded = Session::open(&path)?;
+    let (prov, model) = (loaded.session.provider().to_owned(), loaded.session.model().to_owned());
+    let known =
+        !prov.is_empty() && !model.is_empty() && agent.providers.iter().any(|p| p.name == prov);
+    let id = loaded.session.id().to_owned();
+    agent.session = loaded.session;
+    cx.messages = loaded.messages;
+    cx.tokens = 0;
+    let current_model = cx.model.clone();
+    let (provider, model) = if known {
+        agent.provider = prov.clone();
+        (prov.as_str(), model.as_str())
+    } else {
+        (agent.provider.as_str(), current_model.as_str())
+    };
+    let p =
+        agent.providers.iter().find(|p| p.name == provider).ok_or_else(|| {
+            std::io::Error::other(format!("provider `{provider}` is not configured"))
+        })?;
+    agent.client = connect(p, &id);
+    cx.cache_key = cache_key(provider, &id).map(Into::into);
+    cx.set_model(model);
+    set_thinking(agent, cx);
+    resumed(agent, cx, events);
+    if !known && !(prov.is_empty() && model.is_empty()) {
+        let n = format!("session used {prov}/{model}; continuing with {provider}/{model}");
+        let _ = events.send(Event::Notice(n.into()));
+    }
+    Ok(())
+}
+
+/// Shows a loaded history, unless nobody is there to see it, and says it was resumed.
+fn resumed(agent: &Agent, cx: &Context, events: &UnboundedSender<Event>) {
+    if !agent.print {
+        replay(cx, events);
+    }
+    let n = count(cx.messages.len(), "message");
+    let _ = events.send(Event::Notice(format!("resumed {} ({n})", agent.session.id()).into()));
+}
+
 /// Sends a resumed history to the UI as the events it would have seen live.
 fn replay(cx: &Context, events: &UnboundedSender<Event>) {
     let send = |e| {
@@ -598,6 +668,8 @@ fn replay(cx: &Context, events: &UnboundedSender<Event>) {
     for m in &cx.messages {
         let v: Value = serde_json::from_str(m.get()).unwrap_or_default();
         let text = v["content"].as_str().unwrap_or("");
+        // An invoked skill's body was added for the model, not typed.
+        let text = text.split(crate::skills::MARK).next().unwrap_or(text);
         match v["role"].as_str() {
             Some("user") => match text.strip_prefix(SUMMARY) {
                 Some(rest) => {
@@ -678,12 +750,8 @@ async fn listen(
                 let _ = replies.send(c);
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
-            Command::Submit(_)
-            | Command::SetModel { .. }
-            | Command::SetThinking(_)
-            | Command::Clear
-            | Command::Compact
-            | Command::Login => {}
+            // The rest are sent only while idle.
+            _ => {}
         }
     }
 }
@@ -726,7 +794,7 @@ mod tests {
             client: llm::Client::new(&format!("http://{addr}"), "k", Vec::new(), llm::Api::Chat),
             providers: Vec::new(),
             provider: "p".into(),
-            tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir },
+            tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir.clone() },
             policy: Policy::new(Vec::new(), Vec::new()),
             mode: Mode::Ask,
             session,
@@ -734,6 +802,7 @@ mod tests {
             remember: None,
             thinking: None,
             auth,
+            skills_dir: dir.join("skills"),
             print: false,
             plugins: Default::default(),
         }

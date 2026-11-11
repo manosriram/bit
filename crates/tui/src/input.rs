@@ -12,6 +12,8 @@ pub struct Input {
     back: usize,
     /// The text being typed, kept while older prompts are shown.
     draft: String,
+    /// Where typed prompts are kept across sessions, one per line with `\n` escaped.
+    file: Option<std::path::PathBuf>,
 }
 
 impl Input {
@@ -24,16 +26,8 @@ impl Input {
         match k.code {
             KeyCode::Char('a') if ctrl => self.cursor = 0,
             KeyCode::Char('e') if ctrl => self.cursor = self.text.len(),
-            KeyCode::Backspace if word => {
-                let start = self.word_start();
-                self.text.replace_range(start..self.cursor, "");
-                self.cursor = start;
-            }
-            KeyCode::Char('w') if ctrl => {
-                let start = self.word_start();
-                self.text.replace_range(start..self.cursor, "");
-                self.cursor = start;
-            }
+            KeyCode::Backspace if word => self.replace(self.word_start(), ""),
+            KeyCode::Char('w') if ctrl => self.replace(self.word_start(), ""),
             KeyCode::Left if word => self.cursor = self.word_start(),
             KeyCode::Char('b') if alt => self.cursor = self.word_start(),
             KeyCode::Right if word => self.cursor = self.word_end(),
@@ -87,8 +81,38 @@ impl Input {
 
     pub fn take(&mut self) -> String {
         let text = std::mem::take(&mut self.text);
+        if self.history.last().is_none_or(|h| *h != text)
+            && let Some(f) = &self.file
+        {
+            use std::io::Write;
+            let line = text.replace('\\', "\\\\").replace('\n', "\\n");
+            // shortcut: the file only grows; trim it if it ever gets slow to load.
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(f);
+            let _ = file.and_then(|mut w| writeln!(w, "{line}"));
+        }
         self.remember(&text);
         text
+    }
+
+    /// Loads earlier sessions' prompts from `path`, and keeps new ones there.
+    pub fn load(&mut self, path: std::path::PathBuf) {
+        for line in std::fs::read_to_string(&path).unwrap_or_default().lines() {
+            let (mut text, mut esc) = (String::new(), false);
+            for c in line.chars() {
+                match (esc, c) {
+                    (true, 'n') => text.push('\n'),
+                    (true, c) => text.push(c),
+                    (false, '\\') => {
+                        esc = true;
+                        continue;
+                    }
+                    (false, c) => text.push(c),
+                }
+                esc = false;
+            }
+            self.remember(&text);
+        }
+        self.file = Some(path);
     }
 
     /// The `@word` that ends at the cursor: where it starts, and the text after the `@`.
@@ -111,7 +135,6 @@ impl Input {
         self.back > 0
     }
 
-    /// Replaces the text, with the cursor at the end.
     /// A copy with every character shown as a dot, for an API key.
     pub fn masked(&self) -> Input {
         let dots = |s: &str| "•".repeat(s.chars().count());
@@ -120,6 +143,7 @@ impl Input {
         Input { text, cursor: before.len(), ..Input::default() }
     }
 
+    /// Replaces the text, with the cursor at the end.
     pub fn set(&mut self, text: &str) {
         self.text = text.into();
         self.cursor = self.text.len();
@@ -193,6 +217,26 @@ fn is_word(c: char) -> bool {
 mod tests {
     use super::Input;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn prompts_carry_over_to_the_next_session() {
+        let path = std::env::temp_dir().join(format!("bit-history-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut a = Input::default();
+        a.load(path.clone());
+        for t in ["one", "two\nlines \\n", "two\nlines \\n"] {
+            a.set(t);
+            a.take();
+        }
+        let mut b = Input::default();
+        b.load(path.clone());
+        b.recall(true);
+        assert_eq!(b.text, "two\nlines \\n");
+        b.recall(true);
+        assert_eq!(b.text, "one");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2, "no repeats");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn option_keys_move_and_delete_by_word() {

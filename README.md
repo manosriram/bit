@@ -1,11 +1,12 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-horizontal-dark.svg">
-    <img alt="bit" src="assets/logo-horizontal-light.svg" width="168">
+    <img alt="bit" src="assets/logo-horizontal-light.svg" width="192">
   </picture>
 </p>
 
-bit is a terminal coding agent with strong focus on tiny core, size, and memory footprint.
+bit is a terminal coding agent that is cheap to run, safe to extend, and small enough to
+run anywhere.
 
 <p align="center">
   <a href="assets/demo.mp4"><img alt="bit fixing a failing test, compacting, then writing a plugin from one sentence that asks before rm and blocks a delete" src="assets/demo.gif" width="800"></a>
@@ -13,13 +14,19 @@ bit is a terminal coding agent with strong focus on tiny core, size, and memory 
 
 ## Why
 
-- **Small.** A few thousand lines in five crates. You can read all of it.
-- **Lean.** One binary of about 3.1 MB, Lua for plugins included, running on a
-  single-threaded tokio runtime.
 - **Cheap to run.** The request prefix (model, tools, system prompt) is byte-identical on
-  every turn, and history is only ever appended, so provider prompt caches keep hitting.
-  The session id routes requests to the same cache, even after a resume, and on Anthropic
-  bit places the cache markers itself.
+  every turn, and history is only ever appended, so provider prompt caches keep hitting,
+  even after a resume. Each turn ends with the share of input that was cached.
+- **Safe to extend.** Plugins are sandboxed Lua: no `io`, `os` or `require`, 4 MB of
+  memory, a deadline on every hook. A guard is a few lines you can read before you trust
+  it, and one that breaks blocks the call instead of letting it through.
+- **Runs anywhere.** One binary of about 3.2 MB with Lua built in, and ripgrep its only
+  dependency: it works over SSH, in a container, or in CI with `bit -p`.
+- **Light on memory.** About 7 MB idle and 12 MB at the peak of a long turn, per session,
+  even with 50 skills installed. See [Memory](#memory).
+- **Small.** A few thousand lines in five crates. You can read all of it.
+
+bit leaves out MCP, LSP and sub-agents on purpose: each would cost the properties above.
 
 ## Install
 
@@ -52,19 +59,26 @@ bit -p "<prompt>"  run one turn and exit: the reply on stdout, exit 1 if it fail
 --no-plugins       start without plugins
 bit plugins        check that every plugin loads, and list its hooks and tools
 bit plugins guide  print the plugin guide
+bit skills         list installed skills
+bit skills add <repo>    install a skill from a git repo
+bit skills remove <name> remove a skill
+bit skills update [<name>] pull the latest skill(s)
 ```
 
 In `-p` mode nobody can approve, so write, edit and bash are declined unless `--mode auto`
 or `[bash] allow` permits them.
 
-Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Shift-Tab` toggle
-ask/auto, `Tab` next thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
+Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Tab` toggle
+ask/auto (the switch at the left of the status line, amber in auto), `Shift-Tab` next
+thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
 `Option-Backspace` or `Ctrl-W` delete a word, `/` commands:
 
 ```
 /login             add a provider: paste its API key, or sign in
 /model [id]        pick the model, or set it to id
 /thinking [level]  pick how hard the model thinks, or set it to level
+/sessions          list sessions and resume another one
+/skills [add <repo>]  show installed skills or add one
 /compact           summarize the conversation to free up context
 /clear             start over; the model forgets this conversation
 ```
@@ -97,7 +111,7 @@ the key's variable, which wins over a saved key. More in
 [docs/providers.md](docs/providers.md).
 
 Everything bit keeps is in `~/.config/bit/` (or `$XDG_CONFIG_HOME/bit/`): `config.toml`,
-`auth.json`, `model` (the last pick), `sessions/` and `plugins/`.
+`auth.json`, `model` (the last pick), `sessions/`, `plugins/` and `skills/`.
 
 ## Config
 
@@ -214,6 +228,21 @@ feature, as one working plugin.
 
 Each conversation is a JSONL log in `~/.config/bit/sessions/<id>.jsonl`, written
 after every step, so a resumed session sends the same bytes a running one would.
+
+## Memory
+
+Ten bit sessions running at once, each through one turn of 150 tool calls (2 MB bash
+outputs, reads of a 12 MB file, greps, writes, edits). Memory is per bit process, except
+the last column, which adds up all ten:
+
+| Scenario | Idle | Peak (avg) | Peak (worst) | All 10 at peak |
+|---|---:|---:|---:|---:|
+| No skills, 128k context window | 7.0 MB | 12.1 MB | 12.4 MB | 121 MB |
+| 50 skills, 128k window | 7.2 MB | 12.4 MB | 12.6 MB | 124 MB |
+| 50 skills, 1M window | 7.2 MB | 25.0 MB | 26.9 MB | 250 MB |
+
+Measured on an Apple A18 Pro against a local mock provider, so it tests memory, not speed
+or cost. Method and how to rerun it: [docs/benchmark.md](docs/benchmark.md).
 
 ## License
 

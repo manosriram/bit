@@ -9,7 +9,8 @@ use input::Input;
 use markdown::Markdown;
 use render::{Line, Term, clip, str_width, wrap};
 use std::io;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Instant, sleep_until};
 
@@ -18,45 +19,49 @@ const SPIN: Duration = Duration::from_millis(100);
 const DIM: &str = "2";
 /// Approval bodies longer than this are cut; the model's call is still shown in full later.
 const DETAIL_ROWS: usize = 12;
-/// Rows of the model picker shown at once.
-const PICK_ROWS: usize = 10;
 /// Last rows of a command's output shown under its tool line.
 const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 5] = [
+const COMMANDS: [(&str, &str, &str); 7] = [
     ("/clear", "", "start over; the model forgets this conversation"),
     ("/compact", "", "summarize the conversation to free up context"),
     ("/login", "", "add a provider: paste its API key, or sign in"),
     ("/model", "[id]", "pick the model, or set it to id"),
+    ("/sessions", "", "list sessions and resume another one"),
+    ("/skills", "[add <repo>]", "show installed skills or add one"),
     ("/thinking", "[level]", "pick how hard the model thinks, or set it to level"),
 ];
 /// The id of the `/thinking` picker's question.
 const THINKING: &str = "thinking";
+/// The id of the `/sessions` picker's question.
+const SESSIONS: &str = "sessions";
+/// The id of the `/skills` list's question.
+const SKILLS: &str = "skills";
 const CHOICES: [(&str, Decision); 3] = [
     ("[y]es", Decision::Yes),
     ("[n]o", Decision::No),
     ("[a]lways for this session", Decision::Always),
 ];
-/// The amber logo of `assets/logo-horizontal-*.svg`, one char per pixel: `p` the flag's
-/// pole, `f` the flag, `t` the lettering. Two rows share a terminal row as half blocks,
-/// which keeps the pixels square.
-const LOGO: [&str; 10] = [
-    " pfff         ",
-    "ppfff         ",
-    "p fff         ",
-    "p             ",
-    "p  t    t  t  ",
-    "p  t       t  ",
-    "p  ttt  t ttt ",
-    "p  t  t t  t  ",
-    "p  t  t t  t  ",
-    "p  ttt  t   tt",
+/// The startup logo, one char per pixel, each two columns wide: `X` is the lettering, drawn
+/// as solid amber blocks over a grey field of `BITS`.
+const LOGO: [&str; 7] = [
+    "............",
+    ".X....X..X..",
+    ".X.......X..",
+    ".XXX..X.XXX.",
+    ".X..X.X..X..",
+    ".XXX..X..XX.",
+    "............",
 ];
-/// The accent, for the logo's flag, the spinner, approvals and warnings: the brand amber,
+/// "bit" in binary: the digits behind the logo, two per pixel, and the working animation.
+const BITS: &str = "011000100110100101110100";
+/// The accent, for the logo, the spinner, approvals and warnings: the brand amber,
 /// #F2B544, as the nearest xterm-256 colour, so terminals without true colour show it too.
 const AMBER: &str = "38;5;215";
-/// The logo's pole.
+/// The digits behind the logo.
 const GREY: &str = "90";
+/// Bold violet for `using skill …`, so a skill in use stands out from text and dim notices.
+const SKILL: &str = "38;5;141;1";
 
 /// Runs the terminal UI until the user quits or the agent goes away.
 pub async fn run(
@@ -66,17 +71,24 @@ pub async fn run(
     providers: &[agent::Provider],
     mode: Mode,
     notices: &[String],
+    (skills_dir, sessions, cwd, session): (PathBuf, PathBuf, PathBuf, Box<str>),
 ) -> io::Result<()> {
     let mut ui = Ui {
         provider: provider.into(),
         model: model.into(),
         thinking: thinking.map(Into::into),
         providers: providers.into(),
+        skills_dir,
+        sessions,
+        cwd,
+        session,
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
+        rows: terminal::size()?.1.into(),
         auto: mode == Mode::Auto,
         ..Ui::default()
     };
+    ui.input.load(ui.sessions.with_file_name("history"));
     ui.logo();
     for n in notices {
         ui.event(Event::Notice(n.as_str().into()));
@@ -134,8 +146,9 @@ async fn event_loop(
         let wake = if dirty { Some(last + FRAME) } else { ui.busy.map(|_| last + SPIN) };
         tokio::select! {
             k = keys.recv() => match k {
-                Some(ct::Event::Resize(c, _)) => {
+                Some(ct::Event::Resize(c, r)) => {
                     ui.cols = c.into();
+                    ui.rows = r.into();
                     term.clear()?;
                 }
                 Some(k) => if !ui.key(k, &cmds) { break },
@@ -161,6 +174,14 @@ struct Ui {
     thinking: Option<Box<str>>,
     /// Every provider, with what the model picker offers for each.
     providers: Vec<agent::Provider>,
+    /// Where the skills live, scanned when `/skills` is typed.
+    skills_dir: PathBuf,
+    /// Where the session logs live, for `/sessions`.
+    sessions: PathBuf,
+    /// The working directory, to show on sessions from other directories.
+    cwd: PathBuf,
+    /// The current session id, to mark in the `/sessions` list.
+    session: Box<str>,
     picker: Option<Picker>,
     /// The marked row of the slash-command list.
     menu: usize,
@@ -170,6 +191,7 @@ struct Ui {
     wipe: bool,
     color: bool,
     cols: usize,
+    rows: usize,
     input: Input,
     /// The unfinished line of model text, as markdown. Its finished rows move to `done` at
     /// once, so the live region stays small however long the reply is.
@@ -217,6 +239,8 @@ struct Question {
     options: Vec<Box<str>>,
     /// The marked row; one past the options is `something else`.
     at: usize,
+    /// `d` was pressed on a deletable list: `y` deletes the marked row, `n` or `Esc` keeps it.
+    confirm: bool,
 }
 
 struct Picker {
@@ -255,6 +279,11 @@ fn search<'p>(providers: &'p [agent::Provider], query: &str) -> Vec<(&'p str, &'
     all.filter(|(p, m)| format!("{p} {m}").to_lowercase().contains(&q)).collect()
 }
 
+/// Lists whose rows `d` deletes, after a y/n confirm; `d` does nothing in the others.
+fn deletable(id: &str) -> bool {
+    id == SESSIONS || id == SKILLS
+}
+
 /// `j`/`k` and the arrows move `at` within `len` rows. `Enter` gives `Some(true)`, `Esc`
 /// `Some(false)`.
 fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
@@ -269,16 +298,6 @@ fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
 }
 
 /// Red for a removed line, green for an added one.
-/// The colour of one logo pixel; `None` for the background.
-fn fg(pixel: char) -> Option<&'static str> {
-    match pixel {
-        'p' => Some(GREY),
-        'f' => Some(AMBER),
-        't' => Some("39"),
-        _ => None,
-    }
-}
-
 fn diff_sgr(line: &str) -> &'static str {
     match line.get(..2) {
         Some("- ") => "31",
@@ -292,6 +311,17 @@ fn clean(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
+/// A human-readable relative time like "2h" or "3d".
+fn ago(t: SystemTime) -> String {
+    match SystemTime::now().duration_since(t).unwrap_or_default().as_secs() {
+        0..60 => "now".into(),
+        s @ 60..3600 => format!("{}m", s / 60),
+        s @ 3600..86400 => format!("{}h", s / 3600),
+        s @ 86400..604800 => format!("{}d", s / 86400),
+        s => format!("{}w", s / 604800),
+    }
+}
+
 impl Ui {
     fn width(&self) -> usize {
         self.cols.max(30)
@@ -302,21 +332,24 @@ impl Ui {
             return;
         }
         let mut l = Line::new(self.color);
-        for pair in LOGO.chunks(2) {
+        for row in LOGO {
+            // Without colour the field would hide the letters, so only they are drawn.
+            if !self.color && !row.contains('X') {
+                continue;
+            }
             l.add("", "  ");
-            for (top, bottom) in pair[0].chars().zip(pair[1].chars()) {
-                // shortcut: no cell stacks two colours, so a full block takes the top's.
-                let (sgr, c) = match (fg(top), fg(bottom)) {
-                    (None, None) => ("", " "),
-                    (Some(t), Some(_)) => (t, "█"),
-                    (Some(t), None) => (t, "▀"),
-                    (None, Some(b)) => (b, "▄"),
+            for (i, px) in row.chars().enumerate() {
+                let pair = &BITS[2 * i..2 * i + 2];
+                match (px == 'X', self.color) {
+                    // Reverse video turns two spaces into a solid block, with no Unicode.
+                    (true, true) => l.add(&format!("7;{AMBER}"), "  "),
+                    (true, false) => l.add("", pair),
+                    (false, true) => l.add(GREY, pair),
+                    (false, false) => l.add("", "  "),
                 };
-                l.add(sgr, c);
             }
             self.done.push(l.take().trim_end().to_owned());
         }
-        self.done.push(l.add(DIM, "  01100010 01101001 01110100").take());
         let dir = std::env::current_dir().unwrap_or_default();
         let home = std::env::var_os("HOME").unwrap_or_default();
         let dir = match dir.strip_prefix(&home) {
@@ -343,7 +376,10 @@ impl Ui {
                 }
                 self.quit_armed = false;
                 // Works everywhere, mid-turn too: the agent checks the mode before each call.
-                if k.code == KeyCode::BackTab {
+                // Only an open completion menu takes `Tab` for itself.
+                let modal =
+                    self.approval.is_some() || self.question.is_some() || self.picker.is_some();
+                if k.code == KeyCode::Tab && (modal || !self.in_menu(k.code)) {
                     self.auto = !self.auto;
                     let mode = if self.auto { Mode::Auto } else { Mode::Ask };
                     let _ = cmds.send(Command::SetMode(mode));
@@ -370,7 +406,7 @@ impl Ui {
                             self.input.insert("\n");
                         }
                         KeyCode::Enter => self.submit(cmds),
-                        KeyCode::Tab if self.busy.is_none() => self.next_thinking(cmds),
+                        KeyCode::BackTab if self.busy.is_none() => self.next_thinking(cmds),
                         KeyCode::Up => self.input.recall(true),
                         KeyCode::Down => self.input.recall(false),
                         _ => {
@@ -448,6 +484,22 @@ impl Ui {
     fn question_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
         let Some(q) = &mut self.question else { return };
         let n = q.options.len();
+        if q.confirm {
+            match code {
+                KeyCode::Char('y') => {
+                    let (id, option) = (q.id.clone(), q.options[q.at].clone());
+                    q.confirm = false;
+                    self.delete(&id, &option);
+                }
+                KeyCode::Char('n') | KeyCode::Esc => q.confirm = false,
+                _ => {}
+            }
+            return;
+        }
+        if code == KeyCode::Char('d') && deletable(&q.id) && q.at < n {
+            q.confirm = true;
+            return;
+        }
         let pick = match code {
             KeyCode::Char(c @ '1'..='9') if (c as usize - '0' as usize) <= n => {
                 q.at = c as usize - '1' as usize;
@@ -459,15 +511,62 @@ impl Ui {
         let id = q.id.clone();
         let picked = q.options.get(q.at).filter(|_| pick).map(|o| o.to_string());
         self.question = None;
-        match picked {
+        match (&*id, picked) {
             // The `/thinking` picker is the UI's own, not the agent's; typing `/thinking
             // <level>` is its `something else`.
-            Some(o) if &*id == THINKING => self.set_thinking(&o, cmds),
-            None if &*id == THINKING => {}
-            Some(text) => {
+            (THINKING, Some(o)) => self.set_thinking(&o, cmds),
+            (SESSIONS, Some(o)) => {
+                let prefix = o.split_whitespace().next().unwrap_or(&o);
+                let _ = cmds.send(Command::Resume(prefix.into()));
+            }
+            // Picking a skill starts a message that asks for it: `/ponytail ` then the task.
+            (SKILLS, Some(o)) => {
+                self.input.set(&format!("/{} ", o.split(" — ").next().unwrap_or(&o)))
+            }
+            (THINKING | SESSIONS | SKILLS, None) => {}
+            (_, Some(text)) => {
                 let _ = cmds.send(Command::Answer { id, text });
             }
-            None => self.answering = Some(id),
+            (_, None) => self.answering = Some(id),
+        }
+    }
+
+    /// Deletes `option` of the deletable list `id`, and drops its row; the list closes once empty.
+    fn delete(&mut self, id: &str, option: &str) {
+        let done = match id {
+            SESSIONS => {
+                let prefix = option.split_whitespace().next().unwrap_or(option);
+                agent::session::find(&self.sessions, prefix).and_then(|p| {
+                    // The open session keeps appending to its file, so it can't be deleted.
+                    if p.file_stem().is_some_and(|s| *s == *self.session) {
+                        return Err("the current session can't be deleted".into());
+                    }
+                    std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))
+                })
+            }
+            SKILLS => {
+                let name = option.split(" — ").next().unwrap_or(option);
+                let skills = agent::skills::list(&self.skills_dir);
+                match skills.iter().find(|k| k.name == name).and_then(|k| k.path.parent()) {
+                    Some(d) => {
+                        std::fs::remove_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))
+                    }
+                    None => Err(format!("no skill named `{name}`")),
+                }
+            }
+            _ => return,
+        };
+        let Some(q) = &mut self.question else { return };
+        match done {
+            Ok(()) => {
+                q.options.remove(q.at);
+                q.at = q.at.min(q.options.len().saturating_sub(1));
+                if q.options.is_empty() {
+                    self.question = None;
+                }
+                self.event(Event::Notice(format!("deleted {}", clip(option, 50)).into()));
+            }
+            Err(e) => self.event(Event::Notice(format!("error: {e}").into())),
         }
     }
 
@@ -511,6 +610,21 @@ impl Ui {
                 level => self.set_thinking(level, cmds),
             };
         }
+        if let Some(rest) =
+            typed.strip_prefix("/skills").filter(|r| r.is_empty() || r.starts_with(' '))
+        {
+            self.input.take();
+            return match rest.trim() {
+                "" => self.show_skills(),
+                arg => match arg.split_once(' ') {
+                    Some(("add", repo)) if !repo.trim().is_empty() => {
+                        let _ = cmds.send(Command::SkillAdd { repo: repo.trim().into() });
+                    }
+                    _ => self
+                        .event(Event::Notice("usage: /skills or /skills add <owner/repo>".into())),
+                },
+            };
+        }
         match typed.as_str() {
             "/clear" => {
                 self.input.take();
@@ -524,6 +638,10 @@ impl Ui {
                 self.input.take();
                 let _ = cmds.send(Command::Login);
                 (self.busy, self.cache) = (Some(Instant::now()), (0, Some(0)));
+            }
+            "/sessions" => {
+                self.input.take();
+                self.list_sessions();
             }
             _ if self.model.is_empty() => self.pick(true),
             "/compact" => {
@@ -556,7 +674,7 @@ impl Ui {
         agent::models::levels(&self.provider, &self.model)
     }
 
-    /// Validates the picker and Tab entry points, with the same notice when unavailable.
+    /// Validates the picker and Shift-Tab entry points, with the same notice when unavailable.
     fn available_levels(&mut self) -> Option<&'static [&'static str]> {
         let levels = self.levels();
         if levels.is_empty() {
@@ -575,18 +693,60 @@ impl Ui {
     fn ask_thinking(&mut self) {
         let Some(levels) = self.available_levels() else { return };
         let default = self.default_label();
-        let options: Vec<Box<str>> = [default.as_str()]
-            .iter()
-            .copied()
-            .chain(levels.iter().copied())
-            .map(Into::into)
-            .collect();
+        let all = std::iter::once(default.as_str()).chain(levels.iter().copied());
+        let options: Vec<Box<str>> = all.map(Into::into).collect();
         let at = options.iter().position(|o| Some(&**o) == self.effort()).unwrap_or(0);
         let text = format!("How hard should {} think?", self.model).into();
-        self.question = Some(Question { id: THINKING.into(), text, options, at });
+        self.question = Some(Question { id: THINKING.into(), text, options, at, confirm: false });
     }
 
-    /// `Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
+    /// `/skills`: list installed skills for the human. The model already has them in its prompt.
+    fn show_skills(&mut self) {
+        let skills = agent::skills::list(&self.skills_dir);
+        if skills.is_empty() {
+            let n = "no skills installed. hint: bit skills add <owner/repo>";
+            return self.event(Event::Notice(n.into()));
+        }
+        let options = skills.iter().map(|k| format!("{} — {}", k.name, k.description).into());
+        self.question = Some(Question {
+            id: SKILLS.into(),
+            text: "Installed skills; the model reads a skill's SKILL.md only when a task matches"
+                .into(),
+            options: options.collect(),
+            at: 0,
+            confirm: false,
+        });
+    }
+
+    /// `/sessions`: list sessions and open a picker. The model is not involved.
+    fn list_sessions(&mut self) {
+        let Ok(entries) = agent::session::list(&self.sessions) else {
+            return self.event(Event::Notice("error: could not list sessions".into()));
+        };
+        if entries.is_empty() {
+            return self.event(Event::Notice("no sessions — start one with bit".into()));
+        }
+        let mut options = Vec::new();
+        for e in entries {
+            let id = &e.id[..e.id.len().min(8)];
+            let preview = if e.preview.is_empty() { "(no preview)".into() } else { e.preview };
+            let cwd =
+                if e.cwd == self.cwd { "".to_string() } else { format!("  {}", e.cwd.display()) };
+            let current = if e.id == *self.session { "  ← current" } else { "" };
+            let line =
+                format!("{}  {:<50} {}{}{}", id, clip(&preview, 50), ago(e.modified), cwd, current);
+            options.push(line.into_boxed_str());
+        }
+        self.question = Some(Question {
+            id: SESSIONS.into(),
+            text: "Pick a session to resume".into(),
+            options,
+            at: 0,
+            confirm: false,
+        });
+    }
+
+    /// `Shift-Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
     /// the status line shows it and stepping through would fill the scrollback.
     fn next_thinking(&mut self, cmds: &UnboundedSender<Command>) {
         let Some(levels) = self.available_levels() else { return };
@@ -626,10 +786,7 @@ impl Ui {
         let _ = cmds.send(Command::SetThinking(self.thinking.clone()));
         let n = match &self.thinking {
             Some(l) => format!("thinking set to {l}"),
-            None => match agent::models::default_level(&self.provider, &self.model) {
-                Some(d) => format!("thinking set to the model's default ({d})"),
-                None => "thinking set to the model's default".into(),
-            },
+            None => format!("thinking set to the model's {}", self.default_label()),
         };
         self.event(Event::Notice(n.into()));
     }
@@ -789,6 +946,9 @@ impl Ui {
                 let mut l = Line::new(self.color);
                 if n.starts_with("error:") {
                     l.add(AMBER, "!").add("", &format!(" {}", clean(&n)));
+                } else if n.starts_with("using skill ") {
+                    // `!` is taken by errors and `*` by tool lines.
+                    l.add(SKILL, &format!("+ {}", clean(&n)));
                 } else {
                     l.add(DIM, &format!("  {}", clean(&n)));
                 }
@@ -796,7 +956,8 @@ impl Ui {
             }
             Event::Ask { id, question, options } => {
                 self.end_text();
-                self.question = Some(Question { id, text: question, options, at: 0 });
+                self.question =
+                    Some(Question { id, text: question, options, at: 0, confirm: false });
             }
             Event::Secret { id, prompt } => {
                 (self.answering, self.secret) = (Some(id), Some(prompt));
@@ -807,6 +968,13 @@ impl Ui {
             }
             Event::ToolStart { name, summary, diff, .. } => {
                 self.end_text();
+                // Reading a SKILL.md is how the model uses a skill; say so, since it's otherwise silent.
+                let skill = Path::new(&*summary).parent().and_then(|d| d.file_name());
+                if let Some(s) = skill.filter(|_| &*name == "read" && summary.ends_with("SKILL.md"))
+                {
+                    let n = format!("using skill {}", s.to_string_lossy());
+                    self.event(Event::Notice(n.into()));
+                }
                 self.section(true);
                 self.tool = Some((name, summary, diff));
             }
@@ -932,7 +1100,6 @@ impl Ui {
 
     /// An 8-bit window scrolling through "bit" in binary, one bit per tick.
     fn bits(&self) -> String {
-        const BITS: &str = "011000100110100101110100";
         BITS.chars().cycle().skip(self.tick() % BITS.len()).take(8).collect()
     }
 
@@ -1048,7 +1215,11 @@ impl Ui {
         for r in wrap(&text, w - 4) {
             f.push(self.row("1", &text[r]));
         }
-        f.push(self.row("", ""));
+        f.push(match q.options.get(q.at) {
+            Some(o) if q.confirm => self.row(AMBER, &format!("delete {}? [y]es / [n]o", clean(o))),
+            _ if deletable(&q.id) => self.row(DIM, "enter picks · d deletes"),
+            _ => self.row("", ""),
+        });
         let numbered =
             q.options.iter().enumerate().map(|(i, o)| format!("{}. {}", i + 1, clean(o)));
         let rows: Vec<String> = numbered.chain(["something else".into()]).collect();
@@ -1083,8 +1254,11 @@ impl Ui {
             let (sgr, c) = if i == p.at { ("1", ">") } else { ("", " ") };
             rows.push((sgr, format!("{c}   {m}")));
         }
-        let start = mark.saturating_sub(PICK_ROWS / 2).min(rows.len().saturating_sub(PICK_ROWS));
-        for (sgr, r) in rows.iter().skip(start).take(PICK_ROWS) {
+        // Scroll like `list`: as many rows as fit under the search row and above the
+        // status border, sliding to keep the mark in view.
+        let max = self.rows.saturating_sub(f.len() + 1).max(1);
+        let start = mark.saturating_sub(max / 2).min(rows.len().saturating_sub(max));
+        for (sgr, r) in rows.iter().skip(start).take(max) {
             f.push(self.row(sgr, r));
         }
         f.push(self.status_border(AMBER));
@@ -1130,14 +1304,22 @@ impl Ui {
     }
 
     /// Rows of a list with `>` on the marked one; returns the frame row of the mark.
+    /// If the list is taller than the remaining screen space, it scrolls to keep the
+    /// mark in view.
     fn list<'s>(
         &self,
         f: &mut Vec<String>,
         items: impl Iterator<Item = &'s str>,
         at: usize,
     ) -> usize {
+        let items: Vec<&str> = items.collect();
+        let n = items.len();
+        // Leave one row for the status border that follows the list.
+        let max = self.rows.saturating_sub(f.len() + 1).max(1);
+        let start =
+            if n <= max { 0 } else { at.saturating_sub(max / 2).min(n.saturating_sub(max)) };
         let mut mark = f.len();
-        for (i, s) in items.enumerate() {
+        for (i, s) in items.iter().enumerate().skip(start).take(max) {
             if i == at {
                 mark = f.len();
             }
@@ -1166,7 +1348,9 @@ impl Ui {
 
     fn status_border(&self, sgr: &str) -> String {
         let w = self.width();
-        let mode = if self.auto { "auto" } else { "ask" };
+        // A switch, off for ask and on (amber, as bit won't ask) for auto.
+        let (knob, switch, mode) =
+            if self.auto { (AMBER, "(  o)", "auto") } else { ("", "(o  )", "ask") };
         let ctx = match self.usage.map(|u| u.input) {
             Some(n) if n >= 1000 => format!(" | {:.1}k ctx", f64::from(n) / 1e3),
             Some(n) => format!(" | {n} ctx"),
@@ -1175,7 +1359,8 @@ impl Ui {
         let status = format!("{mode} | {}{ctx}", self.model());
         let mut l = Line::new(self.color);
         l.add(sgr, "+-- ")
-            .add("", clip(&status, w - 6))
+            .add(knob, switch)
+            .add("", clip(&format!(" {status}"), w - 11))
             .add(sgr, " ")
             .fill(sgr, '-', w - 1)
             .add(sgr, "+");
@@ -1233,6 +1418,58 @@ mod tests {
     }
 
     #[test]
+    fn d_deletes_a_session_after_a_confirm_and_nowhere_else() {
+        let dir = std::env::temp_dir().join(format!("bit-tui-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ["aaaaaaaa1", "bbbbbbbb2"] {
+            std::fs::write(dir.join(format!("{id}.jsonl")), "").unwrap();
+        }
+        let mut ui =
+            Ui { cols: 80, sessions: dir.clone(), session: "bbbbbbbb2".into(), ..Ui::default() };
+        let (tx, _) = unbounded_channel();
+        let options = vec!["aaaaaaaa  one".into(), "bbbbbbbb  two".into()];
+        ui.question =
+            Some(Question { id: SESSIONS.into(), text: "".into(), options, at: 0, confirm: false });
+
+        ui.question_key(KeyCode::Char('d'), &tx);
+        assert!(ui.frame().0.iter().any(|r| r.contains("delete aaaaaaaa  one? [y]es / [n]o")));
+        ui.question_key(KeyCode::Char('n'), &tx);
+        assert!(dir.join("aaaaaaaa1.jsonl").exists(), "n keeps it");
+        ui.question_key(KeyCode::Char('d'), &tx);
+        ui.question_key(KeyCode::Char('y'), &tx);
+        assert!(!dir.join("aaaaaaaa1.jsonl").exists(), "y deletes it");
+        assert_eq!(ui.question.as_ref().unwrap().options.len(), 1);
+
+        ui.question_key(KeyCode::Char('d'), &tx);
+        ui.question_key(KeyCode::Char('y'), &tx);
+        assert!(dir.join("bbbbbbbb2.jsonl").exists(), "the current session stays");
+
+        // `/skills` lists in a picker and deletes the skill's directory.
+        let skills = dir.join("skills");
+        std::fs::create_dir_all(skills.join("x")).unwrap();
+        std::fs::write(skills.join("x/SKILL.md"), "---\nname: ex\ndescription: does x\n---\n")
+            .unwrap();
+        ui.skills_dir = skills.clone();
+        ui.show_skills();
+        assert_eq!(ui.question.as_ref().unwrap().options[0].as_ref(), "ex — does x");
+        ui.question_key(KeyCode::Enter, &tx);
+        assert_eq!(ui.input.text, "/ex ", "picking a skill starts a message for it");
+        ui.show_skills();
+        ui.question_key(KeyCode::Char('d'), &tx);
+        ui.question_key(KeyCode::Char('y'), &tx);
+        assert!(!skills.join("x").exists() && ui.question.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A list without deletion ignores `d`.
+        let options = vec!["low".into()];
+        ui.question =
+            Some(Question { id: THINKING.into(), text: "".into(), options, at: 0, confirm: false });
+        ui.question_key(KeyCode::Char('d'), &tx);
+        assert!(!ui.question.as_ref().unwrap().confirm);
+    }
+
+    #[test]
     fn a_typed_login_answer_restores_the_cursor() {
         let mut ui = Ui { cols: 80, ..Ui::default() };
         let (tx, _) = unbounded_channel();
@@ -1278,22 +1515,25 @@ mod tests {
         assert!(ui.question.is_none() && ui.answering.is_none());
         assert!(ui.status_border(DIM).contains("opencode-go/glm-5.2 · default "));
 
-        // Tab steps through the levels and back to default, without notices.
-        let tab = |ui: &mut Ui| ui.key(ct::Event::Key(KeyCode::Tab.into()), &tx);
+        // Shift-Tab steps through the levels and back to default, without notices.
+        let press = |ui: &mut Ui, code: KeyCode| ui.key(ct::Event::Key(code.into()), &tx);
         ui.done.clear();
         for want in [Some("high"), Some("max"), None, Some("high")] {
-            tab(&mut ui);
+            press(&mut ui, KeyCode::BackTab);
             assert!(matches!(rx.try_recv(), Ok(Command::SetThinking(l)) if l.as_deref() == want));
         }
         assert!(ui.done.is_empty());
+        // Tab switches between ask and auto, unless a menu is open to complete from.
+        press(&mut ui, KeyCode::Tab);
+        assert!(ui.auto && matches!(rx.try_recv(), Ok(Command::SetMode(Mode::Auto))));
         ui.input.set("/thi");
-        tab(&mut ui);
+        press(&mut ui, KeyCode::Tab);
         assert_eq!(ui.input.text, "/thinking ", "an open menu still completes");
-        assert!(rx.try_recv().is_err());
+        assert!(ui.auto && rx.try_recv().is_err(), "and the mode stays");
         ui.input.set("");
         ui.busy = Some(Instant::now());
-        tab(&mut ui);
-        assert!(rx.try_recv().is_err(), "nothing changes mid-turn");
+        press(&mut ui, KeyCode::BackTab);
+        assert!(rx.try_recv().is_err(), "the level doesn't change mid-turn");
         ui.busy = None;
 
         // The default shows when bit knows it, and `off` is offered where the model has it.
@@ -1320,7 +1560,7 @@ mod tests {
         ui.set_model("opencode-go".into(), "glm-5.3".into(), &tx);
         assert!(ui.status_border(DIM).contains("glm-5.3 · high"));
 
-        // Picker and Tab reject unavailable levels identically, without sending commands.
+        // Picker and Shift-Tab reject unavailable levels identically, without sending commands.
         while rx.try_recv().is_ok() {}
         for model in ["", "unknown"] {
             ui.model = model.into();
@@ -1389,6 +1629,26 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_skill_md_says_the_skill_is_used() {
+        let mut ui = Ui { cols: 80, ..Ui::default() };
+        let start = |summary: &str| Event::ToolStart {
+            id: "r".into(),
+            name: "read".into(),
+            summary: summary.into(),
+            diff: "".into(),
+        };
+        ui.event(start("/home/x/skills/pony/SKILL.md"));
+        assert!(ui.done.iter().any(|r| r.contains("using skill pony")));
+        ui.color = true;
+        ui.event(Event::Notice("using skill pony".into()));
+        assert!(ui.done.last().unwrap().contains(SKILL), "drawn violet, not dim");
+        assert!(ui.done.last().unwrap().contains("+ using skill pony"));
+        ui.done.clear();
+        ui.event(start("src/main.rs"));
+        assert!(!ui.done.iter().any(|r| r.contains("using skill")));
+    }
+
+    #[test]
     fn a_finished_edit_shows_its_diff_and_a_failed_one_does_not() {
         let rows = edit_rows("- old\n+ new\n", true);
         assert_eq!(rows, ["* edit a.rs  [ok]", "  - old", "  + new"]);
@@ -1406,5 +1666,22 @@ mod tests {
             super::file_matches(&files, "REND"),
             ["src/render.rs", "a/b/render.rs", "render/x.rs"]
         );
+    }
+
+    #[test]
+    fn long_lists_scroll_to_keep_mark_visible() {
+        let ui = Ui { cols: 80, rows: 8, ..Ui::default() };
+        let mut f = vec!["title".into(), "prompt".into(), "".into()];
+        let items: Vec<String> = (0..20).map(|i| format!("option {i}")).collect();
+        let mark = ui.list(&mut f, items.iter().map(String::as_str), 15);
+        // title + prompt + blank + 4 list rows (rows 8 - 3 already used - 1 border).
+        assert_eq!(f.len(), 7);
+        // The mark should be on option 15, centered in the visible window (items 13-16).
+        assert!(f[mark].contains("> option 15"));
+        // Earlier options are not rendered.
+        assert!(!f.iter().any(|r| r.contains("option 0")));
+        assert!(!f.iter().any(|r| r.contains("option 12")));
+        // Later options are not rendered.
+        assert!(!f.iter().any(|r| r.contains("option 17")));
     }
 }

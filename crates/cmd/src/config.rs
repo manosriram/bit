@@ -24,6 +24,8 @@ pub struct Config {
     pub allow: Vec<String>,
     /// Where the Lua plugins are.
     pub plugins: PathBuf,
+    /// Where the skills are.
+    pub skills: PathBuf,
 }
 
 /// Unknown keys land in `unknown` so they can be warned about instead of failing the load.
@@ -134,6 +136,7 @@ pub fn load() -> Result<Config, String> {
         sessions: base.join("sessions"),
         allow: file.bash.allow,
         plugins: base.join("plugins"),
+        skills: base.join("skills"),
     })
 }
 
