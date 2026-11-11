@@ -68,8 +68,8 @@ bit skills update [<name>] pull the latest skill(s)
 In `-p` mode nobody can approve, so write, edit and bash are declined unless `--mode auto`
 or `[bash] allow` permits them.
 
-Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Shift-Tab` toggle
-ask/auto, `Tab` next thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
+Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Tab` toggle
+ask/auto, `Shift-Tab` next thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
 `Option-Backspace` or `Ctrl-W` delete a word, `/` commands:
 
 ```

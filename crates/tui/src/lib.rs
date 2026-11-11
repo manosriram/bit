@@ -42,25 +42,23 @@ const CHOICES: [(&str, Decision); 3] = [
     ("[n]o", Decision::No),
     ("[a]lways for this session", Decision::Always),
 ];
-/// The amber logo of `assets/logo-horizontal-*.svg`, one char per pixel: `p` the flag's
-/// pole, `f` the flag, `t` the lettering. Two rows share a terminal row as half blocks,
-/// which keeps the pixels square.
-const LOGO: [&str; 10] = [
-    " pfff         ",
-    "ppfff         ",
-    "p fff         ",
-    "p             ",
-    "p  t    t  t  ",
-    "p  t       t  ",
-    "p  ttt  t ttt ",
-    "p  t  t t  t  ",
-    "p  t  t t  t  ",
-    "p  ttt  t   tt",
+/// The startup logo, one char per pixel, each two columns wide: `X` is the lettering, drawn
+/// as solid amber blocks over a grey field of `BITS`.
+const LOGO: [&str; 7] = [
+    "............",
+    ".X....X..X..",
+    ".X.......X..",
+    ".XXX..X.XXX.",
+    ".X..X.X..X..",
+    ".XXX..X..XX.",
+    "............",
 ];
-/// The accent, for the logo's flag, the spinner, approvals and warnings: the brand amber,
+/// "bit" in binary: the digits behind the logo, two per pixel, and the working animation.
+const BITS: &str = "011000100110100101110100";
+/// The accent, for the logo, the spinner, approvals and warnings: the brand amber,
 /// #F2B544, as the nearest xterm-256 colour, so terminals without true colour show it too.
 const AMBER: &str = "38;5;215";
-/// The logo's pole.
+/// The digits behind the logo.
 const GREY: &str = "90";
 /// Bold violet for `using skill …`, so a skill in use stands out from text and dim notices.
 const SKILL: &str = "38;5;141;1";
@@ -299,16 +297,6 @@ fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
     None
 }
 
-/// The colour of one logo pixel; `None` for the background.
-fn fg(pixel: char) -> Option<&'static str> {
-    match pixel {
-        'p' => Some(GREY),
-        'f' => Some(AMBER),
-        't' => Some("39"),
-        _ => None,
-    }
-}
-
 /// Red for a removed line, green for an added one.
 fn diff_sgr(line: &str) -> &'static str {
     match line.get(..2) {
@@ -344,21 +332,24 @@ impl Ui {
             return;
         }
         let mut l = Line::new(self.color);
-        for pair in LOGO.chunks(2) {
+        for row in LOGO {
+            // Without colour the field would hide the letters, so only they are drawn.
+            if !self.color && !row.contains('X') {
+                continue;
+            }
             l.add("", "  ");
-            for (top, bottom) in pair[0].chars().zip(pair[1].chars()) {
-                // shortcut: no cell stacks two colours, so a full block takes the top's.
-                let (sgr, c) = match (fg(top), fg(bottom)) {
-                    (None, None) => ("", " "),
-                    (Some(t), Some(_)) => (t, "█"),
-                    (Some(t), None) => (t, "▀"),
-                    (None, Some(b)) => (b, "▄"),
+            for (i, px) in row.chars().enumerate() {
+                let pair = &BITS[2 * i..2 * i + 2];
+                match (px == 'X', self.color) {
+                    // Reverse video turns two spaces into a solid block, with no Unicode.
+                    (true, true) => l.add(&format!("7;{AMBER}"), "  "),
+                    (true, false) => l.add("", pair),
+                    (false, true) => l.add(GREY, pair),
+                    (false, false) => l.add("", "  "),
                 };
-                l.add(sgr, c);
             }
             self.done.push(l.take().trim_end().to_owned());
         }
-        self.done.push(l.add(DIM, "  01100010 01101001 01110100").take());
         let dir = std::env::current_dir().unwrap_or_default();
         let home = std::env::var_os("HOME").unwrap_or_default();
         let dir = match dir.strip_prefix(&home) {
@@ -385,7 +376,10 @@ impl Ui {
                 }
                 self.quit_armed = false;
                 // Works everywhere, mid-turn too: the agent checks the mode before each call.
-                if k.code == KeyCode::BackTab {
+                // Only an open completion menu takes `Tab` for itself.
+                let modal =
+                    self.approval.is_some() || self.question.is_some() || self.picker.is_some();
+                if k.code == KeyCode::Tab && (modal || !self.in_menu(k.code)) {
                     self.auto = !self.auto;
                     let mode = if self.auto { Mode::Auto } else { Mode::Ask };
                     let _ = cmds.send(Command::SetMode(mode));
@@ -412,7 +406,7 @@ impl Ui {
                             self.input.insert("\n");
                         }
                         KeyCode::Enter => self.submit(cmds),
-                        KeyCode::Tab if self.busy.is_none() => self.next_thinking(cmds),
+                        KeyCode::BackTab if self.busy.is_none() => self.next_thinking(cmds),
                         KeyCode::Up => self.input.recall(true),
                         KeyCode::Down => self.input.recall(false),
                         _ => {
@@ -680,7 +674,7 @@ impl Ui {
         agent::models::levels(&self.provider, &self.model)
     }
 
-    /// Validates the picker and Tab entry points, with the same notice when unavailable.
+    /// Validates the picker and Shift-Tab entry points, with the same notice when unavailable.
     fn available_levels(&mut self) -> Option<&'static [&'static str]> {
         let levels = self.levels();
         if levels.is_empty() {
@@ -752,7 +746,7 @@ impl Ui {
         });
     }
 
-    /// `Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
+    /// `Shift-Tab`: the model's next thinking level, wrapping around to `default`. Quiet, since
     /// the status line shows it and stepping through would fill the scrollback.
     fn next_thinking(&mut self, cmds: &UnboundedSender<Command>) {
         let Some(levels) = self.available_levels() else { return };
@@ -1106,7 +1100,6 @@ impl Ui {
 
     /// An 8-bit window scrolling through "bit" in binary, one bit per tick.
     fn bits(&self) -> String {
-        const BITS: &str = "011000100110100101110100";
         BITS.chars().cycle().skip(self.tick() % BITS.len()).take(8).collect()
     }
 
@@ -1355,7 +1348,9 @@ impl Ui {
 
     fn status_border(&self, sgr: &str) -> String {
         let w = self.width();
-        let mode = if self.auto { "auto" } else { "ask" };
+        // A switch, off for ask and on (amber, as bit won't ask) for auto.
+        let (knob, switch, mode) =
+            if self.auto { (AMBER, "(  o)", "auto") } else { ("", "(o  )", "ask") };
         let ctx = match self.usage.map(|u| u.input) {
             Some(n) if n >= 1000 => format!(" | {:.1}k ctx", f64::from(n) / 1e3),
             Some(n) => format!(" | {n} ctx"),
@@ -1364,7 +1359,8 @@ impl Ui {
         let status = format!("{mode} | {}{ctx}", self.model());
         let mut l = Line::new(self.color);
         l.add(sgr, "+-- ")
-            .add("", clip(&status, w - 6))
+            .add(knob, switch)
+            .add("", clip(&format!(" {status}"), w - 11))
             .add(sgr, " ")
             .fill(sgr, '-', w - 1)
             .add(sgr, "+");
@@ -1519,22 +1515,25 @@ mod tests {
         assert!(ui.question.is_none() && ui.answering.is_none());
         assert!(ui.status_border(DIM).contains("opencode-go/glm-5.2 · default "));
 
-        // Tab steps through the levels and back to default, without notices.
-        let tab = |ui: &mut Ui| ui.key(ct::Event::Key(KeyCode::Tab.into()), &tx);
+        // Shift-Tab steps through the levels and back to default, without notices.
+        let press = |ui: &mut Ui, code: KeyCode| ui.key(ct::Event::Key(code.into()), &tx);
         ui.done.clear();
         for want in [Some("high"), Some("max"), None, Some("high")] {
-            tab(&mut ui);
+            press(&mut ui, KeyCode::BackTab);
             assert!(matches!(rx.try_recv(), Ok(Command::SetThinking(l)) if l.as_deref() == want));
         }
         assert!(ui.done.is_empty());
+        // Tab switches between ask and auto, unless a menu is open to complete from.
+        press(&mut ui, KeyCode::Tab);
+        assert!(ui.auto && matches!(rx.try_recv(), Ok(Command::SetMode(Mode::Auto))));
         ui.input.set("/thi");
-        tab(&mut ui);
+        press(&mut ui, KeyCode::Tab);
         assert_eq!(ui.input.text, "/thinking ", "an open menu still completes");
-        assert!(rx.try_recv().is_err());
+        assert!(ui.auto && rx.try_recv().is_err(), "and the mode stays");
         ui.input.set("");
         ui.busy = Some(Instant::now());
-        tab(&mut ui);
-        assert!(rx.try_recv().is_err(), "nothing changes mid-turn");
+        press(&mut ui, KeyCode::BackTab);
+        assert!(rx.try_recv().is_err(), "the level doesn't change mid-turn");
         ui.busy = None;
 
         // The default shows when bit knows it, and `off` is offered where the model has it.
@@ -1561,7 +1560,7 @@ mod tests {
         ui.set_model("opencode-go".into(), "glm-5.3".into(), &tx);
         assert!(ui.status_border(DIM).contains("glm-5.3 · high"));
 
-        // Picker and Tab reject unavailable levels identically, without sending commands.
+        // Picker and Shift-Tab reject unavailable levels identically, without sending commands.
         while rx.try_recv().is_ok() {}
         for model in ["", "unknown"] {
             ui.model = model.into();
