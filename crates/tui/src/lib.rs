@@ -84,6 +84,7 @@ pub async fn run(
         session,
         color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         cols: terminal::size()?.0.into(),
+        rows: terminal::size()?.1.into(),
         auto: mode == Mode::Auto,
         ..Ui::default()
     };
@@ -144,8 +145,9 @@ async fn event_loop(
         let wake = if dirty { Some(last + FRAME) } else { ui.busy.map(|_| last + SPIN) };
         tokio::select! {
             k = keys.recv() => match k {
-                Some(ct::Event::Resize(c, _)) => {
+                Some(ct::Event::Resize(c, r)) => {
                     ui.cols = c.into();
+                    ui.rows = r.into();
                     term.clear()?;
                 }
                 Some(k) => if !ui.key(k, &cmds) { break },
@@ -162,7 +164,6 @@ async fn event_loop(
     term.clear()
 }
 
-#[derive(Default)]
 struct Ui {
     /// The provider requests go to, and its model: empty until the user picks one.
     provider: Box<str>,
@@ -188,6 +189,7 @@ struct Ui {
     wipe: bool,
     color: bool,
     cols: usize,
+    rows: usize,
     input: Input,
     /// The unfinished line of model text, as markdown. Its finished rows move to `done` at
     /// once, so the live region stays small however long the reply is.
@@ -218,6 +220,45 @@ struct Ui {
     /// Whether the last scrollback rows were tool lines (`true`) or model text (`false`),
     /// so a blank row can separate the two.
     section: Option<bool>,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Self {
+            provider: Default::default(),
+            model: Default::default(),
+            thinking: Default::default(),
+            providers: Default::default(),
+            skills_dir: Default::default(),
+            sessions: Default::default(),
+            cwd: Default::default(),
+            session: Default::default(),
+            picker: Default::default(),
+            menu: Default::default(),
+            files: Default::default(),
+            wipe: Default::default(),
+            color: Default::default(),
+            cols: Default::default(),
+            rows: 24,
+            input: Default::default(),
+            partial: Default::default(),
+            shown: Default::default(),
+            thought: Default::default(),
+            md: Default::default(),
+            done: Default::default(),
+            busy: Default::default(),
+            usage: Default::default(),
+            cache: Default::default(),
+            quit_armed: Default::default(),
+            auto: Default::default(),
+            tool: Default::default(),
+            approval: Default::default(),
+            question: Default::default(),
+            answering: Default::default(),
+            secret: Default::default(),
+            section: Default::default(),
+        }
+    }
 }
 
 struct Approval {
@@ -1239,14 +1280,25 @@ impl Ui {
     }
 
     /// Rows of a list with `>` on the marked one; returns the frame row of the mark.
+    /// If the list is taller than the remaining screen space, it scrolls to keep the
+    /// mark in view.
     fn list<'s>(
         &self,
         f: &mut Vec<String>,
         items: impl Iterator<Item = &'s str>,
         at: usize,
     ) -> usize {
+        let items: Vec<&str> = items.collect();
+        let n = items.len();
+        // Leave one row for the status border that follows the list.
+        let max = self.rows.saturating_sub(f.len() + 1).max(1);
+        let start = if n <= max {
+            0
+        } else {
+            at.saturating_sub(max / 2).min(n.saturating_sub(max))
+        };
         let mut mark = f.len();
-        for (i, s) in items.enumerate() {
+        for (i, s) in items.iter().enumerate().skip(start).take(max) {
             if i == at {
                 mark = f.len();
             }
@@ -1515,5 +1567,22 @@ mod tests {
             super::file_matches(&files, "REND"),
             ["src/render.rs", "a/b/render.rs", "render/x.rs"]
         );
+    }
+
+    #[test]
+    fn long_lists_scroll_to_keep_mark_visible() {
+        let ui = Ui { cols: 80, rows: 8, ..Ui::default() };
+        let mut f = vec!["title".into(), "prompt".into(), "".into()];
+        let items: Vec<String> = (0..20).map(|i| format!("option {i}")).collect();
+        let mark = ui.list(&mut f, items.iter().map(String::as_str), 15);
+        // title + prompt + blank + 4 list rows (rows 8 - 3 already used - 1 border).
+        assert_eq!(f.len(), 7);
+        // The mark should be on option 15, centered in the visible window (items 13-16).
+        assert!(f[mark].contains("> option 15"));
+        // Earlier options are not rendered.
+        assert!(!f.iter().any(|r| r.contains("option 0")));
+        assert!(!f.iter().any(|r| r.contains("option 12")));
+        // Later options are not rendered.
+        assert!(!f.iter().any(|r| r.contains("option 17")));
     }
 }
