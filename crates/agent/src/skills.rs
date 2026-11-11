@@ -153,50 +153,85 @@ fn skill_name(url: &str) -> String {
     base.strip_suffix(".git").unwrap_or(base).into()
 }
 
+/// A multi-line YAML scalar, as `description:` uses it: folded (`>`) joins lines with
+/// spaces and a blank line becomes a paragraph break; literal (`|`) keeps the line breaks.
+/// The chomping indicators (`-`, `+`) only affect trailing newlines, which are trimmed
+/// away at the end, so they are accepted but not tracked.
+#[derive(Clone, Copy)]
+enum Scalar {
+    Folded,
+    Literal,
+}
+
+/// `description: >`, `description: >- start here`, `description: |+` and so on. Returns the
+/// scalar kind and the inline text after the indicator, if any.
+fn scalar_indicator(v: &str) -> Option<(Scalar, &str)> {
+    for (prefix, kind) in [
+        (">-", Scalar::Folded),
+        (">+", Scalar::Folded),
+        (">", Scalar::Folded),
+        ("|-", Scalar::Literal),
+        ("|+", Scalar::Literal),
+        ("|", Scalar::Literal),
+    ] {
+        if let Some(rest) = v.strip_prefix(prefix) {
+            return Some((kind, rest.trim()));
+        }
+    }
+    None
+}
+
 /// Parses a simple `name` / `description` frontmatter. SKILL.md is expected to start with
-/// `---`, contain `name:` and `description:` lines, and end with `---`. Only the `>` folded
-/// scalar form is supported for multiline descriptions; that is all the built-in skills use.
+/// `---`, contain `name:` and `description:` lines, and end with `---`. `description` may
+/// use a multi-line YAML scalar (`>`, `|-` and friends); everything else must be one line.
 fn frontmatter(text: &str) -> Option<(String, String)> {
     let mut lines = text.lines();
     if lines.next()? != "---" {
         return None;
     }
     let (mut name, mut description) = (None, None);
-    let mut folded = String::new();
-    let mut in_fold = false;
+    let mut scalar: Option<(Scalar, String)> = None;
 
     for line in lines {
         if line == "---" {
             break;
         }
-        if in_fold && (line.starts_with(' ') || line.starts_with('\t') || line.is_empty()) {
-            if !folded.is_empty() && !line.is_empty() {
-                folded.push(' ');
+        if let Some((kind, content)) = &mut scalar {
+            // A blank (whitespace-only) line is a paragraph break.
+            if line.trim().is_empty() {
+                content.push('\n');
+                continue;
             }
-            folded.push_str(line.trim_start());
-            continue;
-        }
-        if in_fold {
-            description = Some(folded.trim().to_owned());
-            folded.clear();
-            in_fold = false;
+            // An indented line continues the scalar.
+            if line.starts_with(' ') || line.starts_with('\t') {
+                match kind {
+                    Scalar::Folded if !content.is_empty() && !content.ends_with('\n') => {
+                        content.push(' ');
+                    }
+                    Scalar::Literal => content.push('\n'),
+                    Scalar::Folded => {}
+                }
+                content.push_str(line.trim());
+                continue;
+            }
+            // A line at the top level ends the scalar; fall through to parse it as a key.
+            description = Some(content.trim().to_owned());
+            scalar = None;
         }
         let Some((k, v)) = line.split_once(':') else { continue };
         match k.trim() {
             "name" => name = Some(v.trim().to_owned()),
-            "description" => {
-                let v = v.trim();
-                if v == ">" || v == ">-" {
-                    in_fold = true;
-                } else {
-                    description = Some(v.to_owned());
+            "description" => match scalar_indicator(v.trim()) {
+                Some((kind, inline)) => {
+                    scalar = Some((kind, inline.to_owned()));
                 }
-            }
+                None => description = Some(v.trim().to_owned()),
+            },
             _ => {}
         }
     }
-    if in_fold {
-        description = Some(folded.trim().to_owned());
+    if let Some((_, content)) = scalar {
+        description = Some(content.trim().to_owned());
     }
     Some((name?, description.unwrap_or_default()))
 }
@@ -228,6 +263,29 @@ mod tests {
         assert!(desc.contains("fully solves the task"));
         assert!(!desc.contains("argument-hint"));
         assert!(!desc.contains("license"));
+    }
+
+    #[test]
+    fn parses_every_multiline_scalar_indicator() {
+        // Chomping indicators differ only in trailing newlines, which are trimmed.
+        for indicator in [">", ">-", ">+", "|", "|-", "|+"] {
+            let md = format!("---\nname: s\ndescription: {indicator}\n  line 1\n  line 2\n---\n");
+            let (_, desc) = frontmatter(&md).unwrap();
+            assert_eq!(desc.replace('\n', " "), "line 1 line 2", "indicator {indicator}");
+        }
+        // An inline start followed by folded lines joins with a space.
+        let md = "---\nname: s\ndescription: > start\n  here\n---\n";
+        assert_eq!(frontmatter(md).unwrap().1, "start here");
+    }
+
+    #[test]
+    fn blank_lines_are_paragraph_breaks() {
+        // Folded: a blank line becomes one newline; whitespace-only lines count as blank.
+        let md = "---\nname: s\ndescription: >\n  one\n   \n  two\n---\n";
+        assert_eq!(frontmatter(md).unwrap().1, "one\ntwo");
+        // Literal: lines keep their breaks; a blank line is an empty line between them.
+        let md = "---\nname: s\ndescription: |\n  one\n\n  two\n---\n";
+        assert_eq!(frontmatter(md).unwrap().1, "one\n\ntwo");
     }
 
     #[test]

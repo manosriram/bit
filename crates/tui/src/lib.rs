@@ -19,8 +19,6 @@ const SPIN: Duration = Duration::from_millis(100);
 const DIM: &str = "2";
 /// Approval bodies longer than this are cut; the model's call is still shown in full later.
 const DETAIL_ROWS: usize = 12;
-/// Rows of the model picker shown at once.
-const PICK_ROWS: usize = 10;
 /// Last rows of a command's output shown under its tool line.
 const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
@@ -164,6 +162,7 @@ async fn event_loop(
     term.clear()
 }
 
+#[derive(Default)]
 struct Ui {
     /// The provider requests go to, and its model: empty until the user picks one.
     provider: Box<str>,
@@ -220,45 +219,6 @@ struct Ui {
     /// Whether the last scrollback rows were tool lines (`true`) or model text (`false`),
     /// so a blank row can separate the two.
     section: Option<bool>,
-}
-
-impl Default for Ui {
-    fn default() -> Self {
-        Self {
-            provider: Default::default(),
-            model: Default::default(),
-            thinking: Default::default(),
-            providers: Default::default(),
-            skills_dir: Default::default(),
-            sessions: Default::default(),
-            cwd: Default::default(),
-            session: Default::default(),
-            picker: Default::default(),
-            menu: Default::default(),
-            files: Default::default(),
-            wipe: Default::default(),
-            color: Default::default(),
-            cols: Default::default(),
-            rows: 24,
-            input: Default::default(),
-            partial: Default::default(),
-            shown: Default::default(),
-            thought: Default::default(),
-            md: Default::default(),
-            done: Default::default(),
-            busy: Default::default(),
-            usage: Default::default(),
-            cache: Default::default(),
-            quit_armed: Default::default(),
-            auto: Default::default(),
-            tool: Default::default(),
-            approval: Default::default(),
-            question: Default::default(),
-            answering: Default::default(),
-            secret: Default::default(),
-            section: Default::default(),
-        }
-    }
 }
 
 struct Approval {
@@ -1233,8 +1193,11 @@ impl Ui {
             let (sgr, c) = if i == p.at { ("1", ">") } else { ("", " ") };
             rows.push((sgr, format!("{c}   {m}")));
         }
-        let start = mark.saturating_sub(PICK_ROWS / 2).min(rows.len().saturating_sub(PICK_ROWS));
-        for (sgr, r) in rows.iter().skip(start).take(PICK_ROWS) {
+        // Scroll like `list`: as many rows as fit under the search row and above the
+        // status border, sliding to keep the mark in view.
+        let max = self.rows.saturating_sub(f.len() + 1).max(1);
+        let start = mark.saturating_sub(max / 2).min(rows.len().saturating_sub(max));
+        for (sgr, r) in rows.iter().skip(start).take(max) {
             f.push(self.row(sgr, r));
         }
         f.push(self.status_border(AMBER));
