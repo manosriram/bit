@@ -35,6 +35,8 @@ const COMMANDS: [(&str, &str, &str); 7] = [
 const THINKING: &str = "thinking";
 /// The id of the `/sessions` picker's question.
 const SESSIONS: &str = "sessions";
+/// The id of the `/skills` list's question.
+const SKILLS: &str = "skills";
 const CHOICES: [(&str, Decision); 3] = [
     ("[y]es", Decision::Yes),
     ("[n]o", Decision::No),
@@ -236,6 +238,8 @@ struct Question {
     options: Vec<Box<str>>,
     /// The marked row; one past the options is `something else`.
     at: usize,
+    /// `d` was pressed on a deletable list: `y` deletes the marked row, `n` or `Esc` keeps it.
+    confirm: bool,
 }
 
 struct Picker {
@@ -276,6 +280,11 @@ fn search<'p>(providers: &'p [agent::Provider], query: &str) -> Vec<(&'p str, &'
 
 /// `j`/`k` and the arrows move `at` within `len` rows. `Enter` gives `Some(true)`, `Esc`
 /// `Some(false)`.
+/// Lists whose rows `d` deletes, after a y/n confirm; `d` does nothing in the others.
+fn deletable(id: &str) -> bool {
+    id == SESSIONS || id == SKILLS
+}
+
 fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
     match code {
         KeyCode::Up | KeyCode::Char('k') => *at = at.saturating_sub(1),
@@ -483,6 +492,22 @@ impl Ui {
     fn question_key(&mut self, code: KeyCode, cmds: &UnboundedSender<Command>) {
         let Some(q) = &mut self.question else { return };
         let n = q.options.len();
+        if q.confirm {
+            match code {
+                KeyCode::Char('y') => {
+                    let (id, option) = (q.id.clone(), q.options[q.at].clone());
+                    q.confirm = false;
+                    self.delete(&id, &option);
+                }
+                KeyCode::Char('n') | KeyCode::Esc => q.confirm = false,
+                _ => {}
+            }
+            return;
+        }
+        if code == KeyCode::Char('d') && deletable(&q.id) && q.at < n {
+            q.confirm = true;
+            return;
+        }
         let pick = match code {
             KeyCode::Char(c @ '1'..='9') if (c as usize - '0' as usize) <= n => {
                 q.at = c as usize - '1' as usize;
@@ -504,10 +529,54 @@ impl Ui {
                 let _ = cmds.send(Command::Resume(prefix.into()));
             }
             None if &*id == SESSIONS => {}
+            // Picking a skill starts a message that asks for it: `/ponytail ` then the task.
+            Some(o) if &*id == SKILLS => {
+                self.input.set(&format!("/{} ", o.split(" — ").next().unwrap_or(&o)))
+            }
+            None if &*id == SKILLS => {}
             Some(text) => {
                 let _ = cmds.send(Command::Answer { id, text });
             }
             None => self.answering = Some(id),
+        }
+    }
+
+    /// Deletes `option` of the deletable list `id`, and drops its row; the list closes once empty.
+    fn delete(&mut self, id: &str, option: &str) {
+        let done = match id {
+            SESSIONS => {
+                let prefix = option.split_whitespace().next().unwrap_or(option);
+                agent::session::find(&self.sessions, prefix).and_then(|p| {
+                    // The open session keeps appending to its file, so it can't be deleted.
+                    if p.file_stem().is_some_and(|s| *s == *self.session) {
+                        return Err("the current session can't be deleted".into());
+                    }
+                    std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))
+                })
+            }
+            SKILLS => {
+                let name = option.split(" — ").next().unwrap_or(option);
+                let skills = agent::skills::list(&self.skills_dir);
+                match skills.iter().find(|k| k.name == name).and_then(|k| k.path.parent()) {
+                    Some(d) => {
+                        std::fs::remove_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))
+                    }
+                    None => Err(format!("no skill named `{name}`")),
+                }
+            }
+            _ => return,
+        };
+        let Some(q) = &mut self.question else { return };
+        match done {
+            Ok(()) => {
+                q.options.remove(q.at);
+                q.at = q.at.min(q.options.len().saturating_sub(1));
+                if q.options.is_empty() {
+                    self.question = None;
+                }
+                self.event(Event::Notice(format!("deleted {}", clip(option, 50)).into()));
+            }
+            Err(e) => self.event(Event::Notice(format!("error: {e}").into())),
         }
     }
 
@@ -642,7 +711,7 @@ impl Ui {
             .collect();
         let at = options.iter().position(|o| Some(&**o) == self.effort()).unwrap_or(0);
         let text = format!("How hard should {} think?", self.model).into();
-        self.question = Some(Question { id: THINKING.into(), text, options, at });
+        self.question = Some(Question { id: THINKING.into(), text, options, at, confirm: false });
     }
 
     /// `/skills`: list installed skills for the human. The model already has them in its prompt.
@@ -654,17 +723,15 @@ impl Ui {
             ));
             return;
         }
-        let lines: Vec<String> =
-            skills.iter().map(|k| format!("  {} — {}", k.name, k.description)).collect();
-        for line in lines {
-            self.event(Event::Notice(line.into()));
-        }
-        let n = format!(
-            "{} skill{}; the model reads a skill's SKILL.md only when a task matches",
-            skills.len(),
-            if skills.len() == 1 { "" } else { "s" }
-        );
-        self.event(Event::Notice(n.into()));
+        let options = skills.iter().map(|k| format!("{} — {}", k.name, k.description).into());
+        self.question = Some(Question {
+            id: SKILLS.into(),
+            text: "Installed skills; the model reads a skill's SKILL.md only when a task matches"
+                .into(),
+            options: options.collect(),
+            at: 0,
+            confirm: false,
+        });
     }
 
     /// `/sessions`: list sessions and open a picker. The model is not involved.
@@ -693,6 +760,7 @@ impl Ui {
             text: "Pick a session to resume".into(),
             options,
             at: 0,
+            confirm: false,
         });
     }
 
@@ -906,7 +974,8 @@ impl Ui {
             }
             Event::Ask { id, question, options } => {
                 self.end_text();
-                self.question = Some(Question { id, text: question, options, at: 0 });
+                self.question =
+                    Some(Question { id, text: question, options, at: 0, confirm: false });
             }
             Event::Secret { id, prompt } => {
                 (self.answering, self.secret) = (Some(id), Some(prompt));
@@ -1158,7 +1227,11 @@ impl Ui {
         for r in wrap(&text, w - 4) {
             f.push(self.row("1", &text[r]));
         }
-        f.push(self.row("", ""));
+        f.push(match q.options.get(q.at) {
+            Some(o) if q.confirm => self.row(AMBER, &format!("delete {}? [y]es / [n]o", clean(o))),
+            _ if deletable(&q.id) => self.row(DIM, "enter picks · d deletes"),
+            _ => self.row("", ""),
+        });
         let numbered =
             q.options.iter().enumerate().map(|(i, o)| format!("{}. {}", i + 1, clean(o)));
         let rows: Vec<String> = numbered.chain(["something else".into()]).collect();
@@ -1255,11 +1328,8 @@ impl Ui {
         let n = items.len();
         // Leave one row for the status border that follows the list.
         let max = self.rows.saturating_sub(f.len() + 1).max(1);
-        let start = if n <= max {
-            0
-        } else {
-            at.saturating_sub(max / 2).min(n.saturating_sub(max))
-        };
+        let start =
+            if n <= max { 0 } else { at.saturating_sub(max / 2).min(n.saturating_sub(max)) };
         let mut mark = f.len();
         for (i, s) in items.iter().enumerate().skip(start).take(max) {
             if i == at {
@@ -1354,6 +1424,58 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Command::Answer { id, text })
             if &*id == "login" && text == "openai"));
         assert!(ui.frame().2.is_some(), "restore the cursor after selection");
+    }
+
+    #[test]
+    fn d_deletes_a_session_after_a_confirm_and_nowhere_else() {
+        let dir = std::env::temp_dir().join(format!("bit-tui-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ["aaaaaaaa1", "bbbbbbbb2"] {
+            std::fs::write(dir.join(format!("{id}.jsonl")), "").unwrap();
+        }
+        let mut ui =
+            Ui { cols: 80, sessions: dir.clone(), session: "bbbbbbbb2".into(), ..Ui::default() };
+        let (tx, _) = unbounded_channel();
+        let options = vec!["aaaaaaaa  one".into(), "bbbbbbbb  two".into()];
+        ui.question =
+            Some(Question { id: SESSIONS.into(), text: "".into(), options, at: 0, confirm: false });
+
+        ui.question_key(KeyCode::Char('d'), &tx);
+        assert!(ui.frame().0.iter().any(|r| r.contains("delete aaaaaaaa  one? [y]es / [n]o")));
+        ui.question_key(KeyCode::Char('n'), &tx);
+        assert!(dir.join("aaaaaaaa1.jsonl").exists(), "n keeps it");
+        ui.question_key(KeyCode::Char('d'), &tx);
+        ui.question_key(KeyCode::Char('y'), &tx);
+        assert!(!dir.join("aaaaaaaa1.jsonl").exists(), "y deletes it");
+        assert_eq!(ui.question.as_ref().unwrap().options.len(), 1);
+
+        ui.question_key(KeyCode::Char('d'), &tx);
+        ui.question_key(KeyCode::Char('y'), &tx);
+        assert!(dir.join("bbbbbbbb2.jsonl").exists(), "the current session stays");
+
+        // `/skills` lists in a picker and deletes the skill's directory.
+        let skills = dir.join("skills");
+        std::fs::create_dir_all(skills.join("x")).unwrap();
+        std::fs::write(skills.join("x/SKILL.md"), "---\nname: ex\ndescription: does x\n---\n")
+            .unwrap();
+        ui.skills_dir = skills.clone();
+        ui.show_skills();
+        assert_eq!(ui.question.as_ref().unwrap().options[0].as_ref(), "ex — does x");
+        ui.question_key(KeyCode::Enter, &tx);
+        assert_eq!(ui.input.text, "/ex ", "picking a skill starts a message for it");
+        ui.show_skills();
+        ui.question_key(KeyCode::Char('d'), &tx);
+        ui.question_key(KeyCode::Char('y'), &tx);
+        assert!(!skills.join("x").exists() && ui.question.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A list without deletion ignores `d`.
+        let options = vec!["low".into()];
+        ui.question =
+            Some(Question { id: THINKING.into(), text: "".into(), options, at: 0, confirm: false });
+        ui.question_key(KeyCode::Char('d'), &tx);
+        assert!(!ui.question.as_ref().unwrap().confirm);
     }
 
     #[test]

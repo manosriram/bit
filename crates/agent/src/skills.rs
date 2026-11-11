@@ -35,7 +35,7 @@ pub fn section(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
     }
-    let mut s = "\nSkills (read a skill's SKILL.md before doing a task it covers):\n".to_owned();
+    let mut s = "\nSkills (read a skill's SKILL.md before doing a task it covers; a message starting with /<name> asks for that skill):\n".to_owned();
     for k in skills {
         s += &format!("- {} — {} ({})\n", k.name, k.description, k.path.display());
     }
