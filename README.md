@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-horizontal-dark.svg">
-    <img alt="bit" src="assets/logo-horizontal-light.svg" width="168">
+    <img alt="bit" src="assets/logo-horizontal-light.svg" width="192">
   </picture>
 </p>
 
@@ -69,7 +69,8 @@ In `-p` mode nobody can approve, so write, edit and bash are declined unless `--
 or `[bash] allow` permits them.
 
 Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Tab` toggle
-ask/auto, `Shift-Tab` next thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
+ask/auto (the switch at the left of the status line, amber in auto), `Shift-Tab` next
+thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
 `Option-Backspace` or `Ctrl-W` delete a word, `/` commands:
 
 ```
