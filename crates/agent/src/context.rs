@@ -27,14 +27,12 @@ impl Context {
     /// `prompt_cache_key`, for providers that route their cache by it. `messages` is the
     /// history of a resumed session.
     pub fn new(model: &str, cache_key: Option<&str>, messages: Vec<Box<RawValue>>) -> Self {
-        let (prefix, cache_key) = (String::new(), cache_key.map(str::to_owned));
-        let project = project();
         let mut cx = Self {
-            prefix,
+            prefix: String::new(),
             model: String::new(),
-            project,
+            project: project(),
             skills: Vec::new(),
-            cache_key,
+            cache_key: cache_key.map(str::to_owned),
             tools: tools::SCHEMAS.into(),
             thinking: None,
             tokens: 0,

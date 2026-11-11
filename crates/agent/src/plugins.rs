@@ -86,10 +86,8 @@ impl Plugins {
     /// broken file is an error, so a guard never silently goes missing.
     pub fn load(dir: &Path) -> Result<Self, String> {
         let (p, files) = Self::read(dir)?;
-        match files.into_iter().find_map(|(n, r)| r.err().map(|e| format!("✗ {n}: {e}"))) {
-            Some(e) => Err(e),
-            None => Ok(p),
-        }
+        let bad = files.into_iter().find_map(|(n, r)| r.err().map(|e| format!("✗ {n}: {e}")));
+        bad.map_or(Ok(p), Err)
     }
 
     /// Each file with its hooks, or why it fails to load: for `bit plugins`.

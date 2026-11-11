@@ -176,29 +176,12 @@ fn skill_name(url: &str) -> String {
 /// A multi-line YAML scalar, as `description:` uses it: folded (`>`) joins lines with
 /// spaces and a blank line becomes a paragraph break; literal (`|`) keeps the line breaks.
 /// The chomping indicators (`-`, `+`) only affect trailing newlines, which are trimmed
-/// away at the end, so they are accepted but not tracked.
-#[derive(Clone, Copy)]
-enum Scalar {
-    Folded,
-    Literal,
-}
-
-/// `description: >`, `description: >- start here`, `description: |+` and so on. Returns the
-/// scalar kind and the inline text after the indicator, if any.
-fn scalar_indicator(v: &str) -> Option<(Scalar, &str)> {
-    for (prefix, kind) in [
-        (">-", Scalar::Folded),
-        (">+", Scalar::Folded),
-        (">", Scalar::Folded),
-        ("|-", Scalar::Literal),
-        ("|+", Scalar::Literal),
-        ("|", Scalar::Literal),
-    ] {
-        if let Some(rest) = v.strip_prefix(prefix) {
-            return Some((kind, rest.trim()));
-        }
-    }
-    None
+/// away at the end, so they are accepted but not tracked. `description: >`,
+/// `description: >- start here`, `description: |+` and so on: returns whether it's folded
+/// and the inline text after the indicator, if any.
+fn scalar_indicator(v: &str) -> Option<(bool, &str)> {
+    let rest = v.strip_prefix(['>', '|'])?;
+    Some((v.starts_with('>'), rest.strip_prefix(['-', '+']).unwrap_or(rest).trim()))
 }
 
 /// Parses a simple `name` / `description` frontmatter. SKILL.md is expected to start with
@@ -210,13 +193,13 @@ fn frontmatter(text: &str) -> Option<(String, String)> {
         return None;
     }
     let (mut name, mut description) = (None, None);
-    let mut scalar: Option<(Scalar, String)> = None;
+    let mut scalar: Option<(bool, String)> = None;
 
     for line in lines {
         if line == "---" {
             break;
         }
-        if let Some((kind, content)) = &mut scalar {
+        if let Some((folded, content)) = &mut scalar {
             // A blank (whitespace-only) line is a paragraph break.
             if line.trim().is_empty() {
                 content.push('\n');
@@ -224,12 +207,10 @@ fn frontmatter(text: &str) -> Option<(String, String)> {
             }
             // An indented line continues the scalar.
             if line.starts_with(' ') || line.starts_with('\t') {
-                match kind {
-                    Scalar::Folded if !content.is_empty() && !content.ends_with('\n') => {
-                        content.push(' ');
-                    }
-                    Scalar::Literal => content.push('\n'),
-                    Scalar::Folded => {}
+                if !*folded {
+                    content.push('\n');
+                } else if !content.is_empty() && !content.ends_with('\n') {
+                    content.push(' ');
                 }
                 content.push_str(line.trim());
                 continue;
@@ -242,9 +223,7 @@ fn frontmatter(text: &str) -> Option<(String, String)> {
         match k.trim() {
             "name" => name = Some(v.trim().to_owned()),
             "description" => match scalar_indicator(v.trim()) {
-                Some((kind, inline)) => {
-                    scalar = Some((kind, inline.to_owned()));
-                }
+                Some((folded, inline)) => scalar = Some((folded, inline.to_owned())),
                 None => description = Some(v.trim().to_owned()),
             },
             _ => {}

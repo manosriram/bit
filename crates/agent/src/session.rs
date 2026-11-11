@@ -201,22 +201,12 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
             continue;
         };
         let mut lines = BufReader::new(File::open(&path)?).lines();
-        let (cwd, provider, model) = match lines.next().transpose()? {
-            Some(line) => {
-                let Ok(r) = serde_json::from_str::<Record>(&line) else {
-                    continue;
-                };
-                if r.t != "header" {
-                    continue;
-                }
-                (
-                    r.cwd.unwrap_or_default(),
-                    r.provider.unwrap_or_default(),
-                    r.model.unwrap_or_default(),
-                )
-            }
-            None => continue,
+        let Some(line) = lines.next().transpose()? else { continue };
+        let Some(r) = serde_json::from_str::<Record>(&line).ok().filter(|r| r.t == "header") else {
+            continue;
         };
+        let cwd = r.cwd.unwrap_or_default();
+        let (provider, model) = (r.provider.unwrap_or_default(), r.model.unwrap_or_default());
         let mut preview = String::new();
         for line in lines {
             let line = line?;

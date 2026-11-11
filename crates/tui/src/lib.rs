@@ -281,13 +281,13 @@ fn search<'p>(providers: &'p [agent::Provider], query: &str) -> Vec<(&'p str, &'
     all.filter(|(p, m)| format!("{p} {m}").to_lowercase().contains(&q)).collect()
 }
 
-/// `j`/`k` and the arrows move `at` within `len` rows. `Enter` gives `Some(true)`, `Esc`
-/// `Some(false)`.
 /// Lists whose rows `d` deletes, after a y/n confirm; `d` does nothing in the others.
 fn deletable(id: &str) -> bool {
     id == SESSIONS || id == SKILLS
 }
 
+/// `j`/`k` and the arrows move `at` within `len` rows. `Enter` gives `Some(true)`, `Esc`
+/// `Some(false)`.
 fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
     match code {
         KeyCode::Up | KeyCode::Char('k') => *at = at.saturating_sub(1),
@@ -299,7 +299,6 @@ fn nav(code: KeyCode, at: &mut usize, len: usize) -> Option<bool> {
     None
 }
 
-/// Red for a removed line, green for an added one.
 /// The colour of one logo pixel; `None` for the background.
 fn fg(pixel: char) -> Option<&'static str> {
     match pixel {
@@ -310,6 +309,7 @@ fn fg(pixel: char) -> Option<&'static str> {
     }
 }
 
+/// Red for a removed line, green for an added one.
 fn diff_sgr(line: &str) -> &'static str {
     match line.get(..2) {
         Some("- ") => "31",
@@ -325,17 +325,12 @@ fn clean(s: &str) -> String {
 
 /// A human-readable relative time like "2h" or "3d".
 fn ago(t: SystemTime) -> String {
-    let d = SystemTime::now().duration_since(t).unwrap_or_default();
-    if d < Duration::from_secs(60) {
-        "now".into()
-    } else if d < Duration::from_secs(3600) {
-        format!("{}m", d.as_secs() / 60)
-    } else if d < Duration::from_secs(86400) {
-        format!("{}h", d.as_secs() / 3600)
-    } else if d < Duration::from_secs(604800) {
-        format!("{}d", d.as_secs() / 86400)
-    } else {
-        format!("{}w", d.as_secs() / 604800)
+    match SystemTime::now().duration_since(t).unwrap_or_default().as_secs() {
+        0..60 => "now".into(),
+        s @ 60..3600 => format!("{}m", s / 60),
+        s @ 3600..86400 => format!("{}h", s / 3600),
+        s @ 86400..604800 => format!("{}d", s / 86400),
+        s => format!("{}w", s / 604800),
     }
 }
 
@@ -522,25 +517,23 @@ impl Ui {
         let id = q.id.clone();
         let picked = q.options.get(q.at).filter(|_| pick).map(|o| o.to_string());
         self.question = None;
-        match picked {
+        match (&*id, picked) {
             // The `/thinking` picker is the UI's own, not the agent's; typing `/thinking
             // <level>` is its `something else`.
-            Some(o) if &*id == THINKING => self.set_thinking(&o, cmds),
-            None if &*id == THINKING => {}
-            Some(o) if &*id == SESSIONS => {
+            (THINKING, Some(o)) => self.set_thinking(&o, cmds),
+            (SESSIONS, Some(o)) => {
                 let prefix = o.split_whitespace().next().unwrap_or(&o);
                 let _ = cmds.send(Command::Resume(prefix.into()));
             }
-            None if &*id == SESSIONS => {}
             // Picking a skill starts a message that asks for it: `/ponytail ` then the task.
-            Some(o) if &*id == SKILLS => {
+            (SKILLS, Some(o)) => {
                 self.input.set(&format!("/{} ", o.split(" — ").next().unwrap_or(&o)))
             }
-            None if &*id == SKILLS => {}
-            Some(text) => {
+            (THINKING | SESSIONS | SKILLS, None) => {}
+            (_, Some(text)) => {
                 let _ = cmds.send(Command::Answer { id, text });
             }
-            None => self.answering = Some(id),
+            (_, None) => self.answering = Some(id),
         }
     }
 
@@ -706,12 +699,8 @@ impl Ui {
     fn ask_thinking(&mut self) {
         let Some(levels) = self.available_levels() else { return };
         let default = self.default_label();
-        let options: Vec<Box<str>> = [default.as_str()]
-            .iter()
-            .copied()
-            .chain(levels.iter().copied())
-            .map(Into::into)
-            .collect();
+        let all = std::iter::once(default.as_str()).chain(levels.iter().copied());
+        let options: Vec<Box<str>> = all.map(Into::into).collect();
         let at = options.iter().position(|o| Some(&**o) == self.effort()).unwrap_or(0);
         let text = format!("How hard should {} think?", self.model).into();
         self.question = Some(Question { id: THINKING.into(), text, options, at, confirm: false });
@@ -721,10 +710,8 @@ impl Ui {
     fn show_skills(&mut self) {
         let skills = agent::skills::list(&self.skills_dir);
         if skills.is_empty() {
-            self.event(Event::Notice(
-                "no skills installed. hint: bit skills add <owner/repo>".into(),
-            ));
-            return;
+            let n = "no skills installed. hint: bit skills add <owner/repo>";
+            return self.event(Event::Notice(n.into()));
         }
         let options = skills.iter().map(|k| format!("{} — {}", k.name, k.description).into());
         self.question = Some(Question {
@@ -740,12 +727,10 @@ impl Ui {
     /// `/sessions`: list sessions and open a picker. The model is not involved.
     fn list_sessions(&mut self) {
         let Ok(entries) = agent::session::list(&self.sessions) else {
-            self.event(Event::Notice("error: could not list sessions".into()));
-            return;
+            return self.event(Event::Notice("error: could not list sessions".into()));
         };
         if entries.is_empty() {
-            self.event(Event::Notice("no sessions — start one with bit".into()));
-            return;
+            return self.event(Event::Notice("no sessions — start one with bit".into()));
         }
         let mut options = Vec::new();
         for e in entries {
@@ -807,10 +792,7 @@ impl Ui {
         let _ = cmds.send(Command::SetThinking(self.thinking.clone()));
         let n = match &self.thinking {
             Some(l) => format!("thinking set to {l}"),
-            None => match agent::models::default_level(&self.provider, &self.model) {
-                Some(d) => format!("thinking set to the model's default ({d})"),
-                None => "thinking set to the model's default".into(),
-            },
+            None => format!("thinking set to the model's {}", self.default_label()),
         };
         self.event(Event::Notice(n.into()));
     }

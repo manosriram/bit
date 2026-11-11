@@ -26,16 +26,8 @@ impl Input {
         match k.code {
             KeyCode::Char('a') if ctrl => self.cursor = 0,
             KeyCode::Char('e') if ctrl => self.cursor = self.text.len(),
-            KeyCode::Backspace if word => {
-                let start = self.word_start();
-                self.text.replace_range(start..self.cursor, "");
-                self.cursor = start;
-            }
-            KeyCode::Char('w') if ctrl => {
-                let start = self.word_start();
-                self.text.replace_range(start..self.cursor, "");
-                self.cursor = start;
-            }
+            KeyCode::Backspace if word => self.replace(self.word_start(), ""),
+            KeyCode::Char('w') if ctrl => self.replace(self.word_start(), ""),
             KeyCode::Left if word => self.cursor = self.word_start(),
             KeyCode::Char('b') if alt => self.cursor = self.word_start(),
             KeyCode::Right if word => self.cursor = self.word_end(),
@@ -143,7 +135,6 @@ impl Input {
         self.back > 0
     }
 
-    /// Replaces the text, with the cursor at the end.
     /// A copy with every character shown as a dot, for an API key.
     pub fn masked(&self) -> Input {
         let dots = |s: &str| "•".repeat(s.chars().count());
@@ -152,6 +143,7 @@ impl Input {
         Input { text, cursor: before.len(), ..Input::default() }
     }
 
+    /// Replaces the text, with the cursor at the end.
     pub fn set(&mut self, text: &str) {
         self.text = text.into();
         self.cursor = self.text.len();

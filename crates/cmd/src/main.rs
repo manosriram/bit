@@ -141,22 +141,10 @@ fn run(args: args::Args) -> Result<(), String> {
             }
             None => {
                 let at = (provider.as_str(), model.as_str(), cfg.thinking.as_deref());
-                tui::run(
-                    cmd_tx,
-                    ev_rx,
-                    at,
-                    &cfg.providers,
-                    mode,
-                    &notices,
-                    (
-                        cfg.skills.clone(),
-                        cfg.sessions.clone(),
-                        cwd.clone(),
-                        id.clone().into_boxed_str(),
-                    ),
-                )
-                .await
-                .map_err(|e| format!("error: terminal: {e}"))
+                let paths =
+                    (cfg.skills.clone(), cfg.sessions.clone(), cwd.clone(), id.clone().into());
+                let ui = tui::run(cmd_tx, ev_rx, at, &cfg.providers, mode, &notices, paths);
+                ui.await.map_err(|e| format!("error: terminal: {e}"))
             }
         }
     });

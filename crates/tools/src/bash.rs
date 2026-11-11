@@ -29,7 +29,7 @@ pub async fn run(a: Args, cx: &Ctx) -> Result<String, String> {
         let wait = async {
             let status = child.wait().await;
             // Background jobs would otherwise hold the pipe open and stall the read.
-            group.kill();
+            crate::kill_process_group(group.0);
             status
         };
         tokio::join!(wait, out.read(pipe)).0
@@ -56,15 +56,9 @@ pub async fn run(a: Args, cx: &Ctx) -> Result<String, String> {
 /// turn: dropping the future drops this.
 struct Group(i32);
 
-impl Group {
-    fn kill(&self) {
-        crate::kill_process_group(self.0);
-    }
-}
-
 impl Drop for Group {
     fn drop(&mut self) {
-        self.kill();
+        crate::kill_process_group(self.0);
     }
 }
 

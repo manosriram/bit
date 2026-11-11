@@ -14,7 +14,7 @@ pub fn run(sub: &[String], dir: &Path) -> Result<(), String> {
         [a] if a == "remove" => Err("error: bit skills remove needs a name".into()),
         [a, name] if a == "remove" => remove(dir, name),
         [a] if a == "update" => update_all(dir),
-        [a, name] if a == "update" => update_one(dir, name),
+        [a, name] if a == "update" => git_pull(&dir.join(name)),
         _ => Err("error: unknown bit skills command. hint: bit skills add|remove|update".into()),
     }
 }
@@ -60,10 +60,6 @@ fn update_all(dir: &Path) -> Result<(), String> {
     if failed { Err("error: one or more skills failed to update".into()) } else { Ok(()) }
 }
 
-fn update_one(dir: &Path, name: &str) -> Result<(), String> {
-    git_pull(&dir.join(name))
-}
-
 fn git_pull(path: &Path) -> Result<(), String> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
     if path.join(".git").is_dir() {
@@ -93,22 +89,15 @@ fn pull_source(path: &Path, name: &str) -> Result<(), String> {
     let source = std::fs::read_to_string(path.join(".source"))
         .map_err(|e| format!("error: could not read .source for {name}: {e}"))?;
     let mut lines = source.lines();
-    let url = lines.next().ok_or_else(|| format!("error: .source for {name} has no url"))?;
+    let url = lines.next().filter(|u| !u.is_empty());
+    let url = url.ok_or_else(|| format!("error: .source for {name} has no url"))?;
     let subpath = lines.next().unwrap_or("");
-    if url.is_empty() {
-        return Err(format!("error: .source for {name} has no url"));
-    }
 
     let tmp = path.parent().unwrap_or(Path::new(".")).join(format!(".tmp-update-{name}"));
     let _ = std::fs::remove_dir_all(&tmp);
     let out = Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            url,
-            tmp.to_str().unwrap_or(&format!(".tmp-update-{name}")),
-        ])
+        .args(["clone", "--depth", "1", url])
+        .arg(&tmp)
         .output()
         .map_err(|e| format!("error: git clone failed for {name}: {e}. {FIX}"))?;
     if !out.status.success() {

@@ -76,12 +76,7 @@ pub async fn run(
     events: UnboundedSender<Event>,
 ) {
     if !cx.messages.is_empty() {
-        if !agent.print {
-            replay(&cx, &events);
-        }
-        let note =
-            format!("resumed {} ({})", agent.session.id(), count(cx.messages.len(), "message"));
-        let _ = events.send(Event::Notice(note.into()));
+        resumed(&agent, &cx, &events);
     }
     // Shared by the turn and `listen`, which run side by side in one `select!`. Atomic
     // only because `tokio::spawn` needs the future to be `Send`.
@@ -131,22 +126,19 @@ pub async fn run(
             }
             Command::SkillAdd { repo } => {
                 let dir = agent.skills_dir.clone();
-                let tx = events.clone();
-                let _ = tx.send(Event::Notice(format!("installing skill from {repo}...").into()));
-                match tokio::task::spawn_blocking(move || crate::skills::add(&dir, &repo)).await {
+                let n = format!("installing skill from {repo}...");
+                let _ = events.send(Event::Notice(n.into()));
+                let n = match tokio::task::spawn_blocking(move || crate::skills::add(&dir, &repo))
+                    .await
+                {
                     Ok(Ok(msg)) => {
                         cx.add_skills(crate::skills::list(&agent.skills_dir));
-                        let _ = tx.send(Event::Notice(msg.into()));
+                        msg
                     }
-                    Ok(Err(e)) => {
-                        let _ = tx.send(Event::Notice(format!("error: {e}").into()));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Event::Notice(
-                            format!("error: skill install panicked: {e}").into(),
-                        ));
-                    }
-                }
+                    Ok(Err(e)) => format!("error: {e}"),
+                    Err(e) => format!("error: skill install panicked: {e}"),
+                };
+                let _ = events.send(Event::Notice(n.into()));
                 continue;
             }
             Command::Approve { .. } | Command::Answer { .. } | Command::Cancel => continue,
@@ -185,7 +177,7 @@ pub async fn run(
         }
         turn.save(&cx);
         if let Err(e) = turn.a.session.sync() {
-            turn.save_failed(&e);
+            turn.send(save_failed(&e));
         }
         // A send fails only once the UI is gone, and then the command channel closes too.
         let _ = events.send(Event::TurnEnd(reason));
@@ -214,7 +206,7 @@ impl Turn<'_> {
             let c = self.request(cx).await.map_err(|e| StopReason::Error(e.to_string().into()))?;
             cx.tokens = c.usage.input;
             if let Err(e) = self.a.session.usage(&c.usage) {
-                self.save_failed(&e);
+                self.send(save_failed(&e));
             }
             cx.messages.push(c.message);
             self.send(Event::Usage(c.usage));
@@ -453,7 +445,7 @@ impl Turn<'_> {
     /// never holds a tool call without its result.
     fn save(&mut self, cx: &Context) {
         if let Err(e) = self.a.session.append(&cx.messages[self.a.session.logged..]) {
-            self.save_failed(&e);
+            self.send(save_failed(&e));
         }
     }
 
@@ -482,20 +474,16 @@ impl Turn<'_> {
             }
         };
         if let Err(e) = self.a.session.usage(&c.usage) {
-            self.save_failed(&e);
+            self.send(save_failed(&e));
         }
         let summary = msg("user", &format!("{SUMMARY}\n\n{}{LATEST}{latest}", text(&c.message)));
         if let Err(e) = self.a.session.compact(&summary) {
-            self.save_failed(&e);
+            self.send(save_failed(&e));
         }
         let n = cx.messages.len();
         (cx.messages, cx.tokens) = (vec![summary], 0);
         let k = f64::from(c.usage.input) / 1e3;
         self.send(Event::Notice(format!("compacted {n} messages ({k:.1}k tokens)").into()));
-    }
-
-    fn save_failed(&self, e: &std::io::Error) {
-        self.send(save_failed(e));
     }
 
     /// One model request, retried after 1s and 3s while nothing from it has reached the screen.
@@ -654,16 +642,21 @@ fn resume(
     cx.cache_key = cache_key(provider, &id).map(Into::into);
     cx.set_model(model);
     set_thinking(agent, cx);
-    if !agent.print {
-        replay(cx, events);
-    }
-    let note = format!("resumed {} ({})", id, count(cx.messages.len(), "message"));
-    let _ = events.send(Event::Notice(note.into()));
+    resumed(agent, cx, events);
     if !known && !(prov.is_empty() && model.is_empty()) {
         let n = format!("session used {prov}/{model}; continuing with {provider}/{model}");
         let _ = events.send(Event::Notice(n.into()));
     }
     Ok(())
+}
+
+/// Shows a loaded history, unless nobody is there to see it, and says it was resumed.
+fn resumed(agent: &Agent, cx: &Context, events: &UnboundedSender<Event>) {
+    if !agent.print {
+        replay(cx, events);
+    }
+    let n = count(cx.messages.len(), "message");
+    let _ = events.send(Event::Notice(format!("resumed {} ({n})", agent.session.id()).into()));
 }
 
 /// Sends a resumed history to the UI as the events it would have seen live.
@@ -757,14 +750,8 @@ async fn listen(
                 let _ = replies.send(c);
             }
             Command::SetMode(m) => auto.store(m == Mode::Auto, Relaxed),
-            Command::Submit(_)
-            | Command::SetModel { .. }
-            | Command::SetThinking(_)
-            | Command::Clear
-            | Command::Resume(_)
-            | Command::SkillAdd { .. }
-            | Command::Compact
-            | Command::Login => {}
+            // The rest are sent only while idle.
+            _ => {}
         }
     }
 }
