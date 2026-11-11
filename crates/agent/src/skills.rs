@@ -29,13 +29,33 @@ pub fn list(dir: &Path) -> Vec<Skill> {
     out
 }
 
+/// Where an invoked skill's body starts in a user message; replay shows only what's before it.
+pub const MARK: &str = "\n\n<skill ";
+
+/// `/name task`: the message with skill `name`'s SKILL.md appended, so it's used for sure,
+/// and the skill's name. Any other message comes back as typed.
+pub fn invoke(dir: &Path, text: &str) -> (String, Option<String>) {
+    let name = text.strip_prefix('/').and_then(|t| t.split_whitespace().next()).unwrap_or("");
+    let found = list(dir).into_iter().find(|k| !name.is_empty() && k.name == name);
+    match found.and_then(|k| fs::read_to_string(&k.path).ok().map(|b| (k, b))) {
+        Some((k, body)) => {
+            let path = k.path.display();
+            (
+                format!("{text}{MARK}name=\"{}\" path=\"{path}\">\n{body}\n</skill>", k.name),
+                Some(k.name),
+            )
+        }
+        None => (text.into(), None),
+    }
+}
+
 /// The prompt section that lists installed skills. Empty when there are none, so it costs
 /// nothing when the user has no skills.
 pub fn section(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
     }
-    let mut s = "\nSkills (read a skill's SKILL.md before doing a task it covers; a message starting with /<name> asks for that skill):\n".to_owned();
+    let mut s = "\nSkills (read a skill's SKILL.md before doing a task it covers):\n".to_owned();
     for k in skills {
         s += &format!("- {} — {} ({})\n", k.name, k.description, k.path.display());
     }
@@ -239,6 +259,22 @@ fn frontmatter(text: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_name_appends_the_skill_and_other_text_is_untouched() {
+        let dir = std::env::temp_dir().join(format!("bit-invoke-{}", std::process::id()));
+        fs::create_dir_all(dir.join("p")).unwrap();
+        fs::write(dir.join("p/SKILL.md"), "---\nname: pony\ndescription: d\n---\nBe lazy.")
+            .unwrap();
+        let (text, name) = invoke(&dir, "/pony review this");
+        assert_eq!(name.as_deref(), Some("pony"));
+        assert!(text.starts_with("/pony review this\n\n<skill ") && text.contains("Be lazy."));
+        assert_eq!(text.split(MARK).next(), Some("/pony review this"));
+        for other in ["/ponyx hi", "hi /pony", "/"] {
+            assert_eq!(invoke(&dir, other), (other.into(), None));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_frontmatter() {

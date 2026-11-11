@@ -9,7 +9,7 @@ use input::Input;
 use markdown::Markdown;
 use render::{Line, Term, clip, str_width, wrap};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Instant, sleep_until};
@@ -62,6 +62,8 @@ const LOGO: [&str; 10] = [
 const AMBER: &str = "38;5;215";
 /// The logo's pole.
 const GREY: &str = "90";
+/// Bold violet for `using skill …`, so a skill in use stands out from text and dim notices.
+const SKILL: &str = "38;5;141;1";
 
 /// Runs the terminal UI until the user quits or the agent goes away.
 pub async fn run(
@@ -88,6 +90,7 @@ pub async fn run(
         auto: mode == Mode::Auto,
         ..Ui::default()
     };
+    ui.input.load(ui.sessions.with_file_name("history"));
     ui.logo();
     for n in notices {
         ui.event(Event::Notice(n.as_str().into()));
@@ -967,6 +970,9 @@ impl Ui {
                 let mut l = Line::new(self.color);
                 if n.starts_with("error:") {
                     l.add(AMBER, "!").add("", &format!(" {}", clean(&n)));
+                } else if n.starts_with("using skill ") {
+                    // `!` is taken by errors and `*` by tool lines.
+                    l.add(SKILL, &format!("+ {}", clean(&n)));
                 } else {
                     l.add(DIM, &format!("  {}", clean(&n)));
                 }
@@ -986,6 +992,13 @@ impl Ui {
             }
             Event::ToolStart { name, summary, diff, .. } => {
                 self.end_text();
+                // Reading a SKILL.md is how the model uses a skill; say so, since it's otherwise silent.
+                let skill = Path::new(&*summary).parent().and_then(|d| d.file_name());
+                if let Some(s) = skill.filter(|_| &*name == "read" && summary.ends_with("SKILL.md"))
+                {
+                    let n = format!("using skill {}", s.to_string_lossy());
+                    self.event(Event::Notice(n.into()));
+                }
                 self.section(true);
                 self.tool = Some((name, summary, diff));
             }
@@ -1632,6 +1645,26 @@ mod tests {
         let preview = if ok { "ok" } else { "error: no match" }.into();
         ui.event(Event::ToolEnd { id: "e1".into(), ok, preview, output: "".into() });
         ui.done
+    }
+
+    #[test]
+    fn reading_a_skill_md_says_the_skill_is_used() {
+        let mut ui = Ui { cols: 80, ..Ui::default() };
+        let start = |summary: &str| Event::ToolStart {
+            id: "r".into(),
+            name: "read".into(),
+            summary: summary.into(),
+            diff: "".into(),
+        };
+        ui.event(start("/home/x/skills/pony/SKILL.md"));
+        assert!(ui.done.iter().any(|r| r.contains("using skill pony")));
+        ui.color = true;
+        ui.event(Event::Notice("using skill pony".into()));
+        assert!(ui.done.last().unwrap().contains(SKILL), "drawn violet, not dim");
+        assert!(ui.done.last().unwrap().contains("+ using skill pony"));
+        ui.done.clear();
+        ui.event(start("src/main.rs"));
+        assert!(!ui.done.iter().any(|r| r.contains("using skill")));
     }
 
     #[test]

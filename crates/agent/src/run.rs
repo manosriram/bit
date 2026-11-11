@@ -154,7 +154,11 @@ pub async fn run(
         while replies.try_recv().is_ok() {}
         let len = cx.messages.len();
         if let Some(text) = &text {
-            cx.messages.push(msg("user", text));
+            let (text, skill) = crate::skills::invoke(&agent.skills_dir, text);
+            if let Some(name) = skill {
+                let _ = events.send(Event::Notice(format!("using skill {name}").into()));
+            }
+            cx.messages.push(msg("user", &text));
         }
         let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
         let work = async {
@@ -671,6 +675,8 @@ fn replay(cx: &Context, events: &UnboundedSender<Event>) {
     for m in &cx.messages {
         let v: Value = serde_json::from_str(m.get()).unwrap_or_default();
         let text = v["content"].as_str().unwrap_or("");
+        // An invoked skill's body was added for the model, not typed.
+        let text = text.split(crate::skills::MARK).next().unwrap_or(text);
         match v["role"].as_str() {
             Some("user") => match text.strip_prefix(SUMMARY) {
                 Some(rest) => {
