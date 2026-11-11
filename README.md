@@ -80,6 +80,7 @@ thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
 /sessions          list sessions and resume another one
 /skills [add <repo>]  show installed skills or add one
 /compact           summarize the conversation to free up context
+/undo              put back the files the last turn edited; the model forgets that turn
 /clear             start over; the model forgets this conversation
 ```
 
@@ -87,6 +88,10 @@ thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
 takes only `high` and `max`), `off` where the model can skip thinking, and `default`, with
 the level it means when known (`default (medium)`). The pick shows in the status line, is
 kept for the next session, and goes only to models that take it; the rest use their default.
+
+`/undo` restores each file the last turn changed with `edit` or `write` and deletes the ones
+it created, then drops the turn from the history. It can't undo `bash` or plugin tools, and
+says so when the turn ran one. It goes back one turn, within the running session.
 
 ## Providers
 

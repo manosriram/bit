@@ -30,6 +30,7 @@ struct Record<'a> {
     cwd: Option<PathBuf>,
     provider: Option<String>,
     model: Option<String>,
+    n: Option<usize>,
 }
 
 impl Session {
@@ -54,6 +55,7 @@ impl Session {
                 }
                 ("clear", _) => messages.clear(),
                 ("compact", Some(m)) => messages = vec![m.to_owned()],
+                ("undo", _) => messages.truncate(r.n.unwrap_or(messages.len())),
                 ("msg", Some(m)) => messages.push(m.to_owned()),
                 _ => {}
             }
@@ -115,6 +117,15 @@ impl Session {
         match self.header {
             Some(_) => Ok(()),
             None => self.write("{\"t\":\"clear\"}\n"),
+        }
+    }
+
+    /// Keeps only the first `n` messages; a resume then sees the same.
+    pub(crate) fn truncate(&mut self, n: usize) -> io::Result<()> {
+        self.logged = n;
+        match self.header {
+            Some(_) => Ok(()),
+            None => self.write(&format!("{{\"t\":\"undo\",\"n\":{n}}}\n")),
         }
     }
 
@@ -300,5 +311,11 @@ mod tests {
         s.append(&[m("2")]).unwrap();
         let l = Session::open(&dir.join("c1.jsonl")).unwrap();
         assert_eq!(l.messages.iter().map(|m| m.get()).collect::<Vec<_>>(), ["2"]);
+        s.append(&[m("3"), m("4")]).unwrap();
+        s.truncate(2).unwrap();
+        assert_eq!(s.logged, 2);
+        s.append(&[m("5")]).unwrap();
+        let l = Session::open(&dir.join("c1.jsonl")).unwrap();
+        assert_eq!(l.messages.iter().map(|m| m.get()).collect::<Vec<_>>(), ["2", "3", "5"]);
     }
 }

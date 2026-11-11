@@ -30,6 +30,9 @@ pub enum Command {
     SkillAdd {
         repo: Box<str>,
     },
+    /// Puts back the files the last turn's `edit` and `write` calls changed, and drops that
+    /// turn from the history. Answered with a `Notice`. Sent only while idle.
+    Undo,
     /// Summarizes the history now. Runs like a turn and ends with `TurnEnd`.
     Compact,
     /// Asks which provider to sign in to, then signs in. Runs like a turn.

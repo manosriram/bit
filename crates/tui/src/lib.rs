@@ -22,7 +22,7 @@ const DETAIL_ROWS: usize = 12;
 /// Last rows of a command's output shown under its tool line.
 const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 7] = [
+const COMMANDS: [(&str, &str, &str); 8] = [
     ("/clear", "", "start over; the model forgets this conversation"),
     ("/compact", "", "summarize the conversation to free up context"),
     ("/login", "", "add a provider: paste its API key, or sign in"),
@@ -30,6 +30,7 @@ const COMMANDS: [(&str, &str, &str); 7] = [
     ("/sessions", "", "list sessions and resume another one"),
     ("/skills", "[add <repo>]", "show installed skills or add one"),
     ("/thinking", "[level]", "pick how hard the model thinks, or set it to level"),
+    ("/undo", "", "put back the files the last turn edited; the model forgets that turn"),
 ];
 /// The id of the `/thinking` picker's question.
 const THINKING: &str = "thinking";
@@ -642,6 +643,10 @@ impl Ui {
             "/sessions" => {
                 self.input.take();
                 self.list_sessions();
+            }
+            "/undo" => {
+                self.input.take();
+                let _ = cmds.send(Command::Undo);
             }
             _ if self.model.is_empty() => self.pick(true),
             "/compact" => {

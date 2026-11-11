@@ -83,6 +83,7 @@ pub async fn run(
     set_thinking(&agent, &mut cx);
     let auto = AtomicBool::new(agent.mode == Mode::Auto);
     let (replies_tx, mut replies) = unbounded_channel();
+    let mut undo = Undo::default();
     while let Some(cmd) = cmds.recv().await {
         // `None` is `/compact` or `/login`: a turn that sends no message.
         let login = matches!(cmd, Command::Login);
@@ -110,7 +111,13 @@ pub async fn run(
                 }
                 continue;
             }
+            Command::Undo => {
+                let n = undo.revert(&mut cx, &mut agent.session);
+                let _ = events.send(Event::Notice(n.into()));
+                continue;
+            }
             Command::Clear => {
+                undo = Undo::default();
                 cx.messages.clear();
                 cx.tokens = 0;
                 if let Err(e) = agent.session.clear() {
@@ -119,6 +126,7 @@ pub async fn run(
                 continue;
             }
             Command::Resume(prefix) => {
+                undo = Undo::default();
                 if let Err(e) = resume(&mut agent, &mut cx, &prefix, &events) {
                     let _ = events.send(Event::Notice(format!("error: {e}").into()));
                 }
@@ -146,13 +154,14 @@ pub async fn run(
         while replies.try_recv().is_ok() {}
         let len = cx.messages.len();
         if let Some(text) = &text {
+            undo = Undo { from: Some(len), ..Undo::default() };
             let (text, skill) = crate::skills::invoke(&agent.skills_dir, text);
             if let Some(name) = skill {
                 let _ = events.send(Event::Notice(format!("using skill {name}").into()));
             }
             cx.messages.push(msg("user", &text));
         }
-        let mut turn = Turn { a: &mut agent, events: &events, auto: &auto };
+        let mut turn = Turn { a: &mut agent, events: &events, auto: &auto, undo: &mut undo };
         let work = async {
             match text {
                 Some(_) => turn.run(&mut cx, &mut replies).await,
@@ -188,6 +197,86 @@ struct Turn<'a> {
     a: &'a mut Agent,
     events: &'a UnboundedSender<Event>,
     auto: &'a AtomicBool,
+    undo: &'a mut Undo,
+}
+
+/// What `/undo` puts back: the last turn's place in the history, and each file as it was
+/// before that turn's first `edit` or `write` of it.
+#[derive(Default)]
+struct Undo {
+    /// The history's length before the turn; `None` once a compaction replaced it.
+    from: Option<usize>,
+    /// The bytes, or `None` for a file the turn created.
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// Something ran whose changes aren't tracked: bash, a plugin tool, an unreadable file.
+    untracked: bool,
+}
+
+impl Undo {
+    fn track(&mut self, name: &str, args: &str, cwd: &Path) {
+        if !matches!(name, "edit" | "write") {
+            self.untracked |= tools::mutates(name);
+            return;
+        }
+        let v: Value = serde_json::from_str(args).unwrap_or_default();
+        let Some(path) = v["path"].as_str().map(|p| cwd.join(p)) else { return };
+        if self.files.iter().any(|(f, _)| *f == path) {
+            return;
+        }
+        match std::fs::read(&path) {
+            Ok(b) => self.files.push((path, Some(b))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.files.push((path, None)),
+            // Not knowing the old bytes, undo must neither overwrite nor delete it.
+            Err(_) => self.untracked = true,
+        }
+    }
+
+    /// Puts the files back and drops the turn from the history; says what it did.
+    fn revert(&mut self, cx: &mut Context, session: &mut Session) -> String {
+        let u = std::mem::take(self);
+        if u.from.is_none() && u.files.is_empty() {
+            return "nothing to undo".into();
+        }
+        let (mut restored, mut removed, mut failed) = (0, 0, Vec::new());
+        for (path, old) in &u.files {
+            let r = match old {
+                Some(b) => std::fs::write(path, b).map(|()| restored += 1),
+                None => match std::fs::remove_file(path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => {
+                        removed += 1;
+                        Ok(())
+                    }
+                },
+            };
+            if let Err(e) = r {
+                failed.push(format!("{}: {e}", path.display()));
+            }
+        }
+        let mut n = format!(
+            "undid the last turn: restored {}, deleted {} it created",
+            count(restored, "file"),
+            count(removed, "file")
+        );
+        match u.from {
+            Some(len) => {
+                cx.messages.truncate(len);
+                cx.tokens = 0;
+                if let Err(e) = session.truncate(len) {
+                    failed.push(format!("the session log: {e}"));
+                }
+                n += "; the model forgets that turn";
+            }
+            None => n += "; the history was compacted since, so the model still remembers it",
+        }
+        if u.untracked {
+            n += ". bash and plugin changes were not undone";
+        }
+        if !failed.is_empty() {
+            n += &format!(". error: could not restore {}", failed.join(", "));
+        }
+        n
+    }
 }
 
 impl Turn<'_> {
@@ -258,10 +347,14 @@ impl Turn<'_> {
                     }
                     ("ask", _) => self.ask(id, args, replies).await,
                     (_, true) if self.a.plugins.has("tool_", name) => {
+                        self.undo.untracked = true;
                         let (n, a, fx) = (name.to_owned(), args.to_owned(), self.fields());
                         self.hooks(replies, move |p, to| p.run_tool(&n, &a, &fx, to)).await
                     }
-                    (_, true) => tools::exec(name, args, &self.a.tools).await,
+                    (_, true) => {
+                        self.undo.track(name, args, &self.a.tools.cwd);
+                        tools::exec(name, args, &self.a.tools).await
+                    }
                     (_, false) => {
                         let why = if self.a.print { NOT_ALLOWED } else { DECLINED };
                         tools::Output { ok: false, content: why.into() }
@@ -482,6 +575,7 @@ impl Turn<'_> {
         }
         let n = cx.messages.len();
         (cx.messages, cx.tokens) = (vec![summary], 0);
+        self.undo.from = None;
         let k = f64::from(c.usage.input) / 1e3;
         self.send(Event::Notice(format!("compacted {n} messages ({k:.1}k tokens)").into()));
     }
@@ -824,6 +918,10 @@ mod tests {
         (cmd_tx, ev, bodies)
     }
 
+    async fn turn_end(ev: &mut UnboundedReceiver<Event>) {
+        while next(ev).await != Event::TurnEnd(StopReason::Done) {}
+    }
+
     /// The next event that isn't `Usage`.
     async fn next(ev: &mut UnboundedReceiver<Event>) -> Event {
         loop {
@@ -1064,6 +1162,47 @@ mod tests {
         let assistant = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"w1","type":"function","function":{"name":"write","arguments":"{\"path\":\"f.txt\",\"content\":\"hi\"}"}}]}"#;
         let result = format!(r#"{{"content":"{DECLINED}","role":"tool","tool_call_id":"w1"}}]}}"#);
         assert!(b2.ends_with(&format!("{assistant},{result}")), "{b2}");
+    }
+
+    #[tokio::test]
+    async fn undo_restores_files_and_drops_the_turn() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "undo");
+        agent.mode = Mode::Auto;
+        let dir = agent.tools.cwd.clone();
+        std::fs::write(dir.join("old.txt"), "a").unwrap();
+        let replies = vec![
+            sse(&["one"], true),
+            call("w1", "write", r#"{"path":"new.txt","content":"x"}"#),
+            call("e1", "edit", r#"{"path":"old.txt","old":"a","new":"b"}"#),
+            call("e2", "edit", r#"{"path":"old.txt","old":"b","new":"c"}"#),
+            sse(&["two"], true),
+            sse(&["three"], true),
+        ];
+        let (cmds, mut ev, mut bodies) =
+            start(agent, Context::new("m", None, Vec::new()), l, replies).await;
+        cmds.send(Command::Submit("first".into())).unwrap();
+        turn_end(&mut ev).await;
+        cmds.send(Command::Submit("second".into())).unwrap();
+        turn_end(&mut ev).await;
+        assert_eq!(std::fs::read_to_string(dir.join("old.txt")).unwrap(), "c");
+
+        cmds.send(Command::Undo).unwrap();
+        let Event::Notice(n) = next(&mut ev).await else { panic!() };
+        assert!(n.starts_with("undid the last turn: restored 1 file, deleted 1 file"), "{n}");
+        assert_eq!(std::fs::read_to_string(dir.join("old.txt")).unwrap(), "a");
+        assert!(!dir.join("new.txt").exists());
+        cmds.send(Command::Undo).unwrap();
+        assert_eq!(next(&mut ev).await, Event::Notice("nothing to undo".into()));
+
+        cmds.send(Command::Submit("third".into())).unwrap();
+        turn_end(&mut ev).await;
+        let last = std::iter::from_fn(|| bodies.try_recv().ok()).last().unwrap();
+        assert!(last.contains("first") && last.contains("third"), "{last}");
+        assert!(!last.contains("second"), "the undone turn is gone: {last}");
+        let log = std::fs::read_dir(dir.join("sessions")).unwrap().next().unwrap().unwrap();
+        let l = Session::open(&log.path()).unwrap();
+        assert_eq!(l.messages.len(), 4, "a resume sees the same history");
     }
 
     #[tokio::test]
