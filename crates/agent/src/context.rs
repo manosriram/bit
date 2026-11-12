@@ -15,6 +15,8 @@ pub struct Context {
     pub(crate) cache_key: Option<String>,
     /// The tool schemas: the built-ins, then the plugins' own.
     tools: String,
+    /// The model can't call tools, so none are sent: the session is chat only.
+    chat_only: bool,
     /// Fields that set the thinking level, from the provider's spec; none for its default.
     thinking: Option<serde_json::Value>,
     /// Input tokens of the last request: how full the window is. 0 until one is sent.
@@ -34,6 +36,7 @@ impl Context {
             skills: Vec::new(),
             cache_key: cache_key.map(str::to_owned),
             tools: tools::SCHEMAS.into(),
+            chat_only: false,
             thinking: None,
             tokens: 0,
             messages,
@@ -65,8 +68,10 @@ impl Context {
         }
         let mut prefix = head.to_string();
         prefix.pop();
-        prefix.push_str(",\"tools\":");
-        prefix.push_str(&self.tools);
+        if !self.chat_only {
+            prefix.push_str(",\"tools\":");
+            prefix.push_str(&self.tools);
+        }
         prefix.push_str(",\"messages\":[");
         // Models take their name from the history otherwise, and keep the old one after a switch.
         let mut prompt =
@@ -74,6 +79,9 @@ impl Context {
         if !model.is_empty() {
             prompt +=
                 &format!("\nYour model id is {model}. If asked which model you are, say {model}.");
+        }
+        if self.chat_only {
+            prompt += "\nThis model can't call tools, so you have none in this session: answer from the conversation alone, and ask the user to paste any file or output you need.";
         }
         prefix.push_str(msg("system", &prompt).get());
         (self.prefix, self.model) = (prefix, model.into());
@@ -87,6 +95,12 @@ impl Context {
         }
         let base = tools::SCHEMAS.trim_end().strip_suffix(']').unwrap_or(tools::SCHEMAS);
         self.tools = format!("{base},\n{schemas}\n]");
+        self.set_model(&self.model.clone());
+    }
+
+    /// Sends no tools, for a model that can't call them.
+    pub fn set_chat_only(&mut self, on: bool) {
+        self.chat_only = on;
         self.set_model(&self.model.clone());
     }
 
@@ -169,4 +183,17 @@ pub(crate) fn msg(role: &str, content: &str) -> Box<RawValue> {
 pub(crate) fn tool_msg(id: &str, content: &str) -> Box<RawValue> {
     let m = serde_json::json!({"role": "tool", "tool_call_id": id, "content": content});
     RawValue::from_string(m.to_string()).expect("json! is valid JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_chat_only_model_gets_no_tools() {
+        let mut cx = super::Context::new("m", None, Vec::new());
+        assert!(cx.prefix().contains(r#""tools":"#));
+        cx.set_chat_only(true);
+        assert!(!cx.prefix().contains(r#""tools":"#), "{}", cx.prefix());
+        cx.set_chat_only(false);
+        assert!(cx.prefix().contains(r#""tools":"#));
+    }
 }

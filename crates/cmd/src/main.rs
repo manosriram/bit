@@ -105,6 +105,7 @@ fn run(args: args::Args) -> Result<(), String> {
     let mut cx = agent::Context::new(&model, agent::cache_key(&provider, &id), messages);
     cx.add_tools(plugins.schemas());
     cx.add_skills(skills.clone());
+    cx.set_chat_only(p.chat_only.contains(&model));
     let (client, no_key) = (agent::connect(p, &id), p.key.clone().err());
     let mode = if args.auto { agent::proto::Mode::Auto } else { agent::proto::Mode::Ask };
     let rt = tokio::runtime::Builder::new_current_thread()

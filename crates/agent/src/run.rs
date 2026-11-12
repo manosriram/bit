@@ -22,6 +22,8 @@ pub struct Provider {
     pub key: Result<String, String>,
     /// What the model picker offers for it.
     pub models: Vec<String>,
+    /// Those of `models` that can't call tools: they get none.
+    pub chat_only: Vec<String>,
 }
 
 /// The client for `p`, as its spec says. A provider from the config speaks Chat Completions
@@ -387,8 +389,9 @@ impl Turn<'_> {
             API_KEY => false,
             _ => return Err(fail(&format!("error: pick {SIGN_IN} or {API_KEY}"))),
         };
-        let is_oauth = |p: &&Provider| {
-            providers::find(&p.name).is_some_and(|s| matches!(s.auth, Auth::Oauth)) == oauth
+        let is_oauth = |p: &&Provider| match providers::find(&p.name).map(|s| &s.auth) {
+            Some(Auth::None) => false,
+            a => matches!(a, Some(Auth::Oauth)) == oauth,
         };
         let kind: Vec<&Provider> = self.a.providers.iter().filter(is_oauth).collect();
         let status = |p: &Provider| if p.key.is_ok() { CONNECTED } else { NOT_CONNECTED };
@@ -624,7 +627,13 @@ fn set_model(
         cx.cache_key = cache_key(&p.name, &id).map(Into::into);
         agent.provider = p.name.clone();
     }
+    let chat = chat_only(agent, model);
+    cx.set_chat_only(chat);
     cx.set_model(model);
+    if chat {
+        let n = format!("{model} can't call tools: chat only, it can't read, edit or run anything");
+        let _ = events.send(Event::Notice(n.into()));
+    }
     if let Err(e) = agent.session.set_model(&agent.provider, model) {
         let _ = events.send(save_failed(&e));
     }
@@ -647,6 +656,12 @@ fn set_thinking(agent: &Agent, cx: &mut Context) {
     // bit says `off` where the providers say `none`.
     let fields = level.map(|l| to(if l == "off" { "none" } else { l }));
     cx.set_thinking(fields);
+}
+
+/// Whether the current provider marks `model` as one that can't call tools.
+fn chat_only(agent: &Agent, model: &str) -> bool {
+    let p = agent.providers.iter().find(|p| p.name == agent.provider);
+    p.is_some_and(|p| p.chat_only.iter().any(|m| m == model))
 }
 
 fn remember(path: Option<&Path>, pick: &str) -> std::io::Result<()> {
@@ -734,6 +749,7 @@ fn resume(
         })?;
     agent.client = connect(p, &id);
     cx.cache_key = cache_key(provider, &id).map(Into::into);
+    cx.set_chat_only(p.chat_only.iter().any(|m| m == model));
     cx.set_model(model);
     set_thinking(agent, cx);
     resumed(agent, cx, events);
@@ -1321,6 +1337,7 @@ mod tests {
             key_env: "K".into(),
             key: Ok("k".into()),
             models: Vec::new(),
+            chat_only: Vec::new(),
         }];
         let cx = Context::new("", None, Vec::new());
         let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
@@ -1446,6 +1463,7 @@ mod tests {
             key_env: "OPENAI_API_KEY".into(),
             key: Err("error: not set".into()),
             models: Vec::new(),
+            chat_only: Vec::new(),
         }];
         let (cmds, mut ev, mut bodies) =
             start(agent, Context::new("m", None, vec![]), l, vec![]).await;

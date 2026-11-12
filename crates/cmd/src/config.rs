@@ -101,13 +101,26 @@ pub fn load() -> Result<Config, String> {
         let key_env = pick(c_env, builtin.map(|s| s.key_env()), "api_key_env")?;
         let key = match builtin.map(|s| (s, &s.auth)) {
             Some((s, Auth::Oauth)) => signed_in(s, &auth),
+            Some((_, Auth::None)) => Ok(String::new()), // set below, once it's reached
             _ => api_key(&name, &key_env, std::env::var(&key_env).ok(), saved.remove(&name)),
         };
         let mut models = c_models;
         let built: Vec<String> =
             agent::models::list(&name).map(String::from).filter(|m| !models.contains(m)).collect();
         models.extend(built);
-        providers.push(agent::Provider { name, base_url, key_env, key, models });
+        let (mut key, mut chat_only) = (key, Vec::new());
+        if let Some(s) = builtin.filter(|s| matches!(s.auth, Auth::None)) {
+            let local = block_on(providers::local_models(s, &base_url)).unwrap_or_default();
+            chat_only = local.iter().filter(|m| !m.1).map(|m| m.0.clone()).collect();
+            let local: Vec<String> = local.into_iter().map(|m| m.0).collect();
+            if local.is_empty() {
+                key = Err(format!(
+                    "error: no {name} models at {base_url}. hint: start it and pull a model, then restart bit"
+                ));
+            }
+            models.extend(local.into_iter().filter(|m| !models.contains(m)).collect::<Vec<_>>());
+        }
+        providers.push(agent::Provider { name, base_url, key_env, key, models, chat_only });
     }
     providers.sort_by_key(|p| p.key.is_err());
 
@@ -158,8 +171,12 @@ fn api_key(
 /// The saved sign-in. Its own runtime, since a refresh is a request and the session's
 /// runtime starts later.
 fn signed_in(s: &providers::Spec, auth: &std::path::Path) -> Result<String, String> {
+    block_on(providers::token(s, auth))?
+}
+
+fn block_on<T>(f: impl std::future::Future<Output = T>) -> Result<T, String> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
-    rt.map_err(|e| e.to_string())?.block_on(providers::token(s, auth))
+    Ok(rt.map_err(|e| e.to_string())?.block_on(f))
 }
 
 #[cfg(test)]

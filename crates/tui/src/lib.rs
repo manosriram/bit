@@ -22,9 +22,10 @@ const DETAIL_ROWS: usize = 12;
 /// Last rows of a command's output shown under its tool line.
 const TAIL_ROWS: usize = 4;
 /// Slash commands: name, arguments, help.
-const COMMANDS: [(&str, &str, &str); 8] = [
+const COMMANDS: [(&str, &str, &str); 9] = [
     ("/clear", "", "start over; the model forgets this conversation"),
     ("/compact", "", "summarize the conversation to free up context"),
+    ("/exit", "", "quit bit"),
     ("/login", "", "add a provider: paste its API key, or sign in"),
     ("/model", "[id]", "pick the model, or set it to id"),
     ("/sessions", "", "list sessions and resume another one"),
@@ -211,6 +212,8 @@ struct Ui {
     /// report cached tokens.
     cache: (u64, Option<u64>),
     quit_armed: bool,
+    /// Set by `/exit`.
+    exit: bool,
     auto: bool,
     /// The running tool's name and summary, shown just above the box, and its diff.
     tool: Option<(Box<str>, Box<str>, Box<str>)>,
@@ -428,7 +431,7 @@ impl Ui {
             },
             _ => {}
         }
-        true
+        !self.exit
     }
 
     /// `y`/`n`/`a`, or moving and `Enter`; `Esc` declines.
@@ -647,6 +650,13 @@ impl Ui {
             "/undo" => {
                 self.input.take();
                 let _ = cmds.send(Command::Undo);
+            }
+            "/exit" => {
+                self.input.take();
+                if self.busy.is_some() {
+                    let _ = cmds.send(Command::Cancel);
+                }
+                self.exit = true;
             }
             _ if self.model.is_empty() => self.pick(true),
             "/compact" => {
@@ -1385,6 +1395,7 @@ mod tests {
             key_env: "/login".into(),
             key: Err("error: not signed in".into()),
             models: vec!["m".into()],
+            chat_only: Vec::new(),
         };
         let mut ui = Ui { providers: vec![p], cols: 80, ..Ui::default() };
         let (tx, mut rx) = unbounded_channel();
@@ -1688,5 +1699,13 @@ mod tests {
         assert!(!f.iter().any(|r| r.contains("option 12")));
         // Later options are not rendered.
         assert!(!f.iter().any(|r| r.contains("option 17")));
+    }
+
+    #[test]
+    fn exit_quits() {
+        let mut ui = Ui { cols: 80, model: "m".into(), ..Ui::default() };
+        let (tx, _rx) = unbounded_channel();
+        ui.input.set("/exit");
+        assert!(!ui.key(ct::Event::Key(KeyCode::Enter.into()), &tx));
     }
 }

@@ -5,6 +5,7 @@
 pub mod auth;
 mod chatgpt;
 mod keyed;
+mod ollama;
 
 use std::path::Path;
 
@@ -32,6 +33,8 @@ pub enum Auth {
     Key(&'static str),
     /// Signed in through the browser with `/login`.
     Oauth,
+    /// A local server that takes no key.
+    None,
 }
 
 impl Spec {
@@ -40,6 +43,7 @@ impl Spec {
         match self.auth {
             Auth::Key(env) => env,
             Auth::Oauth => "/login",
+            Auth::None => "local",
         }
     }
 }
@@ -53,10 +57,20 @@ pub const ALL: &[&Spec] = &[
     &keyed::OPENCODE_GO,
     &keyed::OPENROUTER,
     &keyed::ZAI,
+    &ollama::SPEC,
 ];
 
 pub fn find(name: &str) -> Option<&'static Spec> {
     ALL.iter().copied().find(|s| s.name == name)
+}
+
+/// The models a keyless local server `s` serves at `base_url`, read from it, each with
+/// whether it can call tools; none for others.
+pub async fn local_models(s: &Spec, base_url: &str) -> Vec<(String, bool)> {
+    match s.auth {
+        Auth::None => ollama::models(base_url).await,
+        _ => Vec::new(),
+    }
 }
 
 /// Signs in to `s` (its URL goes to `show` too) and gives the access token.

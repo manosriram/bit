@@ -9,6 +9,7 @@ bit has these providers built in:
 | `anthropic` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1` | API key |
 | `opencode-go` | the OpenCode Go models (`kimi-k3`, `glm-5.3`, ...) | API key |
 | `chatgpt` | `gpt-6.1-sol`, `gpt-6-sol`, ... | your ChatGPT plan (Plus, Pro, ...) |
+| `ollama` | whatever you've pulled (`ollama pull qwen3-coder`) | nothing |
 
 ## Add a provider
 
@@ -39,6 +40,28 @@ export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 export OPENCODE_API_KEY=...
 ```
+
+## Local models with Ollama
+
+Start Ollama and pull a model, then start bit:
+
+```sh
+ollama serve
+ollama pull qwen3-coder
+```
+
+bit reads the models from `http://localhost:11434/v1` at startup and lists them under
+`ollama` in `/model`. No key needed. Pull a new one? Restart bit. For a server elsewhere:
+
+```toml
+[providers.ollama]
+base_url = "http://my-box:11434/v1"
+```
+
+Ollama's default context window is small for a coding agent; raise it with
+`OLLAMA_CONTEXT_LENGTH=32768 ollama serve`. A model that can't call tools (`ollama show
+<model>` lists `tools` under Capabilities) still works, but chat only: bit sends it no
+tools, so it can't read, edit or run anything.
 
 ## Any other OpenAI-compatible provider
 

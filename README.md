@@ -82,6 +82,7 @@ thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
 /compact           summarize the conversation to free up context
 /undo              put back the files the last turn edited; the model forgets that turn
 /clear             start over; the model forgets this conversation
+/exit              quit bit
 ```
 
 `/thinking` offers the levels the current model takes (glm-5.2 on opencode-go, for one,
@@ -108,6 +109,7 @@ provider whose key is set:
 | `openrouter` | API key | `OPENROUTER_API_KEY` |
 | `zai` | API key | `ZAI_API_KEY` |
 | `chatgpt` | a browser sign-in to your ChatGPT plan (Plus, Pro, ...) | |
+| `ollama` | nothing: its models are the ones pulled on the local server | |
 
 To add one, type `/login` and pick it. For an API key, paste it (it's hidden as you type);
 for `chatgpt`, sign in on the page that opens in your browser. bit saves either in
