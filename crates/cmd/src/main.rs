@@ -112,6 +112,7 @@ fn run(args: args::Args) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
+    // The UI may switch sessions with `/sessions`; the hint names the one open at the end.
     let r = rt.block_on(async {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, ev_rx) = unbounded_channel();
@@ -138,17 +139,18 @@ fn run(args: args::Args) -> Result<(), String> {
         match args.print {
             Some(prompt) => {
                 notices.iter().for_each(|n| eprintln!("bit: {n}"));
-                print::run(cmd_tx, ev_rx, prompt, &mut std::io::stdout()).await
+                print::run(cmd_tx, ev_rx, prompt, &mut std::io::stdout()).await.map(|()| id.clone())
             }
             None => {
                 let at = (provider.as_str(), model.as_str(), cfg.thinking.as_deref());
                 let paths =
                     (cfg.skills.clone(), cfg.sessions.clone(), cwd.clone(), id.clone().into());
                 let ui = tui::run(cmd_tx, ev_rx, at, &cfg.providers, mode, &notices, paths);
-                ui.await.map_err(|e| format!("error: terminal: {e}"))
+                ui.await.map(String::from).map_err(|e| format!("error: terminal: {e}"))
             }
         }
     });
+    let id = r.as_deref().unwrap_or(&id);
     if dir.join(format!("{id}.jsonl")).exists() {
         // In print mode stdout holds only the model's text.
         match print {
@@ -156,7 +158,7 @@ fn run(args: args::Args) -> Result<(), String> {
             false => println!("resume with: bit -r {id}"),
         }
     }
-    r
+    r.map(drop)
 }
 
 /// What `bit plugins guide` prints: how to write a plugin, as one working example.

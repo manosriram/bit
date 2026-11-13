@@ -65,7 +65,8 @@ const GREY: &str = "90";
 /// Bold violet for `using skill …`, so a skill in use stands out from text and dim notices.
 const SKILL: &str = "38;5;141;1";
 
-/// Runs the terminal UI until the user quits or the agent goes away.
+/// Runs the terminal UI until the user quits or the agent goes away. Returns the id of
+/// the session open at the end, which `/sessions` may have switched.
 pub async fn run(
     cmds: UnboundedSender<Command>,
     events: UnboundedReceiver<Event>,
@@ -74,7 +75,7 @@ pub async fn run(
     mode: Mode,
     notices: &[String],
     (skills_dir, sessions, cwd, session): (PathBuf, PathBuf, PathBuf, Box<str>),
-) -> io::Result<()> {
+) -> io::Result<Box<str>> {
     let mut ui = Ui {
         provider: provider.into(),
         model: model.into(),
@@ -116,7 +117,7 @@ async fn event_loop(
     mut ui: Ui,
     cmds: UnboundedSender<Command>,
     mut events: UnboundedReceiver<Event>,
-) -> io::Result<()> {
+) -> io::Result<Box<str>> {
     // Asked before the reader thread starts, which would otherwise swallow the reply.
     let (_, height) = terminal::size()?;
     let used = crossterm::cursor::position().map_or(height, |p| p.1 + 1);
@@ -164,7 +165,8 @@ async fn event_loop(
         }
         dirty = true;
     }
-    term.clear()
+    term.clear()?;
+    Ok(ui.session)
 }
 
 #[derive(Default)]
@@ -521,6 +523,12 @@ impl Ui {
             (THINKING, Some(o)) => self.set_thinking(&o, cmds),
             (SESSIONS, Some(o)) => {
                 let prefix = o.split_whitespace().next().unwrap_or(&o);
+                // Follow it, so `← current`, delete and the exit hint name the open one.
+                if let Ok(p) = agent::session::find(&self.sessions, prefix)
+                    && let Some(id) = p.file_stem().and_then(|s| s.to_str())
+                {
+                    self.session = id.into();
+                }
                 let _ = cmds.send(Command::Resume(prefix.into()));
             }
             // Picking a skill starts a message that asks for it: `/ponytail ` then the task.
@@ -830,7 +838,8 @@ impl Ui {
         };
         let arrow = matches!(code, KeyCode::Up | KeyCode::Down);
         let esc = code == KeyCode::Esc && self.input.at_word().is_some();
-        keys && !esc && !(arrow && self.input.recalling()) && !self.menu().is_empty()
+        let recalling = arrow && self.input.recalling();
+        keys && !esc && !recalling && !self.menu().is_empty()
     }
 
     /// What the input could be completing: slash commands, or files for an `@` word.
@@ -996,7 +1005,7 @@ impl Ui {
             Event::ToolEnd { ok, preview, output, .. } => {
                 if let Some((name, summary, diff)) = self.tool.take() {
                     self.tool_line(&name, &summary, ok, &preview);
-                    if &*name == "bash" || matches!(&*name, "read" | "grep" | "glob") {
+                    if matches!(&*name, "bash" | "read" | "grep" | "glob") {
                         self.tail(&output);
                     } else if ok {
                         self.diff(&diff);
@@ -1209,16 +1218,16 @@ impl Ui {
                 let (at, sgr) = self.ball();
                 l.add("", &" ".repeat(at)).add(sgr, "●").add("", &" ".repeat(5 - at));
             }
-            l.add(
-                "",
-                &match (&self.answering, &self.secret) {
-                    (Some(_), Some(p)) => p.to_string(),
-                    (Some(_), None) => " type your answer, then Enter".into(),
-                    (None, _) => format!(" {} {}s", self.verb(), e.as_secs()),
-                },
-            )
-            .add(DIM, " ");
+            let label = match (&self.answering, &self.secret) {
+                (Some(_), Some(p)) => p.to_string(),
+                (Some(_), None) => " type your answer, then Enter".into(),
+                (None, _) => format!(" {} {}s", self.verb(), e.as_secs()),
+            };
             let right = " esc cancels --+";
+            // Cut to fit, or a long key prompt would wrap the border onto a second row.
+            let room =
+                w.saturating_sub(if self.secret.is_some() { 4 } else { 10 } + 1 + right.len());
+            l.add("", clip(&label, room)).add(DIM, " ");
             l.fill(DIM, '-', w - right.len()).add(DIM, right);
         } else {
             if self.quit_armed {
@@ -1485,6 +1494,14 @@ mod tests {
         ui.question_key(KeyCode::Char('y'), &tx);
         assert!(dir.join("bbbbbbbb2.jsonl").exists(), "the current session stays");
 
+        // Resuming another session makes it the current one.
+        std::fs::write(dir.join("cccccccc3.jsonl"), "").unwrap();
+        let options = vec!["cccccccc  three".into()];
+        ui.question =
+            Some(Question { id: SESSIONS.into(), text: "".into(), options, at: 0, confirm: false });
+        ui.question_key(KeyCode::Enter, &tx);
+        assert_eq!(&*ui.session, "cccccccc3");
+
         // `/skills` lists in a picker and deletes the skill's directory.
         let skills = dir.join("skills");
         std::fs::create_dir_all(skills.join("x")).unwrap();
@@ -1661,6 +1678,11 @@ mod tests {
         assert!(!frame.iter().any(|r| r.contains("sk-secret")), "the key is never drawn");
         assert!(frame.iter().any(|r| r.contains("•••••••••")));
         assert!(frame.iter().any(|r| r.contains("-- paste your key")), "the prompt is on the box");
+        ui.secret = Some(
+            "enter your some-long-provider-name API KEY (SOME_LONG_PROVIDER_API_KEY), then Enter"
+                .into(),
+        );
+        assert!(ui.frame().0.iter().all(|r| str_width(r) <= 80), "a long prompt is cut to fit");
         assert!(!frame.iter().any(|r| r.contains('●')), "no bit animation over a key prompt");
         ui.submit(&tx);
         assert!(matches!(rx.try_recv(), Ok(Command::Answer { id, text })

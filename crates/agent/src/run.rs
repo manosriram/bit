@@ -736,25 +736,24 @@ fn resume(
     agent.session = loaded.session;
     cx.messages = loaded.messages;
     cx.tokens = 0;
-    let current_model = cx.model.clone();
-    let (provider, model) = if known {
+    if known {
         agent.provider = prov.clone();
-        (prov.as_str(), model.as_str())
-    } else {
-        (agent.provider.as_str(), current_model.as_str())
-    };
+    }
+    let (provider, using) =
+        (agent.provider.clone(), if known { model.clone() } else { cx.model.clone() });
     let p =
         agent.providers.iter().find(|p| p.name == provider).ok_or_else(|| {
             std::io::Error::other(format!("provider `{provider}` is not configured"))
         })?;
-    agent.client = connect(p, &id);
-    cx.cache_key = cache_key(provider, &id).map(Into::into);
-    cx.set_chat_only(p.chat_only.iter().any(|m| m == model));
-    cx.set_model(model);
+    (agent.client, agent.no_key) = (connect(p, &id), p.key.clone().err());
+    cx.cache_key = cache_key(&provider, &id).map(Into::into);
+    cx.set_chat_only(p.chat_only.contains(&using));
+    cx.set_model(&using);
     set_thinking(agent, cx);
     resumed(agent, cx, events);
-    if !known && !(prov.is_empty() && model.is_empty()) {
-        let n = format!("session used {prov}/{model}; continuing with {provider}/{model}");
+    // Only a session that named a model it can't go back to is worth a word.
+    if !known && !model.is_empty() {
+        let n = format!("session used {prov}/{model}; continuing with {provider}/{using}");
         let _ = events.send(Event::Notice(n.into()));
     }
     Ok(())
@@ -1437,6 +1436,36 @@ mod tests {
             }
         }
         assert_eq!(ends, [NOT_ALLOWED.into(), NO_USER.into()]);
+    }
+
+    #[test]
+    fn resume_takes_the_sessions_provider_and_its_key_or_says_why_not() {
+        let mut agent = agent("127.0.0.1:1".parse().unwrap(), "resume-provider");
+        let prov = |name: &str, key: Result<String, String>| Provider {
+            name: name.into(),
+            base_url: String::new(),
+            key_env: String::new(),
+            key,
+            models: Vec::new(),
+            chat_only: Vec::new(),
+        };
+        agent.providers = vec![prov("p", Err("error: no p key".into())), prov("q", Ok("k".into()))];
+        agent.no_key = Some("error: no p key".into());
+        let dir = agent.session.path().parent().unwrap().to_owned();
+        for (id, p, m) in [("aa1", "q", "mq"), ("bb2", "gone", "old")] {
+            let mut s = Session::new(&dir, id, Path::new("/w"), p, m);
+            s.append(&[msg("user", "hi")]).unwrap();
+        }
+        let mut cx = Context::new("m", None, Vec::new());
+        let (tx, mut ev) = unbounded_channel();
+        resume(&mut agent, &mut cx, "aa", &tx).unwrap();
+        assert_eq!((agent.provider.as_str(), cx.model.as_str()), ("q", "mq"));
+        assert!(agent.no_key.is_none(), "q has a key");
+        while ev.try_recv().is_ok() {}
+        resume(&mut agent, &mut cx, "bb", &tx).unwrap();
+        let notices: Vec<_> = std::iter::from_fn(|| ev.try_recv().ok()).collect();
+        let n = Event::Notice("session used gone/old; continuing with q/mq".into());
+        assert!(notices.contains(&n), "{notices:?}");
     }
 
     #[tokio::test]

@@ -71,14 +71,23 @@ async fn rg(mut args: Vec<&str>, path: Option<&str>, cx: &Ctx) -> Result<String,
     let _ = tokio::join!(out.read(stdout), e.read_to_end(&mut stderr));
     let status =
         child.wait().await.map_err(|e| err(format_args!("waiting for rg: {e}"), "try again"))?;
+    let stderr = String::from_utf8_lossy(&stderr);
+    let stderr = stderr.trim().trim_start_matches("rg: ");
+    let out = out.finish();
     match status.code() {
-        Some(0) => Ok(out.finish()),
+        Some(0) => Ok(out),
         Some(1) => Ok("no matches".into()),
-        _ => Err(err(
-            String::from_utf8_lossy(&stderr).trim().trim_start_matches("rg: "),
-            "check the pattern and the path",
-        )),
+        // rg exits 2 when any path failed, even with matches: keep them, say what failed.
+        Some(2) if !out.is_empty() => {
+            Ok(format!("{out}[some paths could not be searched: {}]", clip(stderr)))
+        }
+        _ => Err(err(stderr, "check the pattern and the path")),
     }
+}
+
+/// The first line of rg's errors, so one unreadable tree doesn't flood the context.
+fn clip(stderr: &str) -> &str {
+    stderr.lines().next().unwrap_or("")
 }
 
 #[cfg(test)]
@@ -113,5 +122,19 @@ mod tests {
         assert_eq!(o.content, "src/a.rs\n");
         let o = exec("glob", r#"{"pattern":"*","path":"src"}"#, &cx).await;
         assert_eq!(o.content, "src/a.rs\nsrc/b.txt\n");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_dir_keeps_the_other_matches() {
+        use std::os::unix::fs::PermissionsExt;
+        let cx = test_ctx("search-locked");
+        std::fs::write(cx.cwd.join("a.txt"), "needle\n").unwrap();
+        let locked = cx.cwd.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let o = exec("grep", r#"{"pattern":"needle"}"#, &cx).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(o.ok && o.content.starts_with("a.txt:1:needle\n"), "{}", o.content);
+        assert!(o.content.contains("[some paths could not be searched: "));
     }
 }

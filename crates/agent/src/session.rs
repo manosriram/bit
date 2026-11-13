@@ -174,7 +174,10 @@ pub fn latest(dir: &Path, cwd: &Path) -> io::Result<Option<PathBuf>> {
         }
         let mut first = String::new();
         let Ok(f) = File::open(&path) else { continue };
-        BufReader::new(f).read_line(&mut first)?;
+        // Not a session (`.DS_Store`, say): skip it rather than fail the lookup.
+        if BufReader::new(f).read_line(&mut first).is_err() {
+            continue;
+        }
         let r: Option<Record> = serde_json::from_str(&first).ok();
         if r.is_some_and(|r| r.t == "header" && r.cwd.as_deref() == Some(cwd)) {
             found = Some((time, path));
@@ -199,20 +202,23 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
     #[derive(Deserialize)]
     struct Msg<'a> {
         role: &'a str,
-        content: &'a str,
+        // Owned: a borrowed `&str` fails on any escape, like a newline.
+        content: String,
     }
 
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir)?.flatten() {
         let path = e.path();
-        if !path.extension().is_some_and(|e| e == "jsonl") {
+        if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
         let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
             continue;
         };
-        let mut lines = BufReader::new(File::open(&path)?).lines();
-        let Some(line) = lines.next().transpose()? else { continue };
+        let Ok(f) = File::open(&path) else { continue };
+        // A torn or unreadable line ends the scan; the header and preview so far still count.
+        let mut lines = BufReader::new(f).lines().map_while(Result::ok);
+        let Some(line) = lines.next() else { continue };
         let Some(r) = serde_json::from_str::<Record>(&line).ok().filter(|r| r.t == "header") else {
             continue;
         };
@@ -220,8 +226,10 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
         let (provider, model) = (r.provider.unwrap_or_default(), r.model.unwrap_or_default());
         let mut preview = String::new();
         for line in lines {
-            let line = line?;
-            if let Ok(m) = serde_json::from_str::<Msg>(&line)
+            // Messages are logged as `{"t":"msg","msg":{...}}`.
+            let r = serde_json::from_str::<Record>(&line).ok();
+            if let Some(m) =
+                r.and_then(|r| r.msg).and_then(|m| serde_json::from_str::<Msg>(m.get()).ok())
                 && m.role == "user"
             {
                 preview = m.content.chars().take(60).collect();
@@ -296,6 +304,18 @@ mod tests {
         assert_eq!(latest(&dir, Path::new("/w")).unwrap(), Some(dir.join("abc123.jsonl")));
         assert_eq!(latest(&dir, Path::new("/other")).unwrap(), None);
         assert!(find(&dir, "zz").is_err());
+    }
+
+    #[test]
+    fn list_previews_the_first_user_message_and_skips_strays() {
+        let dir = std::env::temp_dir().join(format!("bit-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::new(&dir, "abc", Path::new("/w"), "p", "m");
+        s.append(&[crate::context::msg("user", "fix \"the\"\nbug")]).unwrap();
+        std::fs::write(dir.join(".DS_Store"), b"\xff\xfe junk").unwrap();
+        let e = list(&dir).unwrap();
+        assert_eq!((e.len(), e[0].preview.as_str()), (1, "fix \"the\"\nbug"));
+        assert_eq!(latest(&dir, Path::new("/w")).unwrap(), Some(dir.join("abc.jsonl")));
     }
 
     #[test]
