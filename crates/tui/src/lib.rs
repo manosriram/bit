@@ -1113,21 +1113,15 @@ impl Ui {
         ["|", "/", "-", "\\"][self.tick() % 4]
     }
 
-    /// A byte of binary rain that, every 2.4 s, settles bit by bit into the next letter of
-    /// "bit" (`BITS`), holds it, then scatters again. Pseudo-random from the tick, no rng.
-    fn rain(&self) -> String {
+    /// Where the busy ball is on its 6-cell track, bouncing one cell per tick, and its
+    /// pastel colour, which changes every tick.
+    fn ball(&self) -> (usize, &'static str) {
+        // Pastels from the 256-colour palette: pink, peach, butter, mint, sky, lavender.
+        const COLORS: [&str; 6] =
+            ["38;5;218", "38;5;223", "38;5;229", "38;5;158", "38;5;153", "38;5;183"];
         let t = self.tick();
-        let (phase, byte) = (t % 24, &BITS[t / 24 % 3 * 8..][..8]);
-        byte.chars()
-            .enumerate()
-            .map(|(i, settled)| {
-                if phase >= 10 + i {
-                    return settled;
-                }
-                let x = ((t as u64) << 3 | i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                if x >> 63 == 0 { '0' } else { '1' }
-            })
-            .collect()
+        let at = t % 10;
+        (if at < 6 { at } else { 10 - at }, COLORS[t % COLORS.len()])
     }
 
     /// What the turn is doing right now, from the running tool or the reasoning.
@@ -1209,25 +1203,21 @@ impl Ui {
         l.add(DIM, "+");
         if let Some(t) = self.busy {
             let e = t.elapsed();
-            l.add(DIM, "-- ")
-                // No animation over a key prompt: nothing is running while it's typed.
-                .add(
-                    AMBER,
-                    &if self.secret.is_some() {
-                        String::new()
-                    } else {
-                        format!("[{}]", self.rain())
-                    },
-                )
-                .add(
-                    "",
-                    &match (&self.answering, &self.secret) {
-                        (Some(_), Some(p)) => p.to_string(),
-                        (Some(_), None) => " type your answer, then Enter".into(),
-                        (None, _) => format!(" {} {:.1}s", self.verb(), e.as_secs_f32()),
-                    },
-                )
-                .add(DIM, " ");
+            l.add(DIM, "-- ");
+            // No animation over a key prompt: nothing is running while it's typed.
+            if self.secret.is_none() {
+                let (at, sgr) = self.ball();
+                l.add("", &" ".repeat(at)).add(sgr, "●").add("", &" ".repeat(5 - at));
+            }
+            l.add(
+                "",
+                &match (&self.answering, &self.secret) {
+                    (Some(_), Some(p)) => p.to_string(),
+                    (Some(_), None) => " type your answer, then Enter".into(),
+                    (None, _) => format!(" {} {}s", self.verb(), e.as_secs()),
+                },
+            )
+            .add(DIM, " ");
             let right = " esc cancels --+";
             l.fill(DIM, '-', w - right.len()).add(DIM, right);
         } else {
@@ -1641,9 +1631,8 @@ mod tests {
     }
 
     #[test]
-    fn the_border_rains_and_names_the_tool() {
+    fn the_border_bounces_a_ball_and_names_the_tool() {
         let mut ui = Ui { cols: 80, busy: Some(Instant::now()), ..Ui::default() };
-        assert_eq!(ui.rain().len(), 8);
         assert_eq!(ui.verb(), "working");
         ui.event(Event::Thinking("hm".into()));
         assert_eq!(ui.verb(), "thinking");
@@ -1655,11 +1644,11 @@ mod tests {
         });
         let (frame, ..) = ui.frame();
         assert!(frame.iter().any(|r| r.contains("grepping")));
+        assert_eq!(ui.ball().0, 0);
         ui.busy = Some(Instant::now() - Duration::from_millis(700));
-        ui.busy = Some(Instant::now() - Duration::from_millis(2000));
-        assert_eq!(ui.rain(), "01100010", "settles into b");
-        ui.busy = Some(Instant::now() - Duration::from_millis(4400));
-        assert_eq!(ui.rain(), "01101001", "then i");
+        let (frame, ..) = ui.frame();
+        assert!(frame.iter().any(|r| r.contains("--    ●   grepping")), "turns back at the end");
+        assert_ne!(ui.ball().1, "38;5;218", "and changes colour");
     }
 
     #[test]
@@ -1672,10 +1661,7 @@ mod tests {
         assert!(!frame.iter().any(|r| r.contains("sk-secret")), "the key is never drawn");
         assert!(frame.iter().any(|r| r.contains("•••••••••")));
         assert!(frame.iter().any(|r| r.contains("-- paste your key")), "the prompt is on the box");
-        assert!(
-            !frame.iter().any(|r| r.contains(&ui.rain())),
-            "no bit animation over a key prompt"
-        );
+        assert!(!frame.iter().any(|r| r.contains('●')), "no bit animation over a key prompt");
         ui.submit(&tx);
         assert!(matches!(rx.try_recv(), Ok(Command::Answer { id, text })
             if &*id == "key" && text == "sk-secret"));
