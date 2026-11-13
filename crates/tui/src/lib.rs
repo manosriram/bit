@@ -55,7 +55,7 @@ const LOGO: [&str; 7] = [
     ".XXX..X..XX.",
     "............",
 ];
-/// "bit" in binary: the digits behind the logo, two per pixel, and the working animation.
+/// "bit" in binary: the digits behind the logo, two per pixel.
 const BITS: &str = "011000100110100101110100";
 /// The accent, for the logo, the spinner, approvals and warnings: the brand amber,
 /// #F2B544, as the nearest xterm-256 colour, so terminals without true colour show it too.
@@ -1113,9 +1113,36 @@ impl Ui {
         ["|", "/", "-", "\\"][self.tick() % 4]
     }
 
-    /// An 8-bit window scrolling through "bit" in binary, one bit per tick.
-    fn bits(&self) -> String {
-        BITS.chars().cycle().skip(self.tick() % BITS.len()).take(8).collect()
+    /// A byte of binary rain that, every 2.4 s, settles bit by bit into the next letter of
+    /// "bit" (`BITS`), holds it, then scatters again. Pseudo-random from the tick, no rng.
+    fn rain(&self) -> String {
+        let t = self.tick();
+        let (phase, byte) = (t % 24, &BITS[t / 24 % 3 * 8..][..8]);
+        byte.chars()
+            .enumerate()
+            .map(|(i, settled)| {
+                if phase >= 10 + i {
+                    return settled;
+                }
+                let x = ((t as u64) << 3 | i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                if x >> 63 == 0 { '0' } else { '1' }
+            })
+            .collect()
+    }
+
+    /// What the turn is doing right now, from the running tool or the reasoning.
+    fn verb(&self) -> &'static str {
+        match self.tool.as_ref().map(|(n, ..)| &**n) {
+            Some("read") => "reading",
+            Some("grep") => "grepping",
+            Some("glob") => "globbing",
+            Some("edit") => "editing",
+            Some("write") => "writing",
+            Some("bash") => "running",
+            Some(_) => "working",
+            None if self.thought.is_some() => "thinking",
+            None => "working",
+        }
     }
 
     /// 100 ms steps since the turn started.
@@ -1184,13 +1211,20 @@ impl Ui {
             let e = t.elapsed();
             l.add(DIM, "-- ")
                 // No animation over a key prompt: nothing is running while it's typed.
-                .add(AMBER, &if self.secret.is_some() { String::new() } else { self.bits() })
+                .add(
+                    AMBER,
+                    &if self.secret.is_some() {
+                        String::new()
+                    } else {
+                        format!("[{}]", self.rain())
+                    },
+                )
                 .add(
                     "",
                     &match (&self.answering, &self.secret) {
                         (Some(_), Some(p)) => p.to_string(),
                         (Some(_), None) => " type your answer, then Enter".into(),
-                        (None, _) => format!(" working {:.1}s", e.as_secs_f32()),
+                        (None, _) => format!(" {} {:.1}s", self.verb(), e.as_secs_f32()),
                     },
                 )
                 .add(DIM, " ");
@@ -1607,6 +1641,28 @@ mod tests {
     }
 
     #[test]
+    fn the_border_rains_and_names_the_tool() {
+        let mut ui = Ui { cols: 80, busy: Some(Instant::now()), ..Ui::default() };
+        assert_eq!(ui.rain().len(), 8);
+        assert_eq!(ui.verb(), "working");
+        ui.event(Event::Thinking("hm".into()));
+        assert_eq!(ui.verb(), "thinking");
+        ui.event(Event::ToolStart {
+            id: "t".into(),
+            name: "grep".into(),
+            summary: "config".into(),
+            diff: "".into(),
+        });
+        let (frame, ..) = ui.frame();
+        assert!(frame.iter().any(|r| r.contains("grepping")));
+        ui.busy = Some(Instant::now() - Duration::from_millis(700));
+        ui.busy = Some(Instant::now() - Duration::from_millis(2000));
+        assert_eq!(ui.rain(), "01100010", "settles into b");
+        ui.busy = Some(Instant::now() - Duration::from_millis(4400));
+        assert_eq!(ui.rain(), "01101001", "then i");
+    }
+
+    #[test]
     fn a_pasted_key_is_hidden_and_never_kept() {
         let mut ui = Ui { cols: 80, busy: Some(Instant::now()), ..Ui::default() };
         let (tx, mut rx) = unbounded_channel();
@@ -1617,7 +1673,7 @@ mod tests {
         assert!(frame.iter().any(|r| r.contains("•••••••••")));
         assert!(frame.iter().any(|r| r.contains("-- paste your key")), "the prompt is on the box");
         assert!(
-            !frame.iter().any(|r| r.contains(&ui.bits())),
+            !frame.iter().any(|r| r.contains(&ui.rain())),
             "no bit animation over a key prompt"
         );
         ui.submit(&tx);
