@@ -56,6 +56,8 @@ struct Provider {
     api_key_env: Option<String>,
     #[serde(default)]
     models: Vec<String>,
+    /// The context window of its models, in tokens: when to compact.
+    context: Option<u32>,
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -95,6 +97,7 @@ pub fn load() -> Result<Config, String> {
                 format!("error: [providers.{name}] needs {what}. hint: add it in {at}")
             })
         };
+        let context = conf.as_ref().and_then(|c| c.context);
         let (c_url, c_env, c_models) =
             conf.map_or((None, None, Vec::new()), |c| (c.base_url, c.api_key_env, c.models));
         let base_url = pick(c_url, builtin.map(|s| s.base_url), "base_url")?;
@@ -120,7 +123,15 @@ pub fn load() -> Result<Config, String> {
             }
             models.extend(local.into_iter().filter(|m| !models.contains(m)).collect::<Vec<_>>());
         }
-        providers.push(agent::Provider { name, base_url, key_env, key, models, chat_only });
+        providers.push(agent::Provider {
+            name,
+            base_url,
+            key_env,
+            key,
+            models,
+            chat_only,
+            context,
+        });
     }
     providers.sort_by_key(|p| p.key.is_err());
 
@@ -182,6 +193,14 @@ fn block_on<T>(f: impl std::future::Future<Output = T>) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use agent::providers::auth::Cred;
+
+    #[test]
+    fn a_provider_takes_a_context_window_without_a_warning() {
+        let f: super::File = toml::from_str("[providers.ollama]\ncontext = 32768\n").unwrap();
+        let p = &f.providers["ollama"];
+        assert_eq!((p.context, p.unknown.len()), (Some(32768), 0));
+        assert!(toml::from_str::<super::File>("[providers.x]\ncontext = \"big\"\n").is_err());
+    }
 
     #[test]
     fn the_environment_wins_over_a_saved_key() {

@@ -1429,6 +1429,7 @@ mod tests {
             key: Err("error: not signed in".into()),
             models: vec!["m".into()],
             chat_only: Vec::new(),
+            context: None,
         };
         let mut ui = Ui { providers: vec![p], cols: 80, ..Ui::default() };
         let (tx, mut rx) = unbounded_channel();

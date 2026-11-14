@@ -68,6 +68,9 @@ bit skills update [<name>] pull the latest skill(s)
 In `-p` mode nobody can approve, so write, edit and bash are declined unless `--mode auto`
 or `[bash] allow` permits them.
 
+In ask mode `read`, `grep` and `glob` run without asking inside the working directory, and
+ask first for a path outside it.
+
 Keys: `Enter` send, `Esc` cancel the turn, `Ctrl-C` twice quit, `Tab` toggle
 ask/auto (the switch at the left of the status line, amber in auto), `Shift-Tab` next
 thinking level, `Up`/`Down` earlier prompts, `Option-Left`/`Right` move by word,
@@ -132,6 +135,7 @@ provider = "opencode-go"
 base_url = "http://localhost:8080/v1"
 api_key_env = "LOCAL_API_KEY"
 models = ["qwen3-coder"]          # what /model offers for it
+context = 32768                   # its context window in tokens (default 128000)
 
 [providers.openai]                # extra models for a built-in provider
 models = ["gpt-5.1"]
@@ -144,6 +148,8 @@ allow = ["cargo test", "git status"]   # run without asking
 
 `read`, `write`, `edit`, `bash`, `grep`, `glob`, plus any a plugin adds. Long output is
 cut to its head and tail, and the full text is saved to a file the model can page through.
+`bash` commands run without the providers' API key variables (`OPENAI_API_KEY`, ...) that
+are set, so a command can't print or send them.
 
 ## Plugins
 

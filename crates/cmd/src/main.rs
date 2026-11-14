@@ -108,6 +108,12 @@ fn run(args: args::Args) -> Result<(), String> {
     cx.set_chat_only(p.chat_only.contains(&model));
     let (client, no_key) = (agent::connect(p, &id), p.key.clone().err());
     let mode = if args.auto { agent::proto::Mode::Auto } else { agent::proto::Mode::Ask };
+    let spill = std::env::temp_dir().join(format!("bit-{}", std::process::id()));
+    let mut policy = agent::Policy::new(cfg.allow, plugins.tools());
+    policy.roots = vec![cwd.clone(), spill.clone(), cfg.skills.clone(), cfg.plugins.clone()];
+    // A key that is set is one a command could print or send away.
+    let keys = cfg.providers.iter().map(|p| p.key_env.clone());
+    let scrub = keys.filter(|k| std::env::var_os(k).is_some()).collect();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -121,11 +127,8 @@ fn run(args: args::Args) -> Result<(), String> {
             providers: cfg.providers.clone(),
             provider: provider.clone(),
             no_key,
-            tools: agent::ToolCtx {
-                cwd: cwd.clone(),
-                spill: std::env::temp_dir().join(format!("bit-{}", std::process::id())),
-            },
-            policy: agent::Policy::new(cfg.allow, plugins.tools()),
+            tools: agent::ToolCtx { cwd: cwd.clone(), spill, scrub },
+            policy,
             mode,
             session,
             remember: Some(cfg.remember),

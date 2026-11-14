@@ -155,10 +155,31 @@ impl Context {
         format!("{},{}]}}", &body[..body.len() - 2], ask.get())
     }
 
-    /// Whether the last request used more than 70% of the model's context window.
-    pub(crate) fn full(&self) -> bool {
-        let window = llm::models::context(&self.model).unwrap_or(128_000);
+    /// Whether the last request used more than 70% of the model's context `window`.
+    pub(crate) fn full(&self, window: u32) -> bool {
         u64::from(self.tokens) * 10 > u64::from(window) * 7
+    }
+
+    /// Cuts every long tool result down to its head, for a history the provider refused as
+    /// too long. False when there was nothing left to cut.
+    // shortcut: cuts every long result, and the session log keeps the full ones until the
+    // next compaction; cut only the oldest that are needed once bit counts tokens per message.
+    pub(crate) fn clip(&mut self) -> bool {
+        const KEEP: usize = 2000;
+        const NOTE: &str =
+            "\n[... cut to fit the context window. hint: run the call again for a narrower slice]";
+        let mut cut = false;
+        for m in self.messages.iter_mut().filter(|m| m.get().len() > KEEP + NOTE.len()) {
+            let v: serde_json::Value = serde_json::from_str(m.get()).unwrap_or_default();
+            let content = v["content"].as_str().unwrap_or("");
+            if v["role"] != "tool" || content.len() <= KEEP + NOTE.len() {
+                continue;
+            }
+            let head = &content[..content.floor_char_boundary(KEEP)];
+            *m = tool_msg(v["tool_call_id"].as_str().unwrap_or(""), &format!("{head}{NOTE}"));
+            cut = true;
+        }
+        cut
     }
 }
 
@@ -187,6 +208,28 @@ pub(crate) fn tool_msg(id: &str, content: &str) -> Box<RawValue> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clip_cuts_long_tool_results_once_and_nothing_else() {
+        let long = "é".repeat(3000);
+        let msgs = vec![
+            super::msg("user", &long),
+            super::tool_msg("c1", &long),
+            super::tool_msg("c2", "ok"),
+        ];
+        let mut cx = super::Context::new("m", None, msgs);
+        assert!(cx.clip());
+        assert_eq!(cx.messages[0].get(), super::msg("user", &long).get());
+        assert_eq!(cx.messages[2].get(), super::tool_msg("c2", "ok").get());
+        let cut = cx.messages[1].get();
+        assert!(
+            cut.len() < 2400
+                && cut.contains("cut to fit")
+                && cut.contains(r#""tool_call_id":"c1""#),
+            "{cut}"
+        );
+        assert!(!cx.clip());
+    }
+
     #[test]
     fn a_chat_only_model_gets_no_tools() {
         let mut cx = super::Context::new("m", None, Vec::new());
