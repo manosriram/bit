@@ -24,6 +24,8 @@ pub struct Provider {
     pub models: Vec<String>,
     /// Those of `models` that can't call tools: they get none.
     pub chat_only: Vec<String>,
+    /// The context window of its models, in tokens, when the config sets one.
+    pub context: Option<u32>,
 }
 
 /// The client for `p`, as its spec says. A provider from the config speaks Chat Completions
@@ -291,10 +293,17 @@ impl Turn<'_> {
             return Err(StopReason::Error(e.as_str().into()));
         }
         loop {
-            if cx.full() {
+            if cx.full(self.window(&cx.model)) {
                 self.compact(cx).await;
             }
-            let c = self.request(cx).await.map_err(|e| StopReason::Error(e.to_string().into()))?;
+            let c = match self.request(cx).await {
+                Err(e) if e.too_long() && cx.clip() => {
+                    self.send(Event::Notice(TOO_LONG.into()));
+                    self.request(cx).await
+                }
+                r => r,
+            };
+            let c = c.map_err(|e| StopReason::Error(e.to_string().into()))?;
             cx.tokens = c.usage.input;
             if let Err(e) = self.a.session.usage(&c.usage) {
                 self.send(save_failed(&e));
@@ -455,6 +464,14 @@ impl Turn<'_> {
         tools::Output { ok: true, content }
     }
 
+    /// The context window of `model`: the config's for this provider, else the built-in
+    /// table's, else a guess.
+    fn window(&self, model: &str) -> u32 {
+        let p = self.a.providers.iter().find(|p| p.name == self.a.provider);
+        let set = p.and_then(|p| p.context);
+        set.or_else(|| llm::models::context(model)).unwrap_or(128_000)
+    }
+
     fn fields(&self) -> Fields {
         let mode = if self.auto.load(Relaxed) { "auto" } else { "ask" };
         Fields { cwd: self.a.tools.cwd.clone(), mode, headless: self.a.print }
@@ -558,8 +575,12 @@ impl Turn<'_> {
         };
         let latest = text(&cx.messages[last]);
         let latest = latest.split_once(LATEST).map_or(latest.as_str(), |(_, l)| l).to_owned();
-        let body = cx.summary_body(&msg("user", SUMMARIZE));
-        let c = match self.a.client.stream(body, |_| {}).await {
+        let ask = msg("user", SUMMARIZE);
+        let mut r = self.a.client.stream(cx.summary_body(&ask), |_| {}).await;
+        if r.as_ref().is_err_and(llm::Error::too_long) && cx.clip() {
+            r = self.a.client.stream(cx.summary_body(&ask), |_| {}).await;
+        }
+        let c = match r {
             Ok(c) if !text(&c.message).trim().is_empty() => c,
             r => {
                 let e = r.map_or_else(|e| e.to_string(), |_| "the model sent no summary".into());
@@ -583,9 +604,10 @@ impl Turn<'_> {
         self.send(Event::Notice(format!("compacted {n} messages ({k:.1}k tokens)").into()));
     }
 
-    /// One model request, retried after 1s and 3s while nothing from it has reached the screen.
+    /// One model request, retried while nothing from it has reached the screen: after 1s, 3s,
+    /// 10s and 30s, or after the wait the server asked for, up to a minute.
     async fn request(&self, cx: &Context) -> Result<llm::Completion, llm::Error> {
-        let mut waits = [1, 3].into_iter();
+        let mut waits = [1, 3, 10, 30].into_iter();
         loop {
             let mut shown = false;
             let on_part = |p: llm::Part| {
@@ -597,6 +619,7 @@ impl Turn<'_> {
             };
             match (self.a.client.stream(cx.body(), on_part).await, waits.next()) {
                 (Err(e), Some(wait)) if !shown && e.retryable() => {
+                    let wait = e.retry_after().map_or(wait, |s| s.clamp(1, 60));
                     self.send(Event::Notice(format!("{e}; retrying in {wait}s").into()));
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
@@ -678,6 +701,8 @@ const SUMMARIZE: &str = "Summarize this conversation so that you can continue th
 const SUMMARY: &str = "[The conversation so far was compacted. Summary:]";
 const LATEST: &str = "\n\n[The user's latest message, verbatim:]\n\n";
 
+const TOO_LONG: &str =
+    "the history is longer than the model's context window; cut the long tool results and retrying";
 const DECLINED: &str = "error: the user declined this call. hint: ask them what to do instead";
 const NOT_ALLOWED: &str = "error: bit -p runs without a user, so this call needs --mode auto or a [bash] allow entry. hint: do without it, or tell the user how to allow it";
 const PLUGIN_ASK: &str = "plugin-ask";
@@ -903,7 +928,7 @@ mod tests {
             client: llm::Client::new(&format!("http://{addr}"), "k", Vec::new(), llm::Api::Chat),
             providers: Vec::new(),
             provider: "p".into(),
-            tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir.clone() },
+            tools: tools::Ctx { spill: dir.join(".spill"), cwd: dir.clone(), scrub: Vec::new() },
             policy: Policy::new(Vec::new(), Vec::new()),
             mode: Mode::Ask,
             session,
@@ -1322,6 +1347,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_history_that_is_too_long_is_cut_and_sent_again() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "too-long");
+        std::fs::write(agent.tools.cwd.join("big.txt"), "line\n".repeat(2000)).unwrap();
+        let body = r#"{"error":{"message":"This model's maximum context length is 10 tokens"}}"#;
+        let error = format!(
+            "HTTP/1.1 400 Bad Request\r\nretry-after: 9\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let replies = vec![call("r1", "read", r#"{"path":"big.txt"}"#), error, sse(&["ok"], true)];
+        let cx = Context::new("m", None, Vec::new());
+        let (cmds, mut ev, mut bodies) = start(agent, cx, l, replies).await;
+        cmds.send(Command::Submit("hi".into())).unwrap();
+        turn_end(&mut ev).await;
+        let (_, full, cut) =
+            (bodies.recv().await, bodies.recv().await.unwrap(), bodies.recv().await.unwrap());
+        assert!(full.len() > 20_000 && !full.contains("cut to fit"));
+        assert!(
+            cut.len() < full.len() / 2 && cut.contains("cut to fit the context window"),
+            "{cut}"
+        );
+    }
+
+    #[tokio::test]
+    async fn waits_as_long_as_the_server_asks_up_to_a_minute() {
+        for (asked, waits) in [("40", 40), ("999", 60), ("soon", 1)] {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let agent = agent(l.local_addr().unwrap(), "retry-after");
+            let busy = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: {asked}\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy"
+            );
+            let cx = Context::new("m", None, Vec::new());
+            let (cmds, mut ev, _bodies) = start(agent, cx, l, vec![busy]).await;
+            cmds.send(Command::Submit("hi".into())).unwrap();
+            let retry = Event::Notice(format!("status 429: busy; retrying in {waits}s").into());
+            assert_eq!(next(&mut ev).await, retry);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_configs_context_window_decides_when_to_compact() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = agent(l.local_addr().unwrap(), "window");
+        // `sse` reports 10 input tokens: past 70% of a 12-token window, far from the default.
+        agent.providers = vec![Provider {
+            name: "p".into(),
+            base_url: String::new(),
+            key_env: String::new(),
+            key: Ok("k".into()),
+            models: Vec::new(),
+            chat_only: Vec::new(),
+            context: Some(12),
+        }];
+        let replies = vec![sse(&["A"], true), sse(&["SUM"], true), sse(&["B"], true)];
+        let cx = Context::new("m", None, Vec::new());
+        let (cmds, mut ev, _bodies) = start(agent, cx, l, replies).await;
+        cmds.send(Command::Submit("one".into())).unwrap();
+        turn_end(&mut ev).await;
+        cmds.send(Command::Submit("two".into())).unwrap();
+        let Event::Notice(n) = next(&mut ev).await else { panic!("expected a notice") };
+        assert!(n.starts_with("compacted 3 messages"), "{n}");
+        assert_eq!(next(&mut ev).await, Event::Text("B".into()));
+    }
+
+    #[tokio::test]
+    async fn compact_cuts_a_history_that_is_too_long_to_summarize() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent = agent(l.local_addr().unwrap(), "compact-too-long");
+        let calls = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]}"#;
+        let history = vec![
+            msg("user", "go"),
+            RawValue::from_string(calls.into()).unwrap(),
+            tool_msg("c1", &"x".repeat(50_000)),
+        ];
+        let body = "prompt is too long: 9 tokens > 5 maximum";
+        let error = format!(
+            "HTTP/1.1 413 Payload Too Large\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let cx = Context::new("m", None, history);
+        let (cmds, mut ev, mut bodies) =
+            start(agent, cx, l, vec![error, sse(&["SUM"], true)]).await;
+        cmds.send(Command::Compact).unwrap();
+        loop {
+            match next(&mut ev).await {
+                Event::Notice(n) if n.starts_with("compacted 3 messages") => break,
+                Event::Notice(n) if n.starts_with("error") => panic!("{n}"),
+                _ => {}
+            }
+        }
+        let (full, cut) = (bodies.recv().await.unwrap(), bodies.recv().await.unwrap());
+        assert!(full.len() > 50_000 && cut.len() < 10_000, "{} {}", full.len(), cut.len());
+        assert!(cut.contains("cut to fit the context window") && cut.contains("call tools."));
+    }
+
+    #[tokio::test]
     async fn set_model_switches_provider_and_model() {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -1337,6 +1458,7 @@ mod tests {
             key: Ok("k".into()),
             models: Vec::new(),
             chat_only: Vec::new(),
+            context: None,
         }];
         let cx = Context::new("", None, Vec::new());
         let (cmds, mut ev, mut bodies) = start(agent, cx, l, vec![sse(&["a"], true)]).await;
@@ -1448,6 +1570,7 @@ mod tests {
             key,
             models: Vec::new(),
             chat_only: Vec::new(),
+            context: None,
         };
         agent.providers = vec![prov("p", Err("error: no p key".into())), prov("q", Ok("k".into()))];
         agent.no_key = Some("error: no p key".into());
@@ -1493,6 +1616,7 @@ mod tests {
             key: Err("error: not set".into()),
             models: Vec::new(),
             chat_only: Vec::new(),
+            context: None,
         }];
         let (cmds, mut ev, mut bodies) =
             start(agent, Context::new("m", None, vec![]), l, vec![]).await;

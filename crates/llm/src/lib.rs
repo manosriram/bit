@@ -63,7 +63,8 @@ pub struct Usage {
 #[derive(Debug)]
 pub enum Error {
     Http(reqwest::Error),
-    Status(u16, Box<str>),
+    /// The status, the body, and the seconds `Retry-After` asked for, if any.
+    Status(u16, Box<str>, Option<u64>),
     Api(Box<str>),
     Json(serde_json::Error),
     /// The stream ended before its end marker.
@@ -113,7 +114,9 @@ impl Client {
         let mut res = req.body(body).send().await?;
         if !res.status().is_success() {
             let status = res.status().as_u16();
-            return Err(Error::Status(status, res.text().await.unwrap_or_default().into()));
+            let after = res.headers().get("retry-after");
+            let after = after.and_then(|v| v.to_str().ok()?.trim().parse().ok());
+            return Err(Error::Status(status, res.text().await.unwrap_or_default().into(), after));
         }
         let mut acc = Acc::new(on_part, self.api);
         while let Some(chunk) = res.chunk().await? {
@@ -276,7 +279,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Error::Http(e) => write!(f, "http: {e}"),
-            Error::Status(code, body) => write!(f, "status {code}: {body}"),
+            Error::Status(code, body, _) => write!(f, "status {code}: {body}"),
             Error::Api(e) => write!(f, "api: {e}"),
             Error::Json(e) => write!(f, "bad response: {e}"),
             Error::Disconnected => f.write_str("stream ended early"),
@@ -287,7 +290,24 @@ impl fmt::Display for Error {
 impl Error {
     /// Rate limits, server errors and dropped connections often pass; anything else won't.
     pub fn retryable(&self) -> bool {
-        matches!(self, Error::Status(429 | 500..=599, _) | Error::Http(_) | Error::Disconnected)
+        matches!(self, Error::Status(429 | 500..=599, ..) | Error::Http(_) | Error::Disconnected)
+    }
+
+    /// The seconds the server asked to wait before a retry, if it said.
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Error::Status(_, _, after) => *after,
+            _ => None,
+        }
+    }
+
+    /// Whether the provider refused the request as longer than the model's context window.
+    pub fn too_long(&self) -> bool {
+        let (Error::Status(400 | 413, b, _) | Error::Api(b)) = self else { return false };
+        let b = b.to_ascii_lowercase();
+        ["context length", "context_length", "context window", "too long", "too many tokens"]
+            .iter()
+            .any(|p| b.contains(p))
     }
 }
 
@@ -306,6 +326,17 @@ impl From<serde_json::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tells_a_context_overflow_from_other_refusals() {
+        let status = |code, body: &str| Error::Status(code, body.into(), None);
+        assert!(status(400, "This model's maximum context length is 128000 tokens").too_long());
+        assert!(status(400, "prompt is too long: 250000 tokens > 200000 maximum").too_long());
+        assert!(Error::Api(r#"{"code":"context_length_exceeded"}"#.into()).too_long());
+        assert!(!status(400, "invalid tool schema").too_long());
+        assert!(!status(500, "context length").too_long());
+        assert_eq!(Error::Status(429, "".into(), Some(7)).retry_after(), Some(7));
+    }
 
     type Out = Result<(String, Box<str>, Usage), String>;
 

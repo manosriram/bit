@@ -12,7 +12,11 @@ pub struct Args {
 
 pub async fn run(a: Args, cx: &Ctx) -> Result<String, String> {
     let secs = a.timeout.unwrap_or(120).clamp(1, 600);
-    let mut child = Command::new("sh")
+    let mut sh = Command::new("sh");
+    for key in &cx.scrub {
+        sh.env_remove(key);
+    }
+    let mut child = sh
         .arg("-c")
         .arg(format!("exec 2>&1\n{}", a.command))
         .current_dir(&cx.cwd)
@@ -85,6 +89,14 @@ mod tests {
         assert!(!o.ok);
         assert!(o.content.ends_with("[exit 3]"), "{}", o.content);
         assert!(o.content.contains("bit-test-"));
+    }
+
+    #[tokio::test]
+    async fn scrubbed_variables_do_not_reach_the_command() {
+        let mut cx = test_ctx("bash-scrub");
+        cx.scrub = vec!["HOME".into()];
+        let o = exec("bash", r#"{"command":"echo \"[$HOME]\""}"#, &cx).await;
+        assert_eq!(o.content, "[]\n");
     }
 
     #[tokio::test]

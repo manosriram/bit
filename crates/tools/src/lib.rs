@@ -38,6 +38,8 @@ pub struct Ctx {
     pub cwd: PathBuf,
     /// Directory for spill files; created on first use.
     pub spill: PathBuf,
+    /// Environment variables `bash` commands don't get: the providers' API keys.
+    pub scrub: Vec<String>,
 }
 
 pub struct Output {
@@ -257,7 +259,7 @@ pub(crate) fn test_ctx(name: &str) -> Ctx {
     let dir = std::env::temp_dir().join(format!("bit-test-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Ctx { spill: dir.join(".spill"), cwd: dir }
+    Ctx { spill: dir.join(".spill"), cwd: dir, scrub: Vec::new() }
 }
 
 #[cfg(test)]

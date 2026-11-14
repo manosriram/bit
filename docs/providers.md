@@ -59,7 +59,15 @@ base_url = "http://my-box:11434/v1"
 ```
 
 Ollama's default context window is small for a coding agent; raise it with
-`OLLAMA_CONTEXT_LENGTH=32768 ollama serve`. A model that can't call tools (`ollama show
+`OLLAMA_CONTEXT_LENGTH=32768 ollama serve`, and tell bit the same number, so it compacts
+before Ollama starts dropping the oldest messages:
+
+```toml
+[providers.ollama]
+context = 32768
+```
+
+Without `context`, bit assumes 128000 tokens for a model it doesn't know. A model that can't call tools (`ollama show
 <model>` lists `tools` under Capabilities) still works, but chat only: bit sends it no
 tools, so it can't read, edit or run anything.
 
